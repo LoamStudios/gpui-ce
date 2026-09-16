@@ -50,6 +50,11 @@ pub struct EditableTextState {
     /// True while the user holds the mouse button to select text, including while dragging.
     /// Cleared on mouse-up or when this input loses focus.
     is_selecting: bool,
+    /// Caret captured at single-click drag start. Reused by
+    /// `adjust_drag_endpoint_at_visual_line_edge` because edge handling can shift
+    /// `selection_movement.result.anchor`.
+    mouse_anchor: Option<CaretPosition>,
+    mouse_caret: Option<(CaretSelection, CaretPosition)>,
     /// Last click's position relative to this element, used to match nearby clicks.
     last_click_position: Option<Point<Pixels>>,
     /// Count of consecutive nearby clicks, used to choose single, double, or triple-click behavior.
@@ -142,6 +147,8 @@ impl EditableTextState {
             marked_range: None,
 
             is_selecting: false,
+            mouse_anchor: None,
+            mouse_caret: None,
             last_click_position: None,
             click_count: 0,
 
@@ -205,12 +212,20 @@ impl EditableTextState {
     fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.set_selection(self.caret_selection().caret);
         self.is_selecting = false;
+        self.mouse_anchor = None;
+        self.mouse_caret = None;
         self.last_click_position = None;
         self.click_count = 0;
 
         cx.notify();
     }
 
+    pub(super) fn visible_caret(&self) -> CaretPosition {
+        match self.mouse_caret {
+            Some((selection, caret)) if selection == self.selection_movement.result => caret,
+            _ => self.caret_selection().caret,
+        }
+    }
     /// Returns the IME marked range for character operations.
     pub(super) fn marked_range(&self) -> Option<Range<usize>> {
         self.marked_range.clone()
@@ -406,6 +421,57 @@ impl EditableTextState {
         self.caret_for_pixel_point(point, line_height).index
     }
 
+    /// Returns the caret for `endpoint`, using `opposite_endpoint` as the selection's other end.
+    /// Across visual lines, it maps an upper line's end to its start or a lower line's start to its
+    /// end; otherwise, it returns `endpoint` unchanged.
+    fn adjust_drag_endpoint_at_visual_line_edge(
+        &self,
+        endpoint: CaretPosition,
+        opposite_endpoint: CaretPosition,
+    ) -> CaretPosition {
+        let Ok(document) = self.current_document() else {
+            return endpoint;
+        };
+
+        let line_height = self.layout_data.line_height;
+        let Some(endpoint_visual_position) =
+            document.visual_position_for_caret(endpoint, line_height)
+        else {
+            return endpoint;
+        };
+        let Some(opposite_visual_position) =
+            document.visual_position_for_caret(opposite_endpoint, line_height)
+        else {
+            return endpoint;
+        };
+
+        let (endpoint_edge, target_edge) =
+            if opposite_visual_position.y > endpoint_visual_position.y {
+                (
+                    Direction::End.with_boundary(TextBoundary::VisualLine),
+                    Direction::Start.with_boundary(TextBoundary::VisualLine),
+                )
+            } else if opposite_visual_position.y < endpoint_visual_position.y {
+                (
+                    Direction::Start.with_boundary(TextBoundary::VisualLine),
+                    Direction::End.with_boundary(TextBoundary::VisualLine),
+                )
+            } else {
+                return endpoint;
+            };
+
+        if document
+            .caret_movement(endpoint, endpoint_edge, None)
+            .result
+            .index
+            != endpoint.index
+        {
+            return endpoint;
+        }
+
+        document.caret_movement(endpoint, target_edge, None).result
+    }
+
     fn find_point_for_caret(&self, caret: CaretPosition) -> Point<Pixels> {
         self.point_for_caret(caret).unwrap_or_default()
     }
@@ -465,7 +531,7 @@ impl EditableTextState {
         };
 
         // point will be relative to content_size, and may or may not be within the current scroll_bounds
-        let point = self.find_point_for_caret(self.caret_selection().caret);
+        let point = self.find_point_for_caret(self.visible_caret());
 
         // this scroll_offset diverges from the rest of gpui, as it is stored in the
         // positive real number space (interactivity stores it in the negatives)
@@ -1252,6 +1318,7 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
         let caret = self.caret_for_pixel_point(text_position, line_height);
 
         self.is_selecting = true;
+        self.mouse_caret = None;
         self.apply_click(event.click_count, text_position);
 
         match self.click_count {
@@ -1264,6 +1331,9 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
             _ if event.modifiers.shift => self.select_to_caret(caret, cx),
             _ => self.move_to_caret(caret, cx),
         }
+
+        self.mouse_anchor = (self.click_count == 1 && !event.modifiers.shift)
+            .then_some(self.selection_movement.result.anchor);
     }
 
     fn on_mouse_up(
@@ -1273,6 +1343,7 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
         _cx: &mut Context<'app, Self>,
     ) {
         self.is_selecting = false;
+        self.mouse_anchor = None;
     }
 
     fn on_mouse_move(
@@ -1283,8 +1354,22 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
         cx: &mut Context<'app, Self>,
     ) {
         if self.is_selecting && self.click_count == 1 {
-            let caret = self.caret_for_pixel_point(text_position, self.layout_data.line_height);
-            self.select_to_caret(caret, cx);
+            let pointer_caret =
+                self.caret_for_pixel_point(text_position, self.layout_data.line_height);
+            let mut selection_caret = pointer_caret;
+
+            if let Some(anchor) = self.mouse_anchor {
+                self.selection_movement.result.anchor =
+                    self.adjust_drag_endpoint_at_visual_line_edge(anchor, selection_caret);
+                selection_caret =
+                    self.adjust_drag_endpoint_at_visual_line_edge(selection_caret, anchor);
+            }
+
+            self.mouse_caret = Some((
+                self.selection_movement.result.with_caret(selection_caret),
+                pointer_caret,
+            ));
+            self.select_to_caret(selection_caret, cx);
         }
     }
 }
