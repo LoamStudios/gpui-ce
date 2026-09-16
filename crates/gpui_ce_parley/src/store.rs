@@ -1,3 +1,6 @@
+#[cfg(test)]
+use gpui::{RasterColorEffect, px, rgba};
+
 use anyhow::{Context as _, Result, bail, ensure};
 use fontique::{Blob, Synthesis};
 use gpui::{
@@ -334,11 +337,11 @@ impl FontStore {
     pub(crate) fn intern_synthesized(
         &mut self,
         data: Blob<u8>,
-        index: u32,
+        idx: u32,
         synthesis: Synthesis,
     ) -> Result<FontId> {
         let normalized_coords = {
-            let font = FontRef::from_index(data.as_ref(), index)
+            let font = FontRef::from_index(data.as_ref(), idx)
                 .context("cannot intern a font face Skrifa cannot parse")?;
             font.axes()
                 .location(synthesis.variation_settings().iter().copied())
@@ -346,35 +349,35 @@ impl FontStore {
                 .to_vec()
         };
 
-        self.intern(data, index, &normalized_coords, synthesis)
+        self.intern(data, idx, &normalized_coords, synthesis)
     }
 
     /// Interns a selected font instance and returns its canonical GPUI ID.
     pub(crate) fn intern(
         &mut self,
         data: Blob<u8>,
-        index: u32,
+        idx: u32,
         normalized_coords: &[NormalizedCoord],
         synthesis: Synthesis,
     ) -> Result<FontId> {
-        let font = FontRef::from_index(data.as_ref(), index)
+        let font = FontRef::from_index(data.as_ref(), idx)
             .context("cannot intern a font face Skrifa cannot parse")?;
         let key = FontKey {
             source_identity: SourceIdentity::from(&data),
-            face_index: index,
+            face_index: idx,
             normalized_coords: normalized_coords.to_vec(),
             synthesis: synthesis.into(),
         };
 
-        if let Some(id) = self.ids_by_key.get(&key) {
-            return Ok(*id);
+        if let Some(font_id) = self.ids_by_key.get(&key) {
+            return Ok(*font_id);
         }
 
         if self.fonts.len() >= CANONICAL_FONT_ID_BIT {
             bail!("canonical font store exhausted its FontId namespace");
         }
 
-        let id = FontId(CANONICAL_FONT_ID_BIT | self.fonts.len());
+        let font_id = FontId(CANONICAL_FONT_ID_BIT | self.fonts.len());
         let variations = design_variations(&font, normalized_coords);
         let has_color_glyphs = [*b"CBDT", *b"sbix", *b"COLR", *b"SVG "]
             .into_iter()
@@ -382,7 +385,7 @@ impl FontStore {
         let source_identity = SourceIdentity::from(&data);
         self.fonts.push(LoadedFont {
             data,
-            index,
+            index: idx,
             normalized_coords: normalized_coords.to_vec(),
             variations,
             synthesis,
@@ -390,13 +393,13 @@ impl FontStore {
             source_identity,
         });
 
-        self.ids_by_key.insert(key, id);
-        Ok(id)
+        self.ids_by_key.insert(key, font_id);
+        Ok(font_id)
     }
 
     /// Returns the stored font for a canonical ID.
-    pub(crate) fn get(&self, id: FontId) -> Option<&LoadedFont> {
-        canonical_index(id).and_then(|index| self.fonts.get(index))
+    pub(crate) fn get(&self, font_id: FontId) -> Option<&LoadedFont> {
+        canonical_index(font_id).and_then(|idx| self.fonts.get(idx))
     }
 }
 
@@ -416,16 +419,16 @@ fn design_variations(
     // Revisit every axis so version 2 `avar` mappings which couple axes converge as well as the
     // ordinary per-axis segment maps. Native APIs will apply the same mapping to these values.
     for _ in 0..4 {
-        for (axis_index, axis) in axis_records.iter().enumerate() {
+        for (axis_idx, axis) in axis_records.iter().enumerate() {
             let target = normalized_coords
-                .get(axis_index)
+                .get(axis_idx)
                 .copied()
                 .unwrap_or_default()
                 .to_f32();
             let mut low = axis.min_value();
             let mut high = axis.max_value();
             for _ in 0..24 {
-                values[axis_index] = (low + high) * 0.5;
+                values[axis_idx] = (low + high) * 0.5;
                 let normalized = axes
                     .location(
                         axis_records
@@ -434,19 +437,19 @@ fn design_variations(
                             .map(|(axis, value)| (axis.tag(), *value)),
                     )
                     .coords()
-                    .get(axis_index)
+                    .get(axis_idx)
                     .copied()
                     .unwrap_or_default()
                     .to_f32();
 
                 if normalized < target {
-                    low = values[axis_index];
+                    low = values[axis_idx];
                 } else {
-                    high = values[axis_index];
+                    high = values[axis_idx];
                 }
             }
 
-            values[axis_index] = (low + high) * 0.5;
+            values[axis_idx] = (low + high) * 0.5;
         }
     }
 
@@ -460,8 +463,8 @@ fn design_variations(
         .collect()
 }
 
-fn canonical_index(id: FontId) -> Option<usize> {
-    (id.0 & CANONICAL_FONT_ID_BIT != 0).then_some(id.0 & !CANONICAL_FONT_ID_BIT)
+fn canonical_index(font_id: FontId) -> Option<usize> {
+    (font_id.0 & CANONICAL_FONT_ID_BIT != 0).then_some(font_id.0 & !CANONICAL_FONT_ID_BIT)
 }
 
 /// Swash raster state used by Linux, web, and explicit fallback construction.
@@ -502,7 +505,12 @@ impl GlyphRasterizer for SwashGlyphRasterizer {
         face: RasterFace<'_>,
         params: &RenderGlyphParams,
     ) -> Result<RasterizedGlyph> {
-        let Some(mut image) = self.render_glyph_image(&face, params)? else {
+        // Empty outlines, including spaces at fractional origins, may have one zero
+        // dimension. GPUI represents every empty raster with both dimensions zero.
+        let Some(mut image) = self
+            .render_glyph_image(&face, params)?
+            .filter(|image| image.placement.width != 0 && image.placement.height != 0)
+        else {
             let format = match params.raster_style.mode {
                 GlyphRenderMode::Subpixel => RasterizedGlyphFormat::BgraSubpixelMask,
                 GlyphRenderMode::Color => RasterizedGlyphFormat::BgraColor,

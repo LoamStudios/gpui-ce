@@ -1,3 +1,15 @@
+#[cfg(test)]
+use crate::editable_text::StringStorage;
+
+#[cfg(test)]
+use gpui::{
+    AppContext, Context, HeadlessAppContext, Render, ScaledPixels, TestTextSystem, div, hsla,
+    prelude::*,
+};
+
+#[cfg(test)]
+use std::collections::HashSet;
+
 use crate::editable_text::{
     BLINK_INTERVAL_500MS, Caret, EditableTextState,
     actions::{DEFAULT_INPUT_CONTEXT, EditableTextActionElement, EditableTextActionHandler},
@@ -852,7 +864,11 @@ mod tests {
     }
 
     impl Render for CenteredEditableTextView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _context: &mut Context<Self>,
+        ) -> impl IntoElement {
             div()
                 .flex()
                 .items_center()
@@ -879,11 +895,11 @@ mod tests {
     }
 
     fn only_quad(
-        cx: &mut HeadlessAppContext,
+        context: &mut HeadlessAppContext,
         window: gpui::AnyWindowHandle,
         color: Hsla,
     ) -> Bounds<ScaledPixels> {
-        let bounds = cx.solid_quad_bounds(window, color).unwrap();
+        let bounds = context.solid_quad_bounds(window, color).unwrap();
         assert_eq!(bounds.len(), 1, "expected one rendered quad for {color:?}");
         bounds[0]
     }
@@ -891,25 +907,25 @@ mod tests {
     #[test]
     fn editable_text_keeps_its_device_pixel_offset_when_its_parent_moves() {
         for scale_factor in [1.0, 1.5] {
-            let mut cx = HeadlessAppContext::new(Arc::new(TestTextSystem));
-            let window = cx
-                .open_window(size(px(420.0), px(260.0)), |window, cx| {
+            let mut context = HeadlessAppContext::new(Arc::new(TestTextSystem));
+            let window = context
+                .open_window(size(px(420.0), px(260.0)), |window, context| {
                     window.set_scale_factor(scale_factor);
-                    let input = cx.new(|cx| {
-                        let mut state = EditableTextState::new(StringStorage::from("x"), cx);
-                        state.select_document(cx);
+                    let input = context.new(|context| {
+                        let mut state = EditableTextState::new(StringStorage::from("x"), context);
+                        state.select_document(context);
                         state
                     });
 
-                    cx.new(|_| CenteredEditableTextView { extent: 0.0, input })
+                    context.new(|_| CenteredEditableTextView { extent: 0.0, input })
                 })
                 .unwrap();
 
-            cx.run_until_parked();
+            context.run_until_parked();
             let any_window = window.into();
-            let initial_container = only_quad(&mut cx, any_window, CONTAINER_COLOR);
-            let initial_input = only_quad(&mut cx, any_window, INPUT_COLOR);
-            let initial_selection = only_quad(&mut cx, any_window, SELECTION_COLOR);
+            let initial_container = only_quad(&mut context, any_window, CONTAINER_COLOR);
+            let initial_input = only_quad(&mut context, any_window, INPUT_COLOR);
+            let initial_selection = only_quad(&mut context, any_window, SELECTION_COLOR);
             let expected_input_offset = initial_input.origin - initial_container.origin;
             let expected_selection_offset = initial_selection.origin - initial_input.origin;
             let mut container_origins = HashSet::from([(
@@ -919,16 +935,16 @@ mod tests {
 
             for step in 1..=32 {
                 window
-                    .update(&mut cx, |view, _, cx| {
+                    .update(&mut context, |view, _, context| {
                         view.extent = step as f32;
-                        cx.notify();
+                        context.notify();
                     })
                     .unwrap();
-                cx.run_until_parked();
+                context.run_until_parked();
 
-                let container = only_quad(&mut cx, any_window, CONTAINER_COLOR);
-                let input = only_quad(&mut cx, any_window, INPUT_COLOR);
-                let selection = only_quad(&mut cx, any_window, SELECTION_COLOR);
+                let container = only_quad(&mut context, any_window, CONTAINER_COLOR);
+                let input = only_quad(&mut context, any_window, INPUT_COLOR);
+                let selection = only_quad(&mut context, any_window, SELECTION_COLOR);
                 assert_eq!(
                     input.origin - container.origin,
                     expected_input_offset,
