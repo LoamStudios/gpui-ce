@@ -165,19 +165,6 @@ impl EditableTextState {
         self.selected_range
     }
 
-    pub(super) fn selection_direction(&self) -> Option<NavigationDirection> {
-        match self
-            .selected_range
-            .focus
-            .index
-            .cmp(&self.selected_range.anchor.index)
-        {
-            std::cmp::Ordering::Less => Some(NavigationDirection::Forward),
-            std::cmp::Ordering::Equal => None,
-            std::cmp::Ordering::Greater => Some(NavigationDirection::Back),
-        }
-    }
-
     pub(super) fn caret(&self) -> CaretPosition {
         self.selected_range.focus
     }
@@ -847,10 +834,10 @@ impl EntityInputHandler for EditableTextState {
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         let selection_range = self.selected_byte_range();
-        let direction = self.selection_direction();
+
         Some(UTF16Selection {
             range: self.storage.utf_range_8to16(&selection_range),
-            reversed: direction == Some(NavigationDirection::Back),
+            reversed: self.selected_range.endpoint_ordering() == std::cmp::Ordering::Greater,
         })
     }
 
