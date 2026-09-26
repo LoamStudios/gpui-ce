@@ -65,8 +65,8 @@ pub trait PlatformTextLayout: Send + Sync + std::fmt::Debug {
     fn caret_bounds(&self, caret: CaretPosition, line_height: Pixels) -> Option<Bounds<Pixels>>;
     /// Snaps a caret to a native cluster boundary.
     fn normalized_caret(&self, caret: CaretPosition) -> CaretPosition;
-    /// Moves one caret stop in visual order.
-    fn move_visual(
+    /// Returns the adjacent caret stop in visual order.
+    fn adjacent_visual_caret(
         &self,
         caret: CaretPosition,
         direction: VisualDirection,
@@ -81,13 +81,13 @@ pub trait PlatformTextLayout: Send + Sync + std::fmt::Debug {
     fn logical_cluster_before(&self, caret: CaretPosition) -> Option<Range<usize>>;
     /// Returns the atomic logical cluster after the caret.
     fn logical_cluster_after(&self, caret: CaretPosition) -> Option<Range<usize>>;
-    /// Moves a caret using backend-native text semantics.
-    fn move_caret(
+    /// Returns the caret and preferred horizontal position after applying a movement.
+    fn caret_movement(
         &self,
         caret: CaretPosition,
         movement: TextMovement,
         preferred_x: Option<Pixels>,
-    ) -> (CaretPosition, Option<Pixels>);
+    ) -> CaretMovement;
     /// Returns the word or line selected at a point in GPUI layout coordinates.
     fn selection_from_pixel_point(
         &self,
@@ -106,29 +106,58 @@ pub enum VisualDirection {
     Right,
 }
 
-/// A semantic caret movement handled by the native text layout.
+/// The direction of a semantic text movement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TextMovement {
-    /// Move to the preceding visual caret stop.
-    VisualLeft,
-    /// Move to the following visual caret stop.
-    VisualRight,
-    /// Move to the preceding word in visual order.
-    VisualWordLeft,
-    /// Move to the following word in visual order.
-    VisualWordRight,
+pub enum TextDirection {
+    /// Move toward the visual left.
+    Left,
+    /// Move toward the visual right.
+    Right,
     /// Move to the visual row above.
-    VisualUp,
+    Up,
     /// Move to the visual row below.
-    VisualDown,
-    /// Move to the start of the current visual row.
-    VisualLineStart,
-    /// Move to the end of the current visual row.
-    VisualLineEnd,
-    /// Move to the start of the current hard line.
-    HardLineStart,
-    /// Move to the end of the current hard line.
-    HardLineEnd,
+    Down,
+    /// Move to the start of a line or document boundary.
+    Start,
+    /// Move to the end of a line or document boundary.
+    End,
+}
+
+/// The boundary at which a semantic text movement stops.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextBoundary {
+    /// One backend-defined caret step, which may span several Unicode scalar values.
+    Cluster,
+    /// A word boundary.
+    Word,
+    /// One visual row produced by line breaking, including soft wrapping.
+    VisualLine,
+    /// A line delimited by a hard break.
+    HardLine,
+    /// The complete text document.
+    Document,
+}
+
+/// A semantic caret movement handled by the native text layout.
+///
+/// `direction` chooses where to move, and `boundary` chooses the unit. Consecutive vertical
+/// movements reuse the returned preferred horizontal coordinate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextMovement {
+    /// The direction in which to move.
+    pub direction: TextDirection,
+    /// The boundary at which to stop.
+    pub boundary: TextBoundary,
+}
+
+impl TextDirection {
+    /// Creates a semantic movement in this direction with the requested boundary.
+    pub const fn with_boundary(self, boundary: TextBoundary) -> TextMovement {
+        TextMovement {
+            direction: self,
+            boundary,
+        }
+    }
 }
 
 /// A semantic selection derived from a point.
@@ -320,12 +349,21 @@ impl CaretSelection {
     }
 }
 
-/// The result of moving or extending a selection through a laid-out document.
+/// The result of calculating a caret movement through a laid-out document.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CaretSelectionMove {
+pub struct CaretMovement {
+    /// The caret at the requested destination.
+    pub caret: CaretPosition,
+    /// The horizontal coordinate reused by consecutive vertical movements.
+    pub preferred_x: Option<Pixels>,
+}
+
+/// The result of calculating a selection movement through a laid-out document.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaretSelectionMovement {
     /// The selection after movement.
     pub selection: CaretSelection,
-    /// The horizontal position retained by successive vertical movements.
+    /// The horizontal coordinate reused by consecutive vertical movements.
     pub preferred_x: Option<Pixels>,
 }
 
@@ -477,18 +515,15 @@ impl WrappedLineLayout {
         self.layout.platform_layout.normalized_caret(caret)
     }
 
-    /// Returns the previous caret stop in visual order.
-    pub fn previous_visual_caret(&self, caret: CaretPosition) -> Option<CaretPosition> {
+    /// Returns the adjacent caret stop in visual order.
+    pub fn adjacent_visual_caret(
+        &self,
+        caret: CaretPosition,
+        direction: VisualDirection,
+    ) -> Option<CaretPosition> {
         self.layout
             .platform_layout
-            .move_visual(caret, VisualDirection::Left)
-    }
-
-    /// Returns the next caret stop in visual order.
-    pub fn next_visual_caret(&self, caret: CaretPosition) -> Option<CaretPosition> {
-        self.layout
-            .platform_layout
-            .move_visual(caret, VisualDirection::Right)
+            .adjacent_visual_caret(caret, direction)
     }
 
     /// Returns the logical cluster immediately before the caret.
@@ -501,48 +536,56 @@ impl WrappedLineLayout {
         self.layout.platform_layout.logical_cluster_after(caret)
     }
 
-    /// Moves a caret using the backend's visual and line-breaking model.
-    pub fn move_caret(
+    /// Returns the caret and preferred horizontal position after applying `movement`.
+    /// This only calculates the destination and does not mutate editor state.
+    pub fn caret_movement(
         &self,
         caret: CaretPosition,
         movement: TextMovement,
         preferred_x: Option<Pixels>,
-    ) -> (CaretPosition, Option<Pixels>) {
+    ) -> CaretMovement {
         self.layout
             .platform_layout
-            .move_caret(caret, movement, preferred_x)
+            .caret_movement(caret, movement, preferred_x)
     }
 
-    /// Moves or extends an affinity-aware selection using visual text order.
+    /// Returns a moved or extended affinity-aware selection using visual text order.
     ///
     /// Horizontal movement without extension collapses a non-empty selection toward the requested
     /// visual edge. Other movement starts at the caret. Extending keeps the anchor fixed.
-    pub fn move_selection(
+    ///
+    /// `selection` is the current anchor and active caret.
+    /// `movement` supplies the direction and boundary.
+    /// `extend` keeps the anchor fixed when true and collapses the result when false.
+    /// `preferred_x` carries the horizontal target across vertical movements.
+    /// `line_height` converts caret positions into comparable visual coordinates.
+    pub fn selection_movement(
         &self,
         selection: CaretSelection,
         movement: TextMovement,
         extend: bool,
         preferred_x: Option<Pixels>,
         line_height: Pixels,
-    ) -> CaretSelectionMove {
-        let forward = matches!(
-            movement,
-            TextMovement::VisualRight | TextMovement::VisualWordRight
+    ) -> CaretSelectionMovement {
+        let forward = movement.direction == TextDirection::Right;
+        let horizontal = matches!(
+            movement.direction,
+            TextDirection::Left | TextDirection::Right
+        ) && matches!(
+            movement.boundary,
+            TextBoundary::Cluster | TextBoundary::Word
         );
-        let horizontal = forward
-            || matches!(
-                movement,
-                TextMovement::VisualLeft | TextMovement::VisualWordLeft
-            );
 
         if !extend && !selection.is_empty() && horizontal {
-            let caret_position = self.visual_position_for_caret(selection.caret, line_height);
-            let anchor_position = self.visual_position_for_caret(selection.anchor, line_height);
-            let (visual_start, visual_end) = caret_position
-                .zip(anchor_position)
-                .map(|(caret_position, anchor_position)| {
-                    if (caret_position.y, caret_position.x)
-                        <= (anchor_position.y, anchor_position.x)
+            let caret_visual_position =
+                self.visual_position_for_caret(selection.caret, line_height);
+            let anchor_visual_position =
+                self.visual_position_for_caret(selection.anchor, line_height);
+            let (visual_start, visual_end) = caret_visual_position
+                .zip(anchor_visual_position)
+                .map(|(caret_visual_position, anchor_visual_position)| {
+                    if (caret_visual_position.y, caret_visual_position.x)
+                        <= (anchor_visual_position.y, anchor_visual_position.x)
                     {
                         (selection.caret, selection.anchor)
                     } else {
@@ -556,15 +599,19 @@ impl WrappedLineLayout {
                         (selection.anchor, selection.caret)
                     }
                 });
+
             let caret = if forward { visual_end } else { visual_start };
-            return CaretSelectionMove {
+
+            return CaretSelectionMovement {
                 selection: caret.into(),
                 preferred_x: None,
             };
         }
 
-        let (caret, preferred_x) = self.move_caret(selection.caret, movement, preferred_x);
-        CaretSelectionMove {
+        let CaretMovement { caret, preferred_x } =
+            self.caret_movement(selection.caret, movement, preferred_x);
+
+        CaretSelectionMovement {
             selection: if extend {
                 selection.with_caret(caret)
             } else {

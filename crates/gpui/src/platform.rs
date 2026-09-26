@@ -52,8 +52,9 @@ use crate::{
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::{
-    CaretAffinity, CaretPosition, PaintFragment, PaintStyle, PlatformTextLayout, ShapedGlyph,
-    TextMovement, TextSelectionKind, VisualDirection, VisualLine, size,
+    CaretAffinity, CaretMovement, CaretPosition, PaintFragment, PaintStyle, PlatformTextLayout,
+    ShapedGlyph, TextBoundary, TextDirection, TextMovement, TextSelectionKind, VisualDirection,
+    VisualLine, size,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
@@ -1333,7 +1334,7 @@ impl PlatformTextLayout for TestPlatformTextLayout {
         CaretPosition { index, affinity }
     }
 
-    fn move_visual(
+    fn adjacent_visual_caret(
         &self,
         caret: CaretPosition,
         direction: VisualDirection,
@@ -1388,31 +1389,34 @@ impl PlatformTextLayout for TestPlatformTextLayout {
             .map(|stops| stops[0].0..stops[1].0)
     }
 
-    fn move_caret(
+    fn caret_movement(
         &self,
         caret: CaretPosition,
         movement: TextMovement,
         preferred_x: Option<Pixels>,
-    ) -> (CaretPosition, Option<Pixels>) {
-        let index = match movement {
-            TextMovement::VisualLeft => {
-                self.move_visual(caret, VisualDirection::Left)
+    ) -> CaretMovement {
+        use TextBoundary::*;
+        use TextDirection::*;
+
+        let index = match (movement.direction, movement.boundary) {
+            (Left, Cluster) => {
+                self.adjacent_visual_caret(caret, VisualDirection::Left)
                     .unwrap_or(caret)
                     .index
             }
-            TextMovement::VisualRight => {
-                self.move_visual(caret, VisualDirection::Right)
+            (Right, Cluster) => {
+                self.adjacent_visual_caret(caret, VisualDirection::Right)
                     .unwrap_or(caret)
                     .index
             }
-            TextMovement::VisualWordLeft => {
+            (Left, Word) => {
                 let prefix = &self.text[..caret.index.min(self.text.len())];
                 let trimmed = prefix.trim_end_matches(char::is_whitespace);
                 trimmed.rfind(char::is_whitespace).map_or(0, |index| {
                     index + trimmed[index..].chars().next().unwrap().len_utf8()
                 })
             }
-            TextMovement::VisualWordRight => {
+            (Right, Word) => {
                 let start = caret.index.min(self.text.len());
                 let suffix = &self.text[start..];
                 let word_end = suffix.find(char::is_whitespace).unwrap_or(suffix.len());
@@ -1423,24 +1427,26 @@ impl PlatformTextLayout for TestPlatformTextLayout {
                         .find(|character: char| !character.is_whitespace())
                         .unwrap_or(rest.len())
             }
-            TextMovement::VisualLineStart
-            | TextMovement::HardLineStart
-            | TextMovement::VisualUp => 0,
-            TextMovement::VisualLineEnd | TextMovement::HardLineEnd | TextMovement::VisualDown => {
-                self.len()
-            }
+            (Up | Start, VisualLine) | (Start, HardLine | Document) => 0,
+            (Down | End, VisualLine) | (End, HardLine | Document) => self.len(),
+            _ => caret.index,
         };
-        let preferred_x = matches!(movement, TextMovement::VisualUp | TextMovement::VisualDown)
+
+        let preferred_x = matches!(movement.direction, TextDirection::Up | TextDirection::Down)
             .then(|| {
                 preferred_x.unwrap_or_else(|| {
                     self.caret_bounds(caret, self.size.height)
                         .map_or(Pixels::ZERO, |bounds| bounds.origin.x)
                 })
             });
-        (
-            self.normalized_caret(CaretPosition::attached_to_next_cluster(index)),
+
+        CaretMovement {
+            caret: self.normalized_caret(CaretPosition {
+                index,
+                affinity: CaretAffinity::Downstream,
+            }),
             preferred_x,
-        )
+        }
     }
 
     fn selection_from_pixel_point(

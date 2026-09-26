@@ -4,11 +4,11 @@ use crate::{
 };
 use anyhow::{Context as _, Result};
 use gpui::{
-    Bounds, CaretAffinity, CaretPosition, Font, FontId, FontMetrics, GlyphId, LineLayout,
-    PaintFragment, PaintStyle, Pixels, PlatformTextLayout, PlatformTextSystem, PreparedRasterStyle,
-    RasterStyleRequest, RasterizedGlyph, RenderGlyphParams, ShapedGlyph, Size, TextLayoutRequest,
-    TextMovement, TextRenderingMode, TextRun, TextSelectionKind, VisualDirection, VisualLine,
-    point, px, size,
+    Bounds, CaretAffinity, CaretMovement, CaretPosition, Font, FontId, FontMetrics, GlyphId,
+    LineLayout, PaintFragment, PaintStyle, Pixels, PlatformTextLayout, PlatformTextSystem,
+    PreparedRasterStyle, RasterStyleRequest, RasterizedGlyph, RenderGlyphParams, ShapedGlyph, Size,
+    TextBoundary as Boundary, TextDirection as Direction, TextLayoutRequest, TextMovement,
+    TextRenderingMode, TextRun, TextSelectionKind, VisualDirection, VisualLine, point, px, size,
 };
 use parking_lot::{Mutex, RwLock};
 use parley::setting::Tag;
@@ -307,7 +307,7 @@ impl PlatformTextLayout for ParleyLayout {
         Self::caret_position(self.cursor(caret))
     }
 
-    fn move_visual(
+    fn adjacent_visual_caret(
         &self,
         caret: CaretPosition,
         direction: VisualDirection,
@@ -362,44 +362,46 @@ impl PlatformTextLayout for ParleyLayout {
             .cloned()
     }
 
-    fn move_caret(
+    fn caret_movement(
         &self,
         caret: CaretPosition,
         movement: TextMovement,
         preferred_x: Option<Pixels>,
-    ) -> (CaretPosition, Option<Pixels>) {
+    ) -> CaretMovement {
         let cursor = self.cursor(caret);
-        let moved = match movement {
-            TextMovement::VisualLeft => {
-                return (
-                    self.move_visual(caret, VisualDirection::Left)
+        let moved = match (movement.direction, movement.boundary) {
+            (Direction::Left, Boundary::Cluster) => {
+                return CaretMovement {
+                    caret: self
+                        .adjacent_visual_caret(caret, VisualDirection::Left)
                         .unwrap_or(caret),
-                    None,
-                );
+                    preferred_x: None,
+                };
             }
-            TextMovement::VisualRight => {
-                return (
-                    self.move_visual(caret, VisualDirection::Right)
+            (Direction::Right, Boundary::Cluster) => {
+                return CaretMovement {
+                    caret: self
+                        .adjacent_visual_caret(caret, VisualDirection::Right)
                         .unwrap_or(caret),
-                    None,
-                );
+                    preferred_x: None,
+                };
             }
-            TextMovement::VisualWordLeft => cursor.previous_visual_word(&self.layout),
-            TextMovement::VisualWordRight => cursor.next_visual_word(&self.layout),
-            TextMovement::VisualLineStart => Selection::from(cursor)
+            (Direction::Left, Boundary::Word) => cursor.previous_visual_word(&self.layout),
+            (Direction::Right, Boundary::Word) => cursor.next_visual_word(&self.layout),
+            (Direction::Start, Boundary::VisualLine) => Selection::from(cursor)
                 .line_start(&self.layout, false)
                 .focus(),
-            TextMovement::VisualLineEnd => Selection::from(cursor)
+            (Direction::End, Boundary::VisualLine) => Selection::from(cursor)
                 .line_end(&self.layout, false)
                 .focus(),
-            TextMovement::HardLineStart => Selection::from(cursor)
+            (Direction::Start, Boundary::HardLine) => Selection::from(cursor)
                 .hard_line_start(&self.layout, false)
                 .focus(),
-            TextMovement::HardLineEnd => Selection::from(cursor)
+            (Direction::End, Boundary::HardLine) => Selection::from(cursor)
                 .hard_line_end(&self.layout, false)
                 .focus(),
-            TextMovement::VisualUp | TextMovement::VisualDown => {
-                let delta = if movement == TextMovement::VisualUp {
+            (Direction::Up | Direction::Down, Boundary::VisualLine) => {
+                let delta = if movement.direction == Direction::Up {
                     -1
                 } else {
                     1
@@ -424,15 +426,25 @@ impl PlatformTextLayout for ParleyLayout {
                     } else {
                         selection.next_line(&self.layout, false)
                     };
-                    return (Self::caret_position(moved.focus()), preferred_x);
+                    return CaretMovement {
+                        caret: Self::caret_position(moved.focus()),
+                        preferred_x,
+                    };
                 };
                 let x = preferred_x
                     .map_or_else(|| cursor.geometry(&self.layout, 0.0).x0 as f32, f32::from);
                 let moved = Cursor::from_point(&self.layout, x, self.native_y_for_line(target_ix));
-                return (Self::caret_position(moved), Some(px(x)));
+                return CaretMovement {
+                    caret: Self::caret_position(moved),
+                    preferred_x: Some(px(x)),
+                };
             }
+            _ => cursor,
         };
-        (Self::caret_position(moved), None)
+        CaretMovement {
+            caret: Self::caret_position(moved),
+            preferred_x: None,
+        }
     }
 
     fn selection_from_pixel_point(
@@ -1131,19 +1143,27 @@ mod tests {
             assert!(text.is_char_boundary(caret.index));
             assert!(!seen.contains(&caret), "visual caret traversal cycled");
             seen.push(caret);
-            let Some(next) = wrapped.next_visual_caret(caret) else {
+            let Some(next) = wrapped.adjacent_visual_caret(caret, VisualDirection::Right) else {
                 break;
             };
             caret = next;
         }
-        assert!(wrapped.next_visual_caret(caret).is_none());
+        assert!(
+            wrapped
+                .adjacent_visual_caret(caret, VisualDirection::Right)
+                .is_none()
+        );
         for _ in 0..max_steps {
-            let Some(previous) = wrapped.previous_visual_caret(caret) else {
+            let Some(previous) = wrapped.adjacent_visual_caret(caret, VisualDirection::Left) else {
                 break;
             };
             caret = previous;
         }
-        assert!(wrapped.previous_visual_caret(caret).is_none());
+        assert!(
+            wrapped
+                .adjacent_visual_caret(caret, VisualDirection::Left)
+                .is_none()
+        );
 
         for caret in seen {
             let bounds = wrapped
@@ -1399,15 +1419,23 @@ mod tests {
         let middle = CaretPosition::attached_to_next_cluster(2);
         assert_eq!(
             single_line
-                .move_caret(middle, TextMovement::VisualUp, None)
-                .0
+                .caret_movement(
+                    middle,
+                    Direction::Up.with_boundary(Boundary::VisualLine),
+                    None
+                )
+                .caret
                 .index,
             0
         );
         assert_eq!(
             single_line
-                .move_caret(middle, TextMovement::VisualDown, None)
-                .0
+                .caret_movement(
+                    middle,
+                    Direction::Down.with_boundary(Boundary::VisualLine),
+                    None
+                )
+                .caret
                 .index,
             single_line_text.len()
         );
@@ -1435,45 +1463,45 @@ mod tests {
             anchor: end,
             caret: start,
         };
-        let collapsed_left = layout.move_selection(
+        let collapsed_left = layout.selection_movement(
             selection,
-            TextMovement::VisualLeft,
+            Direction::Left.with_boundary(Boundary::Cluster),
             false,
             None,
             line_height,
         );
         assert!(collapsed_left.selection.is_empty());
         assert_eq!(collapsed_left.selection.caret, start);
-        let collapsed_right = layout.move_selection(
+        let collapsed_right = layout.selection_movement(
             selection,
-            TextMovement::VisualRight,
+            Direction::Right.with_boundary(Boundary::Cluster),
             false,
             None,
             line_height,
         );
         assert_eq!(collapsed_right.selection.caret, end);
 
-        let word = layout.move_selection(
+        let word = layout.selection_movement(
             start.into(),
-            TextMovement::VisualWordRight,
+            Direction::Right.with_boundary(Boundary::Word),
             true,
             None,
             line_height,
         );
         assert_eq!(word.selection.anchor, start);
         assert_ne!(word.selection.caret, start);
-        let down = layout.move_selection(
+        let down = layout.selection_movement(
             word.selection.caret.into(),
-            TextMovement::VisualDown,
+            Direction::Down.with_boundary(Boundary::VisualLine),
             false,
             None,
             line_height,
         );
         assert!(down.preferred_x.is_some());
         let maintained_x = layout
-            .move_selection(
+            .selection_movement(
                 down.selection,
-                TextMovement::VisualDown,
+                Direction::Down.with_boundary(Boundary::VisualLine),
                 false,
                 down.preferred_x,
                 line_height,
