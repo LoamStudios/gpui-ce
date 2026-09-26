@@ -305,7 +305,7 @@ impl EditableTextState {
 
     fn point_for_caret(&self, caret: CaretPosition) -> Option<Point<Pixels>> {
         self.current_document()?
-            .position_for_caret(caret, self.layout_data.line_height)
+            .visual_position_for_caret(caret, self.layout_data.line_height)
     }
 
     fn cluster_deletion_range(&self, direction: NavigationDirection) -> Option<Range<usize>> {
@@ -332,7 +332,7 @@ impl EditableTextState {
             return CaretPosition::attached_to_previous_cluster(storage_len_utf8);
         };
         document
-            .closest_caret_for_position(point, line_height)
+            .closest_caret_for_pixel_point(point, line_height)
             .unwrap_or_else(|closest| closest)
     }
 
@@ -718,7 +718,7 @@ impl EditableTextState {
             return false;
         };
         self.selected_range = document
-            .selection_from_point(point, line_height, kind)
+            .selection_from_pixel_point(point, line_height, kind)
             .into();
         self.preferred_x = None;
         cx.notify();
@@ -905,7 +905,7 @@ impl EntityInputHandler for EditableTextState {
         let end = range.end.min(document.text.len());
         if start == end {
             let caret = CaretPosition::attached_to_next_cluster(start);
-            let position = document.position_for_caret(caret, line_height)?;
+            let position = document.visual_position_for_caret(caret, line_height)?;
             return Some(Bounds::from_corners(
                 bounds.origin + position,
                 bounds.origin + position + point(CARET_PIXELS_EPSILON, line_height),

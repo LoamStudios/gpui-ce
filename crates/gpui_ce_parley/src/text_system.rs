@@ -219,50 +219,50 @@ impl PlatformTextLayout for ParleyLayout {
         size(px(self.layout.width()), px(self.layout.height()))
     }
 
-    fn index_from_point(
+    fn byte_index_from_pixel_point(
         &self,
-        point: gpui::Point<Pixels>,
+        pixel_point: gpui::Point<Pixels>,
         line_height: Pixels,
     ) -> std::result::Result<usize, usize> {
         let closest = self
-            .caret_from_point(point, line_height)
+            .caret_from_pixel_point(pixel_point, line_height)
             .unwrap_or_else(|caret| caret)
             .index;
-        if point.y < Pixels::ZERO || line_height <= Pixels::ZERO {
+        if pixel_point.y < Pixels::ZERO || line_height <= Pixels::ZERO {
             return Err(closest);
         }
-        let line_ix = (point.y / line_height) as usize;
+        let line_ix = (pixel_point.y / line_height) as usize;
         let Some(line) = self.layout.get(line_ix) else {
             return Err(closest);
         };
         let metrics = line.metrics();
         let left = metrics.inline_min_coord + metrics.offset;
         let right = left + metrics.advance;
-        if f32::from(point.x) < left || f32::from(point.x) >= right {
+        if f32::from(pixel_point.x) < left || f32::from(pixel_point.x) >= right {
             return Err(closest);
         }
         Cluster::from_point(
             &self.layout,
-            point.x.into(),
+            pixel_point.x.into(),
             self.native_y_for_line(line_ix),
         )
         .map(|(cluster, _)| cluster.text_range().start)
         .ok_or(closest)
     }
 
-    fn caret_from_point(
+    fn caret_from_pixel_point(
         &self,
-        point: gpui::Point<Pixels>,
+        pixel_point: gpui::Point<Pixels>,
         line_height: Pixels,
     ) -> std::result::Result<CaretPosition, CaretPosition> {
-        let line_ix = if line_height > px(0.0) && point.y >= Pixels::ZERO {
-            (point.y / line_height) as usize
+        let line_ix = if line_height > px(0.0) && pixel_point.y >= Pixels::ZERO {
+            (pixel_point.y / line_height) as usize
         } else {
             0
         };
         let caret = Self::caret_position(Cursor::from_point(
             &self.layout,
-            point.x.into(),
+            pixel_point.x.into(),
             self.native_y_for_line(line_ix),
         ));
         let Some(line) = self.layout.get(line_ix) else {
@@ -271,10 +271,10 @@ impl PlatformTextLayout for ParleyLayout {
         let metrics = line.metrics();
         let left = metrics.inline_min_coord + metrics.offset;
         let right = left + metrics.advance;
-        if point.y >= Pixels::ZERO
+        if pixel_point.y >= Pixels::ZERO
             && line_height > Pixels::ZERO
-            && f32::from(point.x) >= left
-            && f32::from(point.x) < right
+            && f32::from(pixel_point.x) >= left
+            && f32::from(pixel_point.x) < right
         {
             Ok(caret)
         } else {
@@ -282,7 +282,7 @@ impl PlatformTextLayout for ParleyLayout {
         }
     }
 
-    fn caret_geometry(&self, caret: CaretPosition, line_height: Pixels) -> Option<Bounds<Pixels>> {
+    fn caret_bounds(&self, caret: CaretPosition, line_height: Pixels) -> Option<Bounds<Pixels>> {
         if caret.index > self.len() {
             return None;
         }
@@ -303,7 +303,7 @@ impl PlatformTextLayout for ParleyLayout {
         ))
     }
 
-    fn refresh_caret(&self, caret: CaretPosition) -> CaretPosition {
+    fn normalized_caret(&self, caret: CaretPosition) -> CaretPosition {
         Self::caret_position(self.cursor(caret))
     }
 
@@ -328,13 +328,13 @@ impl PlatformTextLayout for ParleyLayout {
         }
     }
 
-    fn selection_geometry(
+    fn selection_bounds(
         &self,
-        range: std::ops::Range<usize>,
+        byte_range: std::ops::Range<usize>,
         line_height: Pixels,
     ) -> Vec<Bounds<Pixels>> {
-        let anchor = Cursor::from_byte_index(&self.layout, range.start, Affinity::Downstream);
-        let focus = Cursor::from_byte_index(&self.layout, range.end, Affinity::Upstream);
+        let anchor = Cursor::from_byte_index(&self.layout, byte_range.start, Affinity::Downstream);
+        let focus = Cursor::from_byte_index(&self.layout, byte_range.end, Affinity::Upstream);
         Selection::new(anchor, focus)
             .geometry(&self.layout)
             .into_iter()
@@ -435,25 +435,27 @@ impl PlatformTextLayout for ParleyLayout {
         (Self::caret_position(moved), None)
     }
 
-    fn selection_from_point(
+    fn selection_from_pixel_point(
         &self,
-        point: gpui::Point<Pixels>,
+        pixel_point: gpui::Point<Pixels>,
         line_height: Pixels,
         kind: TextSelectionKind,
     ) -> std::ops::Range<usize> {
-        let line_ix = if line_height > Pixels::ZERO && point.y >= Pixels::ZERO {
-            (point.y / line_height) as usize
+        let line_ix = if line_height > Pixels::ZERO && pixel_point.y >= Pixels::ZERO {
+            (pixel_point.y / line_height) as usize
         } else {
             0
         };
         let y = self.native_y_for_line(line_ix);
         match kind {
-            TextSelectionKind::Word => Selection::word_from_point(&self.layout, point.x.into(), y),
+            TextSelectionKind::Word => {
+                Selection::word_from_point(&self.layout, pixel_point.x.into(), y)
+            }
             TextSelectionKind::VisualLine => {
-                Selection::line_from_point(&self.layout, point.x.into(), y)
+                Selection::line_from_point(&self.layout, pixel_point.x.into(), y)
             }
             TextSelectionKind::HardLine => {
-                Selection::hard_line_from_point(&self.layout, point.x.into(), y)
+                Selection::hard_line_from_point(&self.layout, pixel_point.x.into(), y)
             }
         }
         .text_range()
@@ -1121,7 +1123,7 @@ mod tests {
         let line_height = px(24.0);
         let wrapped = wrapped(layout.clone_for_test(), px(120.0));
         let mut caret = wrapped
-            .closest_caret_for_position(point(px(-100.0), line_height * 0.5), line_height)
+            .closest_caret_for_pixel_point(point(px(-100.0), line_height * 0.5), line_height)
             .unwrap_err();
         let mut seen = Vec::new();
         let max_steps = text.chars().count() * 4 + wrapped.line_count() * 4 + 8;
@@ -1145,7 +1147,7 @@ mod tests {
 
         for caret in seen {
             let bounds = wrapped
-                .position_for_caret(caret, line_height)
+                .visual_position_for_caret(caret, line_height)
                 .expect("native caret must have geometry");
             assert!(f32::from(bounds.x).is_finite() && f32::from(bounds.y).is_finite());
         }
@@ -1424,10 +1426,10 @@ mod tests {
         );
         let line_height = px(26.0);
         let start = layout
-            .closest_caret_for_position(point(px(-10.0), px(10.0)), line_height)
+            .closest_caret_for_pixel_point(point(px(-10.0), px(10.0)), line_height)
             .unwrap_err();
         let end = layout
-            .closest_caret_for_position(point(px(10_000.0), px(10.0)), line_height)
+            .closest_caret_for_pixel_point(point(px(10_000.0), px(10.0)), line_height)
             .unwrap_err();
         let selection = CaretSelection {
             anchor: end,
@@ -1478,7 +1480,7 @@ mod tests {
             )
             .preferred_x;
         assert_eq!(maintained_x, down.preferred_x);
-        let selection = layout.selection_from_point(
+        let selection = layout.selection_from_pixel_point(
             point(px(12.0), px(10.0)),
             line_height,
             TextSelectionKind::Word,

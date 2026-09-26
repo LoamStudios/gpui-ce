@@ -1069,7 +1069,7 @@ impl TextLayout {
         let Some(document) = &element_state.document else {
             return Err(0);
         };
-        document.index_for_position(position - bounds.origin, line_height)
+        document.byte_index_for_pixel_point(position - bounds.origin, line_height)
     }
 
     /// Get the pixel position for the given byte index.
@@ -1084,7 +1084,7 @@ impl TextLayout {
         let line_height = element_state.line_height;
 
         let document = element_state.document.as_ref()?;
-        Some(bounds.origin + document.position_for_index(index, line_height)?)
+        Some(bounds.origin + document.visual_position_for_byte_index(index, line_height)?)
     }
 
     /// Retrieve the layout for the line containing the given byte index.

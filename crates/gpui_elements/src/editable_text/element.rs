@@ -836,7 +836,7 @@ impl PrepaintElements {
                 }
 
                 let caret_px = document
-                    .position_for_caret(caret, line_height)
+                    .visual_position_for_caret(caret, line_height)
                     .unwrap_or_default();
                 caret_point = Some(caret_px + point(scroll_offset.x, line_y));
             }
