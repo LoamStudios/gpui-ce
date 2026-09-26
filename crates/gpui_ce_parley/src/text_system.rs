@@ -80,7 +80,10 @@ impl ParleyLayout {
 
     fn caret_position(cursor: Cursor) -> CaretPosition {
         let gpui_affinity = cursor.affinity().into_affinity();
-        CaretPosition::new(cursor.index(), gpui_affinity)
+        CaretPosition {
+            index: cursor.index(),
+            affinity: gpui_affinity,
+        }
     }
 
     fn cursor(&self, caret: CaretPosition) -> Cursor {
@@ -1391,7 +1394,7 @@ mod tests {
             ),
             px(500.0),
         );
-        let middle = CaretPosition::new(2, CaretAffinity::Downstream);
+        let middle = CaretPosition::attached_to_next_cluster(2);
         assert_eq!(
             single_line
                 .move_caret(middle, TextMovement::VisualUp, None)
@@ -1426,7 +1429,10 @@ mod tests {
         let end = layout
             .closest_caret_for_position(point(px(10_000.0), px(10.0)), line_height)
             .unwrap_err();
-        let selection = CaretSelection::new(end, start);
+        let selection = CaretSelection {
+            anchor: end,
+            caret: start,
+        };
         let collapsed_left = layout.move_selection(
             selection,
             TextMovement::VisualLeft,
@@ -1435,7 +1441,7 @@ mod tests {
             line_height,
         );
         assert!(collapsed_left.selection.is_empty());
-        assert_eq!(collapsed_left.selection.focus, start);
+        assert_eq!(collapsed_left.selection.caret, start);
         let collapsed_right = layout.move_selection(
             selection,
             TextMovement::VisualRight,
@@ -1443,19 +1449,19 @@ mod tests {
             None,
             line_height,
         );
-        assert_eq!(collapsed_right.selection.focus, end);
+        assert_eq!(collapsed_right.selection.caret, end);
 
         let word = layout.move_selection(
-            CaretSelection::collapsed(start),
+            start.into(),
             TextMovement::VisualWordRight,
             true,
             None,
             line_height,
         );
         assert_eq!(word.selection.anchor, start);
-        assert_ne!(word.selection.focus, start);
+        assert_ne!(word.selection.caret, start);
         let down = layout.move_selection(
-            CaretSelection::collapsed(word.selection.focus),
+            word.selection.caret.into(),
             TextMovement::VisualDown,
             false,
             None,

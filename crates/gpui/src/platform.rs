@@ -1272,7 +1272,7 @@ impl PlatformTextLayout for TestPlatformTextLayout {
                     .total_cmp(&(f32::from(*right) - f32::from(point.x)).abs())
             })
             .map_or(0, |(index, _)| *index);
-        let caret = self.refresh_caret(CaretPosition::new(index, CaretAffinity::Downstream));
+        let caret = self.refresh_caret(CaretPosition::attached_to_next_cluster(index));
         if point.y >= Pixels::ZERO
             && point.y < line_height
             && point.x >= Pixels::ZERO
@@ -1309,7 +1309,7 @@ impl PlatformTextLayout for TestPlatformTextLayout {
         } else {
             caret.affinity
         };
-        CaretPosition::new(index, affinity)
+        CaretPosition { index, affinity }
     }
 
     fn move_visual(
@@ -1327,7 +1327,7 @@ impl PlatformTextLayout for TestPlatformTextLayout {
             VisualDirection::Right => position.checked_add(1)?,
         };
         let index = self.stops.get(position)?.0;
-        Some(self.refresh_caret(CaretPosition::new(index, CaretAffinity::Downstream)))
+        Some(self.refresh_caret(CaretPosition::attached_to_next_cluster(index)))
     }
 
     fn selection_geometry(&self, range: Range<usize>, line_height: Pixels) -> Vec<Bounds<Pixels>> {
@@ -1335,13 +1335,13 @@ impl PlatformTextLayout for TestPlatformTextLayout {
             return Vec::new();
         }
         let Some(start) = self.caret_geometry(
-            CaretPosition::new(range.start, CaretAffinity::Downstream),
+            CaretPosition::attached_to_next_cluster(range.start),
             line_height,
         ) else {
             return Vec::new();
         };
         let Some(end) = self.caret_geometry(
-            CaretPosition::new(range.end, CaretAffinity::Upstream),
+            CaretPosition::attached_to_previous_cluster(range.end),
             line_height,
         ) else {
             return Vec::new();
@@ -1419,7 +1419,7 @@ impl PlatformTextLayout for TestPlatformTextLayout {
                 })
             });
         (
-            self.refresh_caret(CaretPosition::new(index, CaretAffinity::Downstream)),
+            self.refresh_caret(CaretPosition::attached_to_next_cluster(index)),
             preferred_x,
         )
     }

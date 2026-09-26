@@ -166,7 +166,7 @@ impl EditableTextState {
     }
 
     pub(super) fn caret(&self) -> CaretPosition {
-        self.selected_range.focus
+        self.selected_range.caret
     }
 
     /// Returns the IME marked range for character operations.
@@ -232,7 +232,7 @@ impl AccessibilityTextMetrics {
 
         (
             byte_to_character(selection.anchor.index),
-            byte_to_character(selection.focus.index),
+            byte_to_character(selection.caret.index),
         )
     }
 }
@@ -280,7 +280,11 @@ impl EditableTextState {
         self.record_history(range.clone(), text_to_insert.len());
         self.storage.replace_range(range, text_to_insert);
         let affinity = CaretAffinity::for_inserted_text(text_to_insert);
-        self.selected_range = CaretSelection::collapsed(CaretPosition::new(end_pos, affinity));
+        self.selected_range = CaretPosition {
+            index: end_pos,
+            affinity,
+        }
+        .into();
         self.preferred_x = None;
         self.marked_range = None;
     }
@@ -325,7 +329,7 @@ impl EditableTextState {
         }
 
         let Some(document) = self.current_document() else {
-            return CaretPosition::new(storage_len_utf8, CaretAffinity::Upstream);
+            return CaretPosition::attached_to_previous_cluster(storage_len_utf8);
         };
         document
             .closest_caret_for_position(point, line_height)
@@ -418,13 +422,13 @@ impl EditableTextState {
     /// Will cause the current scroll position/offset to update on the next frame,
     /// if the line the carent is on is out of view.
     pub fn move_to(&mut self, caret_pos: usize, cx: &mut Context<Self>) {
-        self.move_to_caret(CaretPosition::new(caret_pos, CaretAffinity::Downstream), cx);
+        self.move_to_caret(CaretPosition::attached_to_next_cluster(caret_pos), cx);
     }
 
     fn move_to_caret(&mut self, mut caret: CaretPosition, cx: &mut Context<Self>) {
         cx.emit(CaretNotify::PauseBlinking);
         caret.index = caret.index.min(self.storage.content_utf8().len());
-        self.selected_range = CaretSelection::collapsed(caret);
+        self.selected_range = caret.into();
         self.preferred_x = None;
         self.scroll_to_caret();
         cx.notify();
@@ -435,13 +439,13 @@ impl EditableTextState {
     /// Will cause the current scroll position/offset to update on the next frame,
     /// if the line the carent is on is out of view.
     pub fn select_to(&mut self, caret_pos: usize, cx: &mut Context<Self>) {
-        self.select_to_caret(CaretPosition::new(caret_pos, CaretAffinity::Downstream), cx);
+        self.select_to_caret(CaretPosition::attached_to_next_cluster(caret_pos), cx);
     }
 
     fn select_to_caret(&mut self, mut caret: CaretPosition, cx: &mut Context<Self>) {
         cx.emit(CaretNotify::PauseBlinking);
         caret.index = caret.index.min(self.as_str().len());
-        self.selected_range = self.selected_range.with_focus(caret);
+        self.selected_range = self.selected_range.with_caret(caret);
         self.preferred_x = None;
         self.scroll_to_caret();
         cx.notify();
@@ -534,7 +538,7 @@ impl EditableTextState {
     ) {
         let caret_pos = match self.selected_range.is_empty() {
             false => match direction {
-                NavigationDirection::Back => self.selected_range.focus.index,
+                NavigationDirection::Back => self.selected_range.caret.index,
                 NavigationDirection::Forward => self.selected_range.anchor.index,
             },
             true => self
@@ -568,7 +572,7 @@ impl EditableTextState {
             cx.emit(CaretNotify::PauseBlinking);
             let storage_len = self.storage.content_utf8().len();
             let mut selection = moved.selection;
-            selection.focus.index = selection.focus.index.min(storage_len);
+            selection.caret.index = selection.caret.index.min(storage_len);
             selection.anchor.index = selection.anchor.index.min(storage_len);
             self.selected_range = selection;
             self.preferred_x = moved.preferred_x;
@@ -611,23 +615,22 @@ impl EditableTextState {
             let index = match direction {
                 NavigationDirection::Back => self
                     .selected_range
-                    .focus
+                    .caret
                     .index
                     .min(self.selected_range.anchor.index),
                 NavigationDirection::Forward => self
                     .selected_range
-                    .focus
+                    .caret
                     .index
                     .max(self.selected_range.anchor.index),
             };
-            self.move_to_caret(CaretPosition::new(index, CaretAffinity::Downstream), cx);
+            self.move_to_caret(CaretPosition::attached_to_next_cluster(index), cx);
             return;
         } else {
             self.caret().index
         };
-        let caret = CaretPosition::new(
+        let caret = CaretPosition::attached_to_next_cluster(
             self.storage.offset_from_caret(base, direction, boundary),
-            CaretAffinity::Downstream,
         );
         if extend {
             self.select_to_caret(caret, cx);
@@ -638,7 +641,7 @@ impl EditableTextState {
 
     /// Sets the current selection to be the entire text in the storage medium
     pub fn select_document(&mut self, cx: &mut Context<Self>) {
-        self.selected_range = (0, self.storage.content_utf8().len()).into();
+        self.selected_range = (0..self.storage.content_utf8().len()).into();
         self.preferred_x = None;
         cx.notify();
     }
@@ -699,7 +702,7 @@ impl EditableTextState {
         } else {
             line_end
         };
-        self.selected_range = (line_start, line_end_with_newline).into();
+        self.selected_range = (line_start..line_end_with_newline).into();
         self.preferred_x = None;
         cx.notify();
     }
@@ -901,7 +904,7 @@ impl EntityInputHandler for EditableTextState {
         let start = range.start.min(document.text.len());
         let end = range.end.min(document.text.len());
         if start == end {
-            let caret = CaretPosition::new(start, CaretAffinity::Downstream);
+            let caret = CaretPosition::attached_to_next_cluster(start);
             let position = document.position_for_caret(caret, line_height)?;
             return Some(Bounds::from_corners(
                 bounds.origin + position,
@@ -1259,11 +1262,14 @@ mod tests {
         let metrics = AccessibilityTextMetrics::new(text, 0);
         let start = 1;
         let end = "A😀日本".len();
-        let forward = CaretSelection::new(
-            CaretPosition::new(start, CaretAffinity::Downstream),
-            CaretPosition::new(end, CaretAffinity::Downstream),
-        );
-        let reversed = CaretSelection::new(forward.focus, forward.anchor);
+        let forward = CaretSelection {
+            anchor: CaretPosition::attached_to_next_cluster(start),
+            caret: CaretPosition::attached_to_next_cluster(end),
+        };
+        let reversed = CaretSelection {
+            anchor: forward.caret,
+            caret: forward.anchor,
+        };
 
         assert_eq!(metrics.character_indices_for_selection(forward), (1, 4));
         assert_eq!(metrics.character_indices_for_selection(reversed), (4, 1));
@@ -1367,7 +1373,7 @@ mod tests {
 
     #[gpui::test]
     fn test_left_collapses_selection_to_start(cx: &mut TestAppContext) {
-        let view = create_test_input(cx, "hello", (1, 4));
+        let view = create_test_input(cx, "hello", 1..4);
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.nav_left(&NavLeft, window, cx);
@@ -1417,7 +1423,7 @@ mod tests {
 
     #[gpui::test]
     fn test_right_collapses_selection_to_end(cx: &mut TestAppContext) {
-        let view = create_test_input(cx, "hello", (1, 4));
+        let view = create_test_input(cx, "hello", 1..4);
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.nav_right(&NavRight, window, cx);
@@ -1579,7 +1585,7 @@ mod tests {
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.select_left(&SelectLeft, window, cx);
-                assert_eq!(input.selected_range, (2, 3).into());
+                assert_eq!(input.selected_range, (2..3).into());
             });
         })
         .unwrap();
@@ -1591,7 +1597,7 @@ mod tests {
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.select_right(&SelectRight, window, cx);
-                assert_eq!(input.selected_range, (3, 2).into());
+                assert_eq!(input.selected_range, (3..2).into());
             });
         })
         .unwrap();
@@ -1603,7 +1609,7 @@ mod tests {
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.select_all(&SelectAll, window, cx);
-                assert_eq!(input.selected_range, (0, 11).into());
+                assert_eq!(input.selected_range, (0..11).into());
             });
         })
         .unwrap();
@@ -1615,7 +1621,7 @@ mod tests {
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.select_start(&SelectDocumentStart, window, cx);
-                assert_eq!(input.selected_range, (0, 6).into());
+                assert_eq!(input.selected_range, (0..6).into());
             });
         })
         .unwrap();
@@ -1627,7 +1633,7 @@ mod tests {
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.select_end(&SelectDocumentEnd, window, cx);
-                assert_eq!(input.selected_range, (11, 6).into());
+                assert_eq!(input.selected_range, (11..6).into());
             });
         })
         .unwrap();
@@ -1639,7 +1645,7 @@ mod tests {
 
     #[gpui::test]
     fn test_backspace_deletes_selection(cx: &mut TestAppContext) {
-        let view = create_test_input(cx, "hello world", (6, 11));
+        let view = create_test_input(cx, "hello world", 6..11);
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.delete_left(&DeleteLeft, window, cx);
@@ -1695,7 +1701,7 @@ mod tests {
 
     #[gpui::test]
     fn test_delete_deletes_selection(cx: &mut TestAppContext) {
-        let view = create_test_input(cx, "hello world", (0, 5));
+        let view = create_test_input(cx, "hello world", 0..5);
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.delete_right(&DeleteRight, window, cx);
@@ -1753,7 +1759,7 @@ mod tests {
 
     #[gpui::test]
     fn test_enter_replaces_selection(cx: &mut TestAppContext) {
-        let view = create_test_input(cx, "hello world", (5, 6));
+        let view = create_test_input(cx, "hello world", 5..6);
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.layout_data.supports_multiline = true;
@@ -1771,7 +1777,7 @@ mod tests {
 
     #[gpui::test]
     fn test_copy_with_selection(cx: &mut TestAppContext) {
-        let view = create_test_input(cx, "hello world", (6, 11));
+        let view = create_test_input(cx, "hello world", 6..11);
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.copy(&Copy, window, cx);
@@ -1786,7 +1792,7 @@ mod tests {
 
     #[gpui::test]
     fn test_cut_with_selection(cx: &mut TestAppContext) {
-        let view = create_test_input(cx, "hello world", (0, 5));
+        let view = create_test_input(cx, "hello world", 0..5);
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.cut(&Cut, window, cx);
@@ -1810,7 +1816,7 @@ mod tests {
                 assert_eq!(input.as_str(), "hello there world");
                 assert_eq!(
                     input.selected_range,
-                    CaretSelection::collapsed(CaretPosition::new(11, CaretAffinity::Upstream))
+                    CaretPosition::attached_to_previous_cluster(11).into()
                 );
             });
         })
@@ -1861,11 +1867,11 @@ mod tests {
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.select_right(&SelectRight, window, cx);
-                assert_eq!(input.selected_range, (3, 0).into());
+                assert_eq!(input.selected_range, (3..0).into());
                 input.select_right(&SelectRight, window, cx);
-                assert_eq!(input.selected_range, (6, 0).into());
+                assert_eq!(input.selected_range, (6..0).into());
                 input.select_right(&SelectRight, window, cx);
-                assert_eq!(input.selected_range, (9, 0).into());
+                assert_eq!(input.selected_range, (9..0).into());
             });
         })
         .unwrap();
@@ -1927,7 +1933,7 @@ mod tests {
 
     #[gpui::test]
     fn test_set_content_resets_selection(cx: &mut TestAppContext) {
-        let view = create_test_input(cx, "hello world", (3, 8));
+        let view = create_test_input(cx, "hello world", 3..8);
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.marked_range = Some(5..7);
@@ -1935,7 +1941,7 @@ mod tests {
                 assert_eq!(input.as_str(), "new content");
                 assert_eq!(
                     input.selected_range,
-                    CaretSelection::collapsed(CaretPosition::new(11, CaretAffinity::Upstream))
+                    CaretPosition::attached_to_previous_cluster(11).into()
                 );
                 assert_eq!(input.marked_range, None);
             });
@@ -1953,7 +1959,7 @@ mod tests {
 
                 input.selected_range = 0.into();
                 input.select_to(1000, cx);
-                assert_eq!(input.selected_range, (5, 0).into());
+                assert_eq!(input.selected_range, (5..0).into());
             });
         })
         .unwrap();
@@ -2016,20 +2022,20 @@ mod tests {
             view.input.update(cx, |input, cx| {
                 // Move right through: a -> 😀 -> b
                 input.nav_right(&NavRight, window, cx);
-                assert_eq!(input.selected_range.focus.index, 1); // after 'a'
+                assert_eq!(input.selected_range.caret.index, 1); // after 'a'
 
                 input.nav_right(&NavRight, window, cx);
-                assert_eq!(input.selected_range.focus.index, 5); // after 😀 (1 + 4 bytes)
+                assert_eq!(input.selected_range.caret.index, 5); // after 😀 (1 + 4 bytes)
 
                 input.nav_right(&NavRight, window, cx);
-                assert_eq!(input.selected_range.focus.index, 6); // after 'b'
+                assert_eq!(input.selected_range.caret.index, 6); // after 'b'
 
                 // Move left back
                 input.nav_left(&NavLeft, window, cx);
-                assert_eq!(input.selected_range.focus.index, 5); // before 'b'
+                assert_eq!(input.selected_range.caret.index, 5); // before 'b'
 
                 input.nav_left(&NavLeft, window, cx);
-                assert_eq!(input.selected_range.focus.index, 1); // before 😀
+                assert_eq!(input.selected_range.caret.index, 1); // before 😀
             });
         })
         .unwrap();
@@ -2045,13 +2051,13 @@ mod tests {
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.nav_right(&NavRight, window, cx); // past 'a'
-                assert_eq!(input.selected_range.focus.index, 1);
+                assert_eq!(input.selected_range.caret.index, 1);
 
                 input.nav_right(&NavRight, window, cx); // past entire emoji with modifier
-                assert_eq!(input.selected_range.focus.index, 9); // 1 + 8
+                assert_eq!(input.selected_range.caret.index, 9); // 1 + 8
 
                 input.nav_left(&NavLeft, window, cx); // back before emoji
-                assert_eq!(input.selected_range.focus.index, 1);
+                assert_eq!(input.selected_range.caret.index, 1);
             });
         })
         .unwrap();
@@ -2069,13 +2075,13 @@ mod tests {
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.nav_right(&NavRight, window, cx); // past 'x'
-                assert_eq!(input.selected_range.focus.index, 1);
+                assert_eq!(input.selected_range.caret.index, 1);
 
                 input.nav_right(&NavRight, window, cx); // past entire ZWJ sequence
-                assert_eq!(input.selected_range.focus.index, 19); // 1 + 18
+                assert_eq!(input.selected_range.caret.index, 19); // 1 + 18
 
                 input.nav_right(&NavRight, window, cx); // past 'y'
-                assert_eq!(input.selected_range.focus.index, 20);
+                assert_eq!(input.selected_range.caret.index, 20);
             });
         })
         .unwrap();
@@ -2088,7 +2094,7 @@ mod tests {
             view.input.update(cx, |input, cx| {
                 input.delete_left(&DeleteLeft, window, cx);
                 assert_eq!(input.as_str(), "ab");
-                assert_eq!(input.selected_range.focus.index, 1);
+                assert_eq!(input.selected_range.caret.index, 1);
             });
         })
         .unwrap();
@@ -2105,7 +2111,7 @@ mod tests {
             view.input.update(cx, |input, cx| {
                 input.delete_left(&DeleteLeft, window, cx);
                 assert_eq!(input.as_str(), "ab");
-                assert_eq!(input.selected_range.focus.index, 1);
+                assert_eq!(input.selected_range.caret.index, 1);
             });
         })
         .unwrap();
@@ -2118,7 +2124,7 @@ mod tests {
             view.input.update(cx, |input, cx| {
                 input.delete_right(&DeleteRight, window, cx);
                 assert_eq!(input.as_str(), "ab");
-                assert_eq!(input.selected_range.focus.index, 1);
+                assert_eq!(input.selected_range.caret.index, 1);
             });
         })
         .unwrap();
@@ -2135,7 +2141,7 @@ mod tests {
             view.input.update(cx, |input, cx| {
                 input.nav_right(&NavRight, window, cx); // past 'x'
                 input.nav_right(&NavRight, window, cx); // past flag (should be single grapheme)
-                assert_eq!(input.selected_range.focus.index, 9); // 1 + 8
+                assert_eq!(input.selected_range.caret.index, 9); // 1 + 8
             });
         })
         .unwrap();
@@ -2151,13 +2157,13 @@ mod tests {
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.nav_right(&NavRight, window, cx); // past 'a'
-                assert_eq!(input.selected_range.focus.index, 1);
+                assert_eq!(input.selected_range.caret.index, 1);
 
                 input.nav_right(&NavRight, window, cx); // past e + combining mark (single grapheme)
-                assert_eq!(input.selected_range.focus.index, 4); // 1 + 3
+                assert_eq!(input.selected_range.caret.index, 4); // 1 + 3
 
                 input.nav_left(&NavLeft, window, cx);
-                assert_eq!(input.selected_range.focus.index, 1);
+                assert_eq!(input.selected_range.caret.index, 1);
             });
         })
         .unwrap();
@@ -2174,7 +2180,7 @@ mod tests {
             view.input.update(cx, |input, cx| {
                 input.nav_right(&NavRight, window, cx); // past 'x'
                 input.nav_right(&NavRight, window, cx); // past entire combined character
-                assert_eq!(input.selected_range.focus.index, 6); // 1 + 5
+                assert_eq!(input.selected_range.caret.index, 6); // 1 + 5
             });
         })
         .unwrap();
@@ -2186,7 +2192,7 @@ mod tests {
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.select_right(&SelectRight, window, cx);
-                assert_eq!(input.selected_range, (5, 1).into()); // selected the entire emoji
+                assert_eq!(input.selected_range, (5..1).into()); // selected the entire emoji
             });
         })
         .unwrap();
@@ -2199,16 +2205,16 @@ mod tests {
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.nav_right(&NavRight, window, cx); // past 'a'
-                assert_eq!(input.selected_range.focus.index, 1);
+                assert_eq!(input.selected_range.caret.index, 1);
 
                 input.nav_right(&NavRight, window, cx); // past 你
-                assert_eq!(input.selected_range.focus.index, 4); // 1 + 3
+                assert_eq!(input.selected_range.caret.index, 4); // 1 + 3
 
                 input.nav_right(&NavRight, window, cx); // past 好
-                assert_eq!(input.selected_range.focus.index, 7); // 4 + 3
+                assert_eq!(input.selected_range.caret.index, 7); // 4 + 3
 
                 input.nav_right(&NavRight, window, cx); // past 'b'
-                assert_eq!(input.selected_range.focus.index, 8);
+                assert_eq!(input.selected_range.caret.index, 8);
             });
         })
         .unwrap();
@@ -2221,23 +2227,23 @@ mod tests {
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.nav_right(&NavRight, window, cx); // past 'H'
-                assert_eq!(input.selected_range.focus.index, 1);
+                assert_eq!(input.selected_range.caret.index, 1);
 
                 input.nav_right(&NavRight, window, cx); // past 'i'
-                assert_eq!(input.selected_range.focus.index, 2);
+                assert_eq!(input.selected_range.caret.index, 2);
 
                 input.nav_right(&NavRight, window, cx); // past 你 (3 bytes)
-                assert_eq!(input.selected_range.focus.index, 5);
+                assert_eq!(input.selected_range.caret.index, 5);
 
                 input.nav_right(&NavRight, window, cx); // past 😀 (4 bytes)
-                assert_eq!(input.selected_range.focus.index, 9);
+                assert_eq!(input.selected_range.caret.index, 9);
 
                 // Now go back
                 input.nav_left(&NavLeft, window, cx);
-                assert_eq!(input.selected_range.focus.index, 5);
+                assert_eq!(input.selected_range.caret.index, 5);
 
                 input.nav_left(&NavLeft, window, cx);
-                assert_eq!(input.selected_range.focus.index, 2);
+                assert_eq!(input.selected_range.caret.index, 2);
             });
         })
         .unwrap();
@@ -2254,7 +2260,7 @@ mod tests {
             view.input.update(cx, |input, cx| {
                 input.nav_right(&NavRight, window, cx); // past 'a'
                 input.nav_right(&NavRight, window, cx); // past emoji with variation selector
-                assert_eq!(input.selected_range.focus.index, 7); // 1 + 6
+                assert_eq!(input.selected_range.caret.index, 7); // 1 + 6
             });
         })
         .unwrap();
@@ -2271,7 +2277,7 @@ mod tests {
                 input.nav_right(&NavRight, window, cx); // past 'x'
                 input.nav_right(&NavRight, window, cx); // past keycap sequence
                 let expected_pos = 1 + keycap.len();
-                assert_eq!(input.selected_range.focus.index, expected_pos);
+                assert_eq!(input.selected_range.caret.index, expected_pos);
             });
         })
         .unwrap();
@@ -2337,7 +2343,7 @@ mod tests {
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.select_up(&SelectUp, window, cx);
-                assert_eq!(input.selected_range, (0, 5).into());
+                assert_eq!(input.selected_range, (0..5).into());
             });
         })
         .unwrap();
@@ -2349,7 +2355,7 @@ mod tests {
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.select_down(&SelectDown, window, cx);
-                assert_eq!(input.selected_range, (11, 5).into()); // "hello world".len() == 11
+                assert_eq!(input.selected_range, (11..5).into()); // "hello world".len() == 11
             });
         })
         .unwrap();
@@ -2426,11 +2432,11 @@ mod tests {
 
     #[gpui::test]
     fn test_undo_restores_selection(cx: &mut TestAppContext) {
-        let view = create_test_input(cx, "hello world", (0, 5));
+        let view = create_test_input(cx, "hello world", 0..5);
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 without_history_grouping(input);
-                input.selected_range.focus.affinity = CaretAffinity::Upstream;
+                input.selected_range.caret.affinity = CaretAffinity::Upstream;
                 input.selected_range.anchor.affinity = CaretAffinity::Downstream;
 
                 // Delete selection
@@ -2443,10 +2449,10 @@ mod tests {
                 assert_eq!(input.as_str(), "hello world");
                 assert_eq!(
                     input.selected_range,
-                    CaretSelection::from_focus_anchor(
-                        CaretPosition::new(0, CaretAffinity::Upstream),
-                        CaretPosition::new(5, CaretAffinity::Downstream),
-                    )
+                    CaretSelection {
+                        anchor: CaretPosition::attached_to_next_cluster(5),
+                        caret: CaretPosition::attached_to_previous_cluster(0),
+                    }
                 );
             });
         })
@@ -2572,7 +2578,7 @@ mod tests {
 
     #[gpui::test]
     fn test_cut_is_undoable(cx: &mut TestAppContext) {
-        let view = create_test_input(cx, "hello world", (0, 5));
+        let view = create_test_input(cx, "hello world", 0..5);
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 without_history_grouping(input);
@@ -2686,7 +2692,7 @@ mod tests {
     #[gpui::test]
     fn test_delete_word_left_with_selection(cx: &mut TestAppContext) {
         // Selection from 0 to 5 ("hello")
-        let view = create_test_input(cx, "hello world", (0, 5));
+        let view = create_test_input(cx, "hello world", 0..5);
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.delete_word_left(&DeleteWordLeft, window, cx);
@@ -2724,7 +2730,7 @@ mod tests {
 
     #[gpui::test]
     fn test_delete_word_right_with_selection(cx: &mut TestAppContext) {
-        let view = create_test_input(cx, "hello world", (0, 5));
+        let view = create_test_input(cx, "hello world", 0..5);
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 input.delete_word_right(&DeleteWordRight, window, cx);

@@ -233,80 +233,81 @@ pub struct CaretPosition {
 }
 
 impl CaretPosition {
-    /// Creates a caret at a byte index with the given affinity.
-    pub fn new(index: usize, affinity: CaretAffinity) -> Self {
-        Self { index, affinity }
+    /// Creates a caret attached to the next logical cluster.
+    pub const fn attached_to_next_cluster(index: usize) -> Self {
+        Self {
+            index,
+            affinity: CaretAffinity::Downstream,
+        }
+    }
+
+    /// Creates a caret attached to the previous logical cluster.
+    pub const fn attached_to_previous_cluster(index: usize) -> Self {
+        Self {
+            index,
+            affinity: CaretAffinity::Upstream,
+        }
     }
 }
 
 /// An affinity-aware text selection.
 ///
-/// The anchor stays fixed while the focus is the active caret.
+/// The anchor stays fixed while the caret is the active endpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaretSelection {
     /// The fixed end of the selection.
     pub anchor: CaretPosition,
     /// The active end of the selection.
-    pub focus: CaretPosition,
+    pub caret: CaretPosition,
 }
 
 impl From<usize> for CaretSelection {
     fn from(index: usize) -> Self {
-        Self::collapsed(CaretPosition::new(index, CaretAffinity::Downstream))
+        CaretPosition::attached_to_next_cluster(index).into()
     }
 }
 
-/// Creates a downstream-affinity selection from `(focus, anchor)` byte indices.
-impl From<(usize, usize)> for CaretSelection {
-    fn from((focus, anchor): (usize, usize)) -> Self {
-        Self::from_focus_anchor(
-            CaretPosition::new(focus, CaretAffinity::Downstream),
-            CaretPosition::new(anchor, CaretAffinity::Downstream),
-        )
+impl From<CaretPosition> for CaretSelection {
+    fn from(caret: CaretPosition) -> Self {
+        Self {
+            anchor: caret,
+            caret,
+        }
     }
 }
 
-/// Creates a downstream-affinity selection whose focus is `start` and anchor is `end`.
+/// Creates a downstream-affinity selection whose caret is `start` and anchor is `end`.
 impl From<Range<usize>> for CaretSelection {
     fn from(range: Range<usize>) -> Self {
-        Self::from((range.start, range.end))
+        Self {
+            anchor: CaretPosition::attached_to_next_cluster(range.end),
+            caret: CaretPosition::attached_to_next_cluster(range.start),
+        }
     }
 }
 
 impl CaretSelection {
-    /// Creates a selection from its fixed anchor and active focus.
-    pub fn new(anchor: CaretPosition, focus: CaretPosition) -> Self {
-        Self { anchor, focus }
-    }
-
-    /// Creates a selection from its active focus and fixed anchor.
-    pub fn from_focus_anchor(focus: CaretPosition, anchor: CaretPosition) -> Self {
-        Self { anchor, focus }
-    }
-
-    /// Creates an empty selection at `caret`.
-    pub fn collapsed(caret: CaretPosition) -> Self {
-        Self::new(caret, caret)
-    }
-
     /// Returns whether the selection is empty.
     pub fn is_empty(&self) -> bool {
-        self.anchor.index == self.focus.index
+        self.anchor.index == self.caret.index
     }
 
-    /// Compares the active focus's UTF-8 byte index with the fixed anchor's index.
+    /// Compares the active caret's UTF-8 byte index with the fixed anchor's index.
     pub fn endpoint_ordering(self) -> std::cmp::Ordering {
-        self.focus.index.cmp(&self.anchor.index)
+        self.caret.index.cmp(&self.anchor.index)
     }
 
     /// Returns the selected UTF-8 byte range in logical order.
     pub fn byte_range(self) -> Range<usize> {
-        self.anchor.index.min(self.focus.index)..self.anchor.index.max(self.focus.index)
+        self.anchor.index.min(self.caret.index)..self.anchor.index.max(self.caret.index)
     }
 
     /// Moves the active end while preserving the anchor.
-    pub fn with_focus(self, focus: CaretPosition) -> Self {
-        Self { focus, ..self }
+    pub fn with_caret(self, caret: CaretPosition) -> Self {
+        Self {
+            anchor: self.anchor,
+            caret,
+        }
     }
 }
 
@@ -442,10 +443,7 @@ impl WrappedLineLayout {
 
         self.layout
             .platform_layout
-            .caret_geometry(
-                CaretPosition::new(index, CaretAffinity::Downstream),
-                line_height,
-            )
+            .caret_geometry(CaretPosition::attached_to_next_cluster(index), line_height)
             .map(|bounds| bounds.origin)
     }
 
@@ -505,7 +503,7 @@ impl WrappedLineLayout {
     /// Moves or extends an affinity-aware selection using visual text order.
     ///
     /// Horizontal movement without extension collapses a non-empty selection toward the requested
-    /// visual edge. Other movement starts at the focus. Extending keeps the anchor fixed.
+    /// visual edge. Other movement starts at the caret. Extending keeps the anchor fixed.
     pub fn move_selection(
         &self,
         selection: CaretSelection,
@@ -525,39 +523,39 @@ impl WrappedLineLayout {
             );
 
         if !extend && !selection.is_empty() && horizontal {
-            let focus_position = self.position_for_caret(selection.focus, line_height);
+            let caret_position = self.position_for_caret(selection.caret, line_height);
             let anchor_position = self.position_for_caret(selection.anchor, line_height);
-            let (visual_start, visual_end) = focus_position
+            let (visual_start, visual_end) = caret_position
                 .zip(anchor_position)
-                .map(|(focus_position, anchor_position)| {
-                    if (focus_position.y, focus_position.x)
+                .map(|(caret_position, anchor_position)| {
+                    if (caret_position.y, caret_position.x)
                         <= (anchor_position.y, anchor_position.x)
                     {
-                        (selection.focus, selection.anchor)
+                        (selection.caret, selection.anchor)
                     } else {
-                        (selection.anchor, selection.focus)
+                        (selection.anchor, selection.caret)
                     }
                 })
                 .unwrap_or_else(|| {
-                    if selection.focus.index <= selection.anchor.index {
-                        (selection.focus, selection.anchor)
+                    if selection.caret.index <= selection.anchor.index {
+                        (selection.caret, selection.anchor)
                     } else {
-                        (selection.anchor, selection.focus)
+                        (selection.anchor, selection.caret)
                     }
                 });
             let caret = if forward { visual_end } else { visual_start };
             return CaretSelectionMove {
-                selection: CaretSelection::collapsed(caret),
+                selection: caret.into(),
                 preferred_x: None,
             };
         }
 
-        let (focus, preferred_x) = self.move_caret(selection.focus, movement, preferred_x);
+        let (caret, preferred_x) = self.move_caret(selection.caret, movement, preferred_x);
         CaretSelectionMove {
             selection: if extend {
-                selection.with_focus(focus)
+                selection.with_caret(caret)
             } else {
-                CaretSelection::collapsed(focus)
+                caret.into()
             },
             preferred_x,
         }
@@ -898,24 +896,24 @@ mod tests {
 
     #[test]
     fn caret_selection_endpoint_ordering_uses_byte_indices() {
-        for (focus, anchor, expected) in [
+        for (caret, anchor, expected) in [
             (
-                CaretPosition::new(2, CaretAffinity::Downstream),
-                CaretPosition::new(5, CaretAffinity::Downstream),
+                CaretPosition::attached_to_next_cluster(2),
+                CaretPosition::attached_to_next_cluster(5),
                 std::cmp::Ordering::Less,
             ),
             (
-                CaretPosition::new(5, CaretAffinity::Downstream),
-                CaretPosition::new(5, CaretAffinity::Upstream),
+                CaretPosition::attached_to_next_cluster(5),
+                CaretPosition::attached_to_previous_cluster(5),
                 std::cmp::Ordering::Equal,
             ),
             (
-                CaretPosition::new(8, CaretAffinity::Upstream),
-                CaretPosition::new(5, CaretAffinity::Downstream),
+                CaretPosition::attached_to_previous_cluster(8),
+                CaretPosition::attached_to_next_cluster(5),
                 std::cmp::Ordering::Greater,
             ),
         ] {
-            let selection = CaretSelection::from_focus_anchor(focus, anchor);
+            let selection = CaretSelection { anchor, caret };
             assert_eq!(selection.endpoint_ordering(), expected);
         }
     }
