@@ -308,17 +308,46 @@ impl EditableTextState {
             .visual_position_for_caret(caret, self.layout_data.line_height)
     }
 
-    fn cluster_deletion_range(&self, direction: NavigationDirection) -> Option<Range<usize>> {
-        let range = match direction {
-            NavigationDirection::Back => self
-                .current_document()?
-                .logical_cluster_before(self.caret()),
-            NavigationDirection::Forward => {
-                self.current_document()?.logical_cluster_after(self.caret())
-            }
-        }?;
+    /// Returns the storage range a deletion command should remove using the current text layout.
+    /// Returns `None` when the current layout cannot provide the range.
+    fn deletion_range_from_layout(
+        &self,
+        direction: NavigationDirection,
+        boundary: TextBoundary,
+    ) -> Option<Range<usize>> {
+        let document = self.current_document()?;
+        let caret = self.caret();
 
-        (!range.is_empty() && self.as_str().contains_range(&range)).then_some(range)
+        let movement = match (direction, boundary) {
+            (NavigationDirection::Back, TextBoundary::Cluster) => {
+                return document
+                    .logical_cluster_before(caret)
+                    .filter(|range| !range.is_empty() && self.as_str().contains_range(range));
+            }
+            (NavigationDirection::Forward, TextBoundary::Cluster) => {
+                return document
+                    .logical_cluster_after(caret)
+                    .filter(|range| !range.is_empty() && self.as_str().contains_range(range));
+            }
+            (NavigationDirection::Back, TextBoundary::Word) => {
+                Direction::Left.with_boundary(TextBoundary::Word)
+            }
+            (NavigationDirection::Forward, TextBoundary::Word) => {
+                Direction::Right.with_boundary(TextBoundary::Word)
+            }
+            (NavigationDirection::Back, TextBoundary::HardLine) => {
+                Direction::Start.with_boundary(TextBoundary::HardLine)
+            }
+            (NavigationDirection::Forward, TextBoundary::HardLine) => {
+                Direction::End.with_boundary(TextBoundary::HardLine)
+            }
+            (_, TextBoundary::VisualLine) => return None,
+            (_, TextBoundary::Document) => return None,
+        };
+
+        let target = document.caret_movement(caret, movement, None).caret.index;
+
+        Some(target.min(caret.index)..target.max(caret.index))
     }
 
     /// Returns the utf-8 character position of the start of the line that contains the provided pixel-point.
@@ -476,38 +505,14 @@ impl EditableTextState {
         }
 
         let range = self.selected_byte_range();
-        let range = match range.is_empty() {
-            false => range,
-            true if matches!(boundary, TextBoundary::Cluster) => {
-                self.cluster_deletion_range(direction).unwrap_or_else(|| {
-                    self.storage
-                        .range_from_caret(self.caret().index, direction, boundary)
-                })
-            }
-            true if matches!(boundary, TextBoundary::Word | TextBoundary::HardLine) => self
-                .current_document()
-                .map(|document| {
-                    let movement_direction = match (direction, boundary) {
-                        (NavigationDirection::Back, TextBoundary::Word) => Direction::Left,
-                        (NavigationDirection::Forward, TextBoundary::Word) => Direction::Right,
-                        (NavigationDirection::Back, TextBoundary::HardLine) => Direction::Start,
-                        (NavigationDirection::Forward, TextBoundary::HardLine) => Direction::End,
-                        _ => unreachable!(),
-                    };
-                    let movement = movement_direction.with_boundary(boundary);
-                    let target = document
-                        .caret_movement(self.caret(), movement, None)
-                        .caret
-                        .index;
-                    target.min(self.caret().index)..target.max(self.caret().index)
-                })
+        let range = if range.is_empty() {
+            self.deletion_range_from_layout(direction, boundary)
                 .unwrap_or_else(|| {
                     self.storage
                         .range_from_caret(self.caret().index, direction, boundary)
-                }),
-            true => self
-                .storage
-                .range_from_caret(self.caret().index, direction, boundary),
+                })
+        } else {
+            range
         };
         let storage_len_utf8 = self.storage.content_utf8().len();
         let start = range.start.min(storage_len_utf8);
