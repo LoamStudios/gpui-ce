@@ -41,6 +41,10 @@ pub struct LineLayout {
 ///
 /// Byte positions are UTF-8 boundaries. Geometry is in GPUI layout coordinates, using the
 /// caller-provided line height. Implementations must preserve visual order and caret affinity.
+///
+/// A cluster is one backend-defined caret step. It may contain several Unicode scalar values, such
+/// as a combining sequence or an emoji ZWJ sequence. Logical clusters are independent of visual
+/// direction and soft-wrapped rows.
 pub trait PlatformTextLayout: Send + Sync + std::fmt::Debug {
     /// Length of the source text in UTF-8 bytes.
     fn len(&self) -> usize;
@@ -227,7 +231,11 @@ pub struct ShapedGlyph {
     pub is_emoji: bool,
 }
 
-/// Determines which logical neighbor owns a caret at a text boundary.
+/// Determines which logical neighbor owns a caret at a shared text boundary.
+///
+/// At a soft wrap, downstream places the caret at the next row's start, and upstream places it at
+/// the previous row's end. At a bidirectional boundary, affinities can place the same byte index at
+/// different horizontal positions. They refer to logical order, not visual left and right.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CaretAffinity {
     /// The caret attaches to the logically following cluster.
