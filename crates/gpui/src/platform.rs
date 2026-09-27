@@ -1407,7 +1407,7 @@ mod tests {
             &self,
             caret: CaretPosition,
             movement: TextMovement,
-            preferred_x: Option<Pixels>,
+            vertical_navigation_x: Option<Pixels>,
         ) -> CaretMovement {
             use TextBoundary::*;
             use TextDirection::*;
@@ -1448,20 +1448,20 @@ mod tests {
                 _ => caret.index,
             };
 
-            let preferred_x = matches!(movement.direction, TextDirection::Up | TextDirection::Down)
-                .then(|| {
-                    preferred_x.unwrap_or_else(|| {
+            let vertical_navigation_x =
+                matches!(movement.direction, TextDirection::Up | TextDirection::Down).then(|| {
+                    vertical_navigation_x.unwrap_or_else(|| {
                         self.caret_bounds(caret, self.size.height)
                             .map_or(Pixels::ZERO, |bounds| bounds.origin.x)
                     })
                 });
 
             CaretMovement {
-                caret: self.normalized_caret(CaretPosition {
+                result: self.normalized_caret(CaretPosition {
                     index,
                     affinity: CaretAffinity::Downstream,
                 }),
-                preferred_x,
+                vertical_navigation_x,
             }
         }
 

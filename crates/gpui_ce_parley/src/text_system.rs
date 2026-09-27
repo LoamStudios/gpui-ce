@@ -366,24 +366,24 @@ impl PlatformTextLayout for ParleyLayout {
         &self,
         caret: CaretPosition,
         movement: TextMovement,
-        preferred_x: Option<Pixels>,
+        vertical_navigation_x: Option<Pixels>,
     ) -> CaretMovement {
         let cursor = self.cursor(caret);
         let moved = match (movement.direction, movement.boundary) {
             (Direction::Left, Boundary::Cluster) => {
                 return CaretMovement {
-                    caret: self
+                    result: self
                         .adjacent_visual_caret(caret, VisualDirection::Left)
                         .unwrap_or(caret),
-                    preferred_x: None,
+                    vertical_navigation_x: None,
                 };
             }
             (Direction::Right, Boundary::Cluster) => {
                 return CaretMovement {
-                    caret: self
+                    result: self
                         .adjacent_visual_caret(caret, VisualDirection::Right)
                         .unwrap_or(caret),
-                    preferred_x: None,
+                    vertical_navigation_x: None,
                 };
             }
             (Direction::Left, Boundary::Word) => cursor.previous_visual_word(&self.layout),
@@ -427,23 +427,23 @@ impl PlatformTextLayout for ParleyLayout {
                         selection.next_line(&self.layout, false)
                     };
                     return CaretMovement {
-                        caret: Self::caret_position(moved.focus()),
-                        preferred_x,
+                        result: Self::caret_position(moved.focus()),
+                        vertical_navigation_x,
                     };
                 };
-                let x = preferred_x
+                let x = vertical_navigation_x
                     .map_or_else(|| cursor.geometry(&self.layout, 0.0).x0 as f32, f32::from);
                 let moved = Cursor::from_point(&self.layout, x, self.native_y_for_line(target_ix));
                 return CaretMovement {
-                    caret: Self::caret_position(moved),
-                    preferred_x: Some(px(x)),
+                    result: Self::caret_position(moved),
+                    vertical_navigation_x: Some(px(x)),
                 };
             }
             _ => cursor,
         };
         CaretMovement {
-            caret: Self::caret_position(moved),
-            preferred_x: None,
+            result: Self::caret_position(moved),
+            vertical_navigation_x: None,
         }
     }
 
@@ -1424,7 +1424,7 @@ mod tests {
                     Direction::Up.with_boundary(Boundary::VisualLine),
                     None
                 )
-                .caret
+                .result
                 .index,
             0
         );
@@ -1435,7 +1435,7 @@ mod tests {
                     Direction::Down.with_boundary(Boundary::VisualLine),
                     None
                 )
-                .caret
+                .result
                 .index,
             single_line_text.len()
         );
@@ -1470,8 +1470,8 @@ mod tests {
             None,
             line_height,
         );
-        assert!(collapsed_left.selection.is_empty());
-        assert_eq!(collapsed_left.selection.caret, start);
+        assert!(collapsed_left.result.is_empty());
+        assert_eq!(collapsed_left.result.caret, start);
         let collapsed_right = layout.selection_movement(
             selection,
             Direction::Right.with_boundary(Boundary::Cluster),
@@ -1479,7 +1479,7 @@ mod tests {
             None,
             line_height,
         );
-        assert_eq!(collapsed_right.selection.caret, end);
+        assert_eq!(collapsed_right.result.caret, end);
 
         let word = layout.selection_movement(
             start.into(),
@@ -1488,26 +1488,26 @@ mod tests {
             None,
             line_height,
         );
-        assert_eq!(word.selection.anchor, start);
-        assert_ne!(word.selection.caret, start);
+        assert_eq!(word.result.anchor, start);
+        assert_ne!(word.result.caret, start);
         let down = layout.selection_movement(
-            word.selection.caret.into(),
+            word.result.caret.into(),
             Direction::Down.with_boundary(Boundary::VisualLine),
             false,
             None,
             line_height,
         );
-        assert!(down.preferred_x.is_some());
+        assert!(down.vertical_navigation_x.is_some());
         let maintained_x = layout
             .selection_movement(
-                down.selection,
+                down.result,
                 Direction::Down.with_boundary(Boundary::VisualLine),
                 false,
-                down.preferred_x,
+                down.vertical_navigation_x,
                 line_height,
             )
-            .preferred_x;
-        assert_eq!(maintained_x, down.preferred_x);
+            .vertical_navigation_x;
+        assert_eq!(maintained_x, down.vertical_navigation_x);
         let selection = layout.selection_from_pixel_point(
             point(px(12.0), px(10.0)),
             line_height,

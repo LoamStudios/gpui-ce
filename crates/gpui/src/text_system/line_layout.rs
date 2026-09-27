@@ -85,12 +85,12 @@ pub trait PlatformTextLayout: Send + Sync + std::fmt::Debug {
     fn logical_cluster_before(&self, caret: CaretPosition) -> Option<Range<usize>>;
     /// Returns the atomic logical cluster after the caret.
     fn logical_cluster_after(&self, caret: CaretPosition) -> Option<Range<usize>>;
-    /// Returns the caret and preferred horizontal position after applying a movement.
+    /// Returns the caret and retained horizontal coordinate after applying a movement.
     fn caret_movement(
         &self,
         caret: CaretPosition,
         movement: TextMovement,
-        preferred_x: Option<Pixels>,
+        vertical_navigation_x: Option<Pixels>,
     ) -> CaretMovement;
     /// Returns the word or line selected at a point in GPUI layout coordinates.
     fn selection_from_pixel_point(
@@ -298,12 +298,13 @@ impl CaretPosition {
 
 /// An affinity-aware text selection.
 ///
-/// The anchor stays fixed while the caret is the active endpoint.
+/// The anchor stays fixed while the caret is the active endpoint. Either endpoint may be the
+/// logical start or end of the selected byte range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaretSelection {
-    /// The fixed end of the selection.
+    /// The fixed position of the selection, which may be its logical start or end.
     pub anchor: CaretPosition,
-    /// The active end of the selection.
+    /// The active position of the selection. When it equals `anchor`, the selection is empty.
     pub caret: CaretPosition,
 }
 
@@ -357,23 +358,18 @@ impl CaretSelection {
     }
 }
 
-/// The result of calculating a caret movement through a laid-out document.
+/// The result of calculating movement through a laid-out document.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CaretMovement {
-    /// The caret at the requested destination.
-    pub caret: CaretPosition,
-    /// The horizontal coordinate reused by consecutive vertical movements.
-    pub preferred_x: Option<Pixels>,
+pub struct CaretMovement<T = CaretPosition> {
+    /// The value at the requested destination.
+    pub result: T,
+    /// The horizontal coordinate from the layout's left edge retained across consecutive vertical
+    /// movements.
+    pub vertical_navigation_x: Option<Pixels>,
 }
 
 /// The result of calculating a selection movement through a laid-out document.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CaretSelectionMovement {
-    /// The selection after movement.
-    pub selection: CaretSelection,
-    /// The horizontal coordinate reused by consecutive vertical movements.
-    pub preferred_x: Option<Pixels>,
-}
+pub type CaretSelectionMovement = CaretMovement<CaretSelection>;
 
 /// A document layout with its optional wrapping constraint.
 #[derive(Debug)]
@@ -544,17 +540,17 @@ impl WrappedLineLayout {
         self.layout.platform_layout.logical_cluster_after(caret)
     }
 
-    /// Returns the caret and preferred horizontal position after applying `movement`.
+    /// Returns the caret and retained horizontal coordinate after applying `movement`.
     /// This only calculates the destination and does not mutate editor state.
     pub fn caret_movement(
         &self,
         caret: CaretPosition,
         movement: TextMovement,
-        preferred_x: Option<Pixels>,
+        vertical_navigation_x: Option<Pixels>,
     ) -> CaretMovement {
         self.layout
             .platform_layout
-            .caret_movement(caret, movement, preferred_x)
+            .caret_movement(caret, movement, vertical_navigation_x)
     }
 
     /// Returns a moved or extended affinity-aware selection using visual text order.
@@ -565,14 +561,14 @@ impl WrappedLineLayout {
     /// `selection` is the current anchor and active caret.
     /// `movement` supplies the direction and boundary.
     /// `extend` keeps the anchor fixed when true and collapses the result when false.
-    /// `preferred_x` carries the horizontal target across vertical movements.
+    /// `vertical_navigation_x` carries the horizontal target across vertical movements.
     /// `line_height` converts caret positions into comparable visual coordinates.
     pub fn selection_movement(
         &self,
         selection: CaretSelection,
         movement: TextMovement,
         extend: bool,
-        preferred_x: Option<Pixels>,
+        vertical_navigation_x: Option<Pixels>,
         line_height: Pixels,
     ) -> CaretSelectionMovement {
         let forward = movement.direction == TextDirection::Right;
@@ -611,21 +607,23 @@ impl WrappedLineLayout {
             let caret = if forward { visual_end } else { visual_start };
 
             return CaretSelectionMovement {
-                selection: caret.into(),
-                preferred_x: None,
+                result: caret.into(),
+                vertical_navigation_x: None,
             };
         }
 
-        let CaretMovement { caret, preferred_x } =
-            self.caret_movement(selection.caret, movement, preferred_x);
+        let CaretMovement {
+            result: caret,
+            vertical_navigation_x,
+        } = self.caret_movement(selection.caret, movement, vertical_navigation_x);
 
         CaretSelectionMovement {
-            selection: if extend {
+            result: if extend {
                 selection.with_caret(caret)
             } else {
                 caret.into()
             },
-            preferred_x,
+            vertical_navigation_x,
         }
     }
 
