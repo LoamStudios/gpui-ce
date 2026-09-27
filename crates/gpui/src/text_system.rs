@@ -76,7 +76,9 @@ impl TextSystem {
         self.platform_text_system.all_font_names()
     }
 
-    /// Add a font's data to the text system.
+    /// Adds font data to the text system.
+    ///
+    /// Font family names come from each font's embedded name table.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         // Serialize registration with cache misses so an in-flight lookup cannot
         // repopulate a stale miss after the newly registered fonts become available.

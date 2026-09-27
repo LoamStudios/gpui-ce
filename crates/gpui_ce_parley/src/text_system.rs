@@ -865,10 +865,7 @@ fn push_face_families<'a>(
         families.push(FaceFamily::SystemUi);
         families.push(FaceFamily::Named(system_font_fallback));
     } else {
-        families.push(FaceFamily::Named(canonical_family(
-            name,
-            system_font_fallback,
-        )));
+        families.push(FaceFamily::Named(name));
     }
 }
 
@@ -883,18 +880,7 @@ fn push_parley_families<'a>(
             system_font_fallback.to_string(),
         )));
     } else {
-        families.push(FontFamilyName::Named(Cow::Owned(
-            canonical_family(name, system_font_fallback).to_string(),
-        )));
-    }
-}
-
-fn canonical_family<'a>(name: &'a str, system: &'a str) -> &'a str {
-    match name {
-        ".SystemUIFont" => system,
-        ".ZedSans" | "Zed Plex Sans" => "IBM Plex Sans",
-        ".ZedMono" | "Zed Plex Mono" => "Lilex",
-        _ => name,
+        families.push(FontFamilyName::Named(Cow::Owned(name.to_string())));
     }
 }
 
@@ -913,7 +899,7 @@ impl PlatformTextSystem for ParleyTextSystem {
 
     fn all_font_names(&self) -> Vec<String> {
         let mut names = self.catalog.family_names();
-        names.extend([".SystemUIFont", ".ZedSans", ".ZedMono"].map(str::to_owned));
+        names.push(".SystemUIFont".to_owned());
         names.sort_unstable();
         names.dedup();
         names
