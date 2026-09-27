@@ -319,13 +319,14 @@ impl PlatformTextLayout for ParleyLayout {
         let inverse = self.direct_visual_move(moved, Self::opposite(direction));
         let inverse_position = Self::cursor_position(&self.layout, inverse);
         let current_position = Self::cursor_position(&self.layout, cursor);
-        if moved_position == (adjacent.block, adjacent.inline)
+        let result = if moved_position == (adjacent.block, adjacent.inline)
             && inverse_position == current_position
         {
-            Some(Self::caret_position(moved))
+            moved
         } else {
-            Some(Self::caret_position(adjacent.cursor))
-        }
+            adjacent.cursor
+        };
+        Some(Self::caret_position(result))
     }
 
     fn selection_bounds(
