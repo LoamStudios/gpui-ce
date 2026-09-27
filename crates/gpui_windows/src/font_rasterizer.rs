@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result, bail, ensure};
 use gpui::{
-    Bounds, DevicePixels, GlyphRenderMode, PreparedRasterStyle, RasterColorEffect,
+    Bounds, DevicePixels, GlyphRenderMode, PreparedRasterStyle, RasterColorEffect, RasterColorExt,
     RasterStyleRequest, RasterizedGlyph, RasterizedGlyphFormat, RenderGlyphParams, Rgba8,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, TextRenderingMode, point, size,
 };
@@ -553,7 +553,9 @@ impl GlyphRasterizer for DirectWriteGlyphRasterizer {
         if request.requested_mode == GlyphRenderMode::Color {
             PreparedRasterStyle {
                 mode: GlyphRenderMode::Color,
-                color_effect: RasterColorEffect::Preblend(request.scene_color.into()),
+                color_effect: RasterColorEffect::Preblend(
+                    request.scene_color.quantize_raster_color(),
+                ),
             }
         } else {
             PreparedRasterStyle::independent(request.requested_mode)

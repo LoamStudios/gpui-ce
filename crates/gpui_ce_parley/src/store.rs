@@ -1,9 +1,9 @@
 use anyhow::{Context as _, Result, bail, ensure};
 use fontique::{Blob, Synthesis};
 use gpui::{
-    Bounds, FontId, FontMetrics, GlyphId, GlyphRenderMode, PreparedRasterStyle, RasterStyleRequest,
-    RasterizedGlyph, RasterizedGlyphFormat, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, Size, TextRenderingMode, point, size,
+    Bounds, FontId, FontMetrics, GlyphId, GlyphRenderMode, PreparedRasterStyle, RasterColorExt,
+    RasterStyleRequest, RasterizedGlyph, RasterizedGlyphFormat, RenderGlyphParams,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, Size, TextRenderingMode, point, size,
 };
 use skrifa::{
     FontRef, MetadataProvider as _, Tag,
@@ -476,7 +476,9 @@ impl GlyphRasterizer for SwashGlyphRasterizer {
         if request.requested_mode == GlyphRenderMode::Color {
             PreparedRasterStyle {
                 mode: GlyphRenderMode::Color,
-                color_effect: gpui::RasterColorEffect::Preblend(request.scene_color.into()),
+                color_effect: gpui::RasterColorEffect::Preblend(
+                    request.scene_color.quantize_raster_color(),
+                ),
             }
         } else {
             PreparedRasterStyle::independent(request.requested_mode)
@@ -532,12 +534,7 @@ impl GlyphRasterizer for SwashGlyphRasterizer {
             {
                 let color = match params.raster_style.color_effect {
                     gpui::RasterColorEffect::Preblend(color) => color,
-                    gpui::RasterColorEffect::Independent => gpui::Rgba8 {
-                        red: 0,
-                        green: 0,
-                        blue: 0,
-                        alpha: 255,
-                    },
+                    gpui::RasterColorEffect::Independent => gpui::Rgba8::new(0, 0, 0, 255),
                     gpui::RasterColorEffect::Dilation(_) => {
                         bail!("color glyph rasterization cannot use a dilation style")
                     }
@@ -637,7 +634,7 @@ fn subpixel_offset(params: &RenderGlyphParams) -> Vector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{RasterColorEffect, point, px, rgba};
+    use gpui::{RasterColorEffect, Rgba8, point, px, rgba};
 
     const IBM_PLEX: &[u8] =
         include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
@@ -682,7 +679,7 @@ mod tests {
         assert_eq!(style.mode, GlyphRenderMode::Color);
         assert_eq!(
             style.color_effect,
-            RasterColorEffect::Preblend(rgba(0xe02010cc).into())
+            RasterColorEffect::Preblend(Rgba8::new(224, 32, 16, 204))
         );
 
         for scale_factor in [1.0, 2.0] {
