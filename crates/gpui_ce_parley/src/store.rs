@@ -1,6 +1,3 @@
-#[cfg(test)]
-use gpui::{RasterColorEffect, px, rgba};
-
 use anyhow::{Context as _, Result, bail, ensure};
 use fontique::{Blob, Synthesis};
 use gpui::{
