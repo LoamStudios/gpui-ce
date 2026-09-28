@@ -1,15 +1,3 @@
-#[cfg(test)]
-use crate::editable_text::StringStorage;
-
-#[cfg(test)]
-use gpui::{
-    AppContext, Context, HeadlessAppContext, Render, ScaledPixels, TestTextSystem, div, hsla,
-    prelude::*,
-};
-
-#[cfg(test)]
-use std::collections::HashSet;
-
 use crate::editable_text::{
     BLINK_INTERVAL_500MS, Caret, EditableTextState,
     actions::{DEFAULT_INPUT_CONTEXT, EditableTextActionElement, EditableTextActionHandler},
