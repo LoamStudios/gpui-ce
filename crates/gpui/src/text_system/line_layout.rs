@@ -245,14 +245,25 @@ pub enum CaretAffinity {
     Upstream,
 }
 
-/// Hard line breaks that place an inserted-text caret downstream: line feed (`U+000A`),
-/// carriage return (`U+000D`), line separator (`U+2028`), and paragraph separator (`U+2029`).
+/// Hard line breaks that place an inserted-text caret downstream.
 static HARD_LINE_BREAK_CHARACTERS: phf::Set<char> = phf::phf_set! {
     '\n',
     '\r',
+    '\u{001c}',
+    '\u{001d}',
+    '\u{001e}',
+    '\u{0085}',
     '\u{2028}',
     '\u{2029}',
 };
+
+/// Returns whether `character` separates Unicode text paragraphs.
+///
+/// Line separator (`U+2028`) is a hard line break within the current paragraph. Consumers are
+/// responsible for treating a CRLF pair as one paragraph separator.
+pub fn is_paragraph_separator(character: char) -> bool {
+    character != '\u{2028}' && HARD_LINE_BREAK_CHARACTERS.contains(&character)
+}
 
 impl CaretAffinity {
     /// Returns the affinity for a caret placed after inserted text.
@@ -261,7 +272,7 @@ impl CaretAffinity {
             return Self::Downstream;
         };
 
-        if HARD_LINE_BREAK_CHARACTERS.contains(&last_character) {
+        if is_paragraph_separator(last_character) || last_character == '\u{2028}' {
             return Self::Downstream;
         }
 
@@ -958,7 +969,7 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaretAffinity, CaretPosition, CaretSelection};
+    use super::*;
 
     #[test]
     fn caret_selection_endpoint_ordering_uses_byte_indices() {
@@ -985,7 +996,20 @@ mod tests {
     }
 
     #[test]
-    fn inserted_text_affinity_tracks_trailing_hard_line_breaks() {
+    fn paragraph_separators_match_unicode_bidi_class_b() {
+        for character in [
+            '\n', '\r', '\u{001c}', '\u{001d}', '\u{001e}', '\u{0085}', '\u{2029}',
+        ] {
+            assert!(is_paragraph_separator(character));
+        }
+
+        for character in [' ', '\u{2028}'] {
+            assert!(!is_paragraph_separator(character));
+        }
+    }
+
+    #[test]
+    fn inserted_text_affinity_tracks_trailing_paragraph_separators() {
         assert_eq!(
             CaretAffinity::for_inserted_text(""),
             CaretAffinity::Downstream
@@ -995,7 +1019,9 @@ mod tests {
             CaretAffinity::Upstream
         );
 
-        for text in ["\n", "\r", "\u{2028}", "\u{2029}"] {
+        for text in [
+            "\n", "\r", "\u{001c}", "\u{001d}", "\u{001e}", "\u{0085}", "\u{2028}", "\u{2029}",
+        ] {
             assert_eq!(
                 CaretAffinity::for_inserted_text(text),
                 CaretAffinity::Downstream
