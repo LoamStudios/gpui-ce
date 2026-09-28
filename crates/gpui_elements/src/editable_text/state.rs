@@ -17,6 +17,26 @@ use std::{
 
 const CARET_PIXELS_EPSILON: Pixels = gpui::px(4.);
 
+#[derive(Clone, Copy)]
+enum SelectionGroup {
+    Word,
+    Line,
+    Document,
+}
+
+impl SelectionGroup {
+    fn layout_kind(self) -> Option<TextSelectionKind> {
+        match self {
+            Self::Word => Some(TextSelectionKind::Word),
+            Self::Line => Some(TextSelectionKind::HardLine),
+            Self::Document => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OldDocumentVersion;
+
 /// Internal state for EditableText elements.
 pub struct EditableTextState {
     /// The storage medium backing this element-state. Hypothetically supports both
@@ -304,15 +324,21 @@ impl EditableTextState {
 
 // Screen space (text layout engine output) & String space transformers
 impl EditableTextState {
-    fn current_document(&self) -> Option<&WrappedLine> {
+    fn current_document(&self) -> Result<&WrappedLine, OldDocumentVersion> {
         if self.layout_data.state.last_seen_storage_version != self.storage.version() {
-            return None;
+            return Err(OldDocumentVersion);
         }
-        self.layout_data.document.as_deref()
+
+        Ok(self
+            .layout_data
+            .document
+            .as_deref()
+            .expect("editable text layout invariant violated: current version has no document"))
     }
 
     fn point_for_caret(&self, caret: CaretPosition) -> Option<Point<Pixels>> {
-        self.current_document()?
+        self.current_document()
+            .ok()?
             .visual_position_for_caret(caret, self.layout_data.line_height)
     }
 
@@ -323,7 +349,7 @@ impl EditableTextState {
         direction: NavigationDirection,
         boundary: TextBoundary,
     ) -> Option<Range<usize>> {
-        let document = self.current_document()?;
+        let document = self.current_document().ok()?;
         let caret = self.caret();
 
         let movement = match (direction, boundary) {
@@ -365,7 +391,7 @@ impl EditableTextState {
             return CaretPosition::default();
         }
 
-        let Some(document) = self.current_document() else {
+        let Ok(document) = self.current_document() else {
             return CaretPosition::attached_to_previous_cluster(storage_len_utf8);
         };
         document
@@ -386,7 +412,7 @@ impl EditableTextState {
         use TextBoundary::*;
 
         let caret = self.caret();
-        let range = if let Some(document) = self.current_document() {
+        let range = if let Ok(document) = self.current_document() {
             let [start, end] = [
                 Direction::Start.with_boundary(TextBoundary::HardLine),
                 Direction::End.with_boundary(TextBoundary::HardLine),
@@ -570,7 +596,7 @@ impl EditableTextState {
     }
 
     fn move_semantic(&mut self, movement: TextMovement, extend: bool, cx: &mut Context<Self>) {
-        if let Some(document) = self.current_document() {
+        if let Ok(document) = self.current_document() {
             let moved = document.selection_movement(
                 self.selection.result,
                 movement,
@@ -620,7 +646,7 @@ impl EditableTextState {
 
     /// Sets the current selection to be the entire text in the storage medium
     pub fn select_document(&mut self, cx: &mut Context<Self>) {
-        self.set_selection(0..self.storage.content_utf8().len());
+        self.set_selection(self.storage_selection_at(0, SelectionGroup::Document));
         cx.notify();
     }
 
@@ -663,40 +689,46 @@ impl EditableTextState {
         }
     }
 
-    fn select_word_at(&mut self, caret_pos: usize, cx: &mut Context<Self>) {
-        self.set_selection(self.storage.word_range_at(caret_pos));
-        cx.notify();
-    }
-
-    fn select_line_at(&mut self, caret_pos: usize, cx: &mut Context<Self>) {
+    fn storage_selection_at(&self, caret_pos: usize, group: SelectionGroup) -> Range<usize> {
         use NavigationDirection::*;
         use TextBoundary::*;
 
-        let line_start = self.storage.offset_from_caret(caret_pos, Back, HardLine);
-        let line_end = self.storage.offset_from_caret(caret_pos, Forward, HardLine);
-        let line_end_with_newline = if line_end < self.storage.content_utf8().len() {
-            self.storage.offset_from_caret(line_end, Forward, Cluster)
-        } else {
-            line_end
-        };
-        self.set_selection(line_start..line_end_with_newline);
-        cx.notify();
+        match group {
+            SelectionGroup::Word => self.storage.word_range_at(caret_pos),
+            SelectionGroup::Line => {
+                let line_start = self.storage.offset_from_caret(caret_pos, Back, HardLine);
+                let line_end = self.storage.offset_from_caret(caret_pos, Forward, HardLine);
+                let line_end_with_newline = if line_end < self.storage.content_utf8().len() {
+                    self.storage.offset_from_caret(line_end, Forward, Cluster)
+                } else {
+                    line_end
+                };
+
+                line_start..line_end_with_newline
+            }
+            SelectionGroup::Document => 0..self.storage.content_utf8().len(),
+        }
     }
 
-    fn select_layout_at(
+    fn select_group_at(
         &mut self,
         point: Point<Pixels>,
         line_height: Pixels,
-        kind: TextSelectionKind,
+        group: SelectionGroup,
         cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(document) = self.current_document() else {
-            return false;
+    ) {
+        let selection = match group.layout_kind() {
+            Some(kind) => match self.current_document() {
+                Ok(document) => document.selection_from_pixel_point(point, line_height, kind),
+                Err(OldDocumentVersion) => {
+                    let caret_pos = self.caret_for_pixel_point(point, line_height).index;
+                    self.storage_selection_at(caret_pos, group)
+                }
+            },
+            None => self.storage_selection_at(0, group),
         };
-        let selection = document.selection_from_pixel_point(point, line_height, kind);
         self.set_selection(selection);
         cx.notify();
-        true
     }
 }
 
@@ -874,7 +906,7 @@ impl EntityInputHandler for EditableTextState {
         let range = self.storage.utf_range_16to8(&range_utf16);
         let line_height = window.line_height();
 
-        let document = self.current_document()?;
+        let document = self.current_document().ok()?;
         let start = range.start.min(document.text.len());
         let end = range.end.min(document.text.len());
         if start == end {
@@ -1192,26 +1224,18 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
         self.apply_click(event.click_count, text_position);
 
         match self.click_count {
-            DOUBLE_CLICK => {
-                if !self.select_layout_at(
-                    text_position,
-                    window.line_height(),
-                    TextSelectionKind::Word,
-                    cx,
-                ) {
-                    self.select_word_at(caret.index, cx);
-                }
-            }
-            TRIPLE_CLICK => {
-                if !self.select_layout_at(
-                    text_position,
-                    window.line_height(),
-                    TextSelectionKind::HardLine,
-                    cx,
-                ) {
-                    self.select_line_at(caret.index, cx);
-                }
-            }
+            DOUBLE_CLICK => self.select_group_at(
+                text_position,
+                window.line_height(),
+                SelectionGroup::Word,
+                cx,
+            ),
+            TRIPLE_CLICK => self.select_group_at(
+                text_position,
+                window.line_height(),
+                SelectionGroup::Line,
+                cx,
+            ),
             _ if event.modifiers.shift => self.select_to_caret(caret, cx),
             _ => self.move_to_caret(caret, cx),
         }
@@ -1262,7 +1286,9 @@ mod tests {
     }
 
     fn default_state(content: &str, cx: &mut Context<EditableTextState>) -> EditableTextState {
-        EditableTextState::new(StringStorage::from(content), cx)
+        let mut state = EditableTextState::new(StringStorage::from(content), cx);
+        state.layout_data.state.last_seen_storage_version = state.version().wrapping_sub(1);
+        state
     }
 
     #[test]
@@ -2050,6 +2076,31 @@ mod tests {
                 let range = input.storage.word_range_at(8);
                 assert_eq!(range.start, 6);
                 assert_eq!(range.end, 11);
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_select_group_at_falls_back_without_a_current_layout(cx: &mut TestAppContext) {
+        let view = create_test_input(cx, "first line\nlast", 0);
+        view.update(cx, |view, _window, cx| {
+            view.input.update(cx, |input, cx| {
+                input.layout_data.state.last_seen_storage_version = input.version();
+                input.emplace("first line\nlast word", cx);
+                assert!(matches!(input.current_document(), Err(OldDocumentVersion)));
+
+                let position = point(gpui::px(0.), gpui::px(0.));
+                let line_height = gpui::px(16.);
+
+                input.select_group_at(position, line_height, SelectionGroup::Word, cx);
+                assert_eq!(input.selected_byte_range(), 16..20);
+
+                input.select_group_at(position, line_height, SelectionGroup::Line, cx);
+                assert_eq!(input.selected_byte_range(), 11..20);
+
+                input.select_group_at(position, line_height, SelectionGroup::Document, cx);
+                assert_eq!(input.selected_byte_range(), 0..20);
             });
         })
         .unwrap();
