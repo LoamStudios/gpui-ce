@@ -408,9 +408,6 @@ impl EditableTextState {
     }
 
     fn line_range_for_cut(&self) -> Range<usize> {
-        use NavigationDirection::*;
-        use TextBoundary::*;
-
         let caret = self.caret();
         let range = if let Ok(document) = self.current_document() {
             let [start, end] = [
@@ -420,16 +417,33 @@ impl EditableTextState {
             .map(|movement| document.caret_movement(caret, movement, None).result.index);
             start.min(end)..start.max(end)
         } else {
-            self.storage.offset_from_caret(caret.index, Back, HardLine)
-                ..self
-                    .storage
-                    .offset_from_caret(caret.index, Forward, HardLine)
+            let start = self.storage.offset_from_caret(
+                caret.index,
+                NavigationDirection::Back,
+                TextBoundary::HardLine,
+            );
+            let end = self.storage.offset_from_caret(
+                caret.index,
+                NavigationDirection::Forward,
+                TextBoundary::HardLine,
+            );
+
+            start..end
         };
 
         if range.end < self.as_str().len() {
-            range.start..self.storage.offset_from_caret(range.end, Forward, Cluster)
+            range.start
+                ..self.storage.offset_from_caret(
+                    range.end,
+                    NavigationDirection::Forward,
+                    TextBoundary::Cluster,
+                )
         } else if range.start > 0 {
-            self.storage.offset_from_caret(range.start, Back, Cluster)..range.end
+            self.storage.offset_from_caret(
+                range.start,
+                NavigationDirection::Back,
+                TextBoundary::Cluster,
+            )..range.end
         } else {
             range
         }

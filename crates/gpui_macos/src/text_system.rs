@@ -1,6 +1,19 @@
 pub(crate) use renderer::MacGlyphRasterizer;
 
 mod renderer {
+    use core_foundation_sys::{
+        preferences::CFPreferencesCopyAppValue, preferences::kCFPreferencesCurrentApplication,
+    };
+
+    #[cfg(test)]
+    use gpui::{GlyphId, PlatformTextSystem, font as gpui_font, px, rgba};
+
+    #[cfg(test)]
+    use gpui_parley::{ParleyTextSystem, SystemFonts};
+
+    #[cfg(test)]
+    use std::borrow::Cow;
+
     use anyhow::{Context as _, Result, anyhow, ensure};
     use core_foundation::{
         array::{CFArray, CFArrayRef},
@@ -73,6 +86,7 @@ mod renderer {
                             face.font_id, face.face_index, face.variations
                         )
                     })?;
+
                     Ok(entry.insert(native))
                 }
             }
@@ -110,6 +124,7 @@ mod renderer {
             let glyph_rect = font
                 .get_bounding_rects_for_glyphs(kCTFontOrientationDefault, &[glyph])
                 .apply_transform(&text_matrix);
+
             if glyph_rect.is_empty()
                 || glyph_rect.size.width <= 0.0
                 || glyph_rect.size.height <= 0.0
@@ -124,6 +139,7 @@ mod renderer {
             } else {
                 0.0
             };
+
             let padding = (embolden * scale_factor).ceil() + 1.0;
             let left = (glyph_rect.origin.x * scale_factor - padding).floor();
             let mut right =
@@ -131,11 +147,14 @@ mod renderer {
             let top =
                 (-(glyph_rect.origin.y + glyph_rect.size.height) * scale_factor - padding).floor();
             let bottom = (-glyph_rect.origin.y * scale_factor + padding).ceil();
+
             if params.subpixel_variant.x > 0 {
                 right += 1.0;
             }
+
             let width = (right - left) as i32;
             let height = (bottom - top) as i32;
+
             if width <= 0 || height <= 0 {
                 return Ok(RasterizedGlyph::empty(format_for_mode(
                     params.raster_style.mode,
@@ -148,6 +167,7 @@ mod renderer {
             } else {
                 1
             };
+
             let mut pixels = vec![0; width as usize * height as usize * bytes_per_pixel];
             {
                 let color_space = if bytes_per_pixel == 4 {
@@ -155,6 +175,7 @@ mod renderer {
                 } else {
                     CGColorSpace::create_device_gray()
                 };
+
                 let context = CGContext::create_bitmap_context(
                     Some(pixels.as_mut_ptr().cast()),
                     width as usize,
@@ -225,6 +246,7 @@ mod renderer {
             } else {
                 RasterColorEffect::Dilation(0)
             };
+
             PreparedRasterStyle {
                 mode: GlyphRenderMode::Grayscale,
                 color_effect,
@@ -249,12 +271,14 @@ mod renderer {
             let data = CFData::from_buffer(face.data);
             let descriptors_ref =
                 unsafe { CTFontManagerCreateFontDescriptorsFromData(data.as_concrete_TypeRef()) };
+
             ensure!(
                 !descriptors_ref.is_null(),
                 "CoreText rejected the supplied font bytes"
             );
             let descriptors: CFArray<CTFontDescriptor> =
                 unsafe { CFArray::wrap_under_create_rule(descriptors_ref) };
+
             let descriptor = descriptors.get(face.face_index as CFIndex).ok_or_else(|| {
                 anyhow!(
                     "collection contains {} faces, requested {}",
@@ -262,6 +286,7 @@ mod renderer {
                     face.face_index
                 )
             })?;
+
             let mut descriptor =
                 unsafe { CTFontDescriptor::wrap_under_get_rule(descriptor.as_concrete_TypeRef()) };
 
@@ -281,8 +306,10 @@ mod renderer {
                 let variation_key = unsafe {
                     CFString::wrap_under_get_rule(font_descriptor::kCTFontVariationAttribute)
                 };
+
                 let variation_value =
                     unsafe { CFType::wrap_under_get_rule(variations.as_CFTypeRef()) };
+
                 let attributes =
                     CFDictionary::from_CFType_pairs(&[(variation_key, variation_value)])
                         .into_untyped();
@@ -310,6 +337,7 @@ mod renderer {
         } else {
             CGTextDrawingMode::CGTextFill
         });
+
         context.set_text_matrix(&text_matrix);
         context.set_allows_antialiasing(true);
         context.set_should_antialias(true);
@@ -351,10 +379,6 @@ mod renderer {
     fn font_smoothing_allowed_by_user() -> bool {
         static ALLOWED: OnceLock<bool> = OnceLock::new();
         *ALLOWED.get_or_init(|| {
-            use core_foundation_sys::preferences::{
-                CFPreferencesCopyAppValue, kCFPreferencesCurrentApplication,
-            };
-
             let key = CFString::new("AppleFontSmoothing");
             let value_ref = unsafe {
                 CFPreferencesCopyAppValue(
@@ -362,10 +386,13 @@ mod renderer {
                     kCFPreferencesCurrentApplication,
                 )
             };
+
             if value_ref.is_null() {
                 return true;
             }
+
             let value = unsafe { CFType::wrap_under_create_rule(value_ref) };
+
             value
                 .downcast_into::<CFNumber>()
                 .and_then(|number| number.to_i64())
@@ -381,12 +408,6 @@ mod renderer {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use gpui::{
-            GlyphId, GlyphRenderMode, PlatformTextSystem, RasterColorEffect, RasterizedGlyphFormat,
-            font, point, px, rgba,
-        };
-        use gpui_parley::{ParleyTextSystem, SystemFonts};
-        use std::borrow::Cow;
 
         const SOURCE_SERIF: &[u8] =
             include_bytes!("../../../assets/fonts/source-serif-4/SourceSerif4[opsz,wght].ttf");
@@ -399,7 +420,7 @@ mod renderer {
                 MacGlyphRasterizer::new(),
             );
             system.add_fonts(vec![Cow::Borrowed(SOURCE_SERIF)]).unwrap();
-            let font_id = system.font_id(&font("Source Serif 4")).unwrap();
+            let font_id = system.font_id(&gpui_font("Source Serif 4")).unwrap();
             let render_pass = || {
                 "Ag&"
                     .chars()
@@ -454,7 +475,7 @@ mod renderer {
             );
             system.add_fonts(vec![Cow::Borrowed(SOURCE_SERIF)]).unwrap();
             let font_id = system
-                .font_id(&font("Source Serif 4").bold().italic())
+                .font_id(&gpui_font("Source Serif 4").bold().italic())
                 .unwrap();
 
             let render_style = |glyph_id: GlyphId, raster_style, variant| {
@@ -469,6 +490,7 @@ mod renderer {
                     })
                     .unwrap()
             };
+
             let render = |glyph_id: GlyphId, mode, color, variant| {
                 render_style(
                     glyph_id,
@@ -485,12 +507,14 @@ mod renderer {
                 scene_color: rgba(0x303030ff),
                 requested_mode: GlyphRenderMode::Subpixel,
             });
+
             assert_eq!(normalized_subpixel.mode, GlyphRenderMode::Grayscale);
 
             let light_style = system.prepare_raster_style(RasterStyleRequest {
                 scene_color: rgba(0xffffffff),
                 requested_mode: GlyphRenderMode::Grayscale,
             });
+
             assert_eq!(
                 light_style.color_effect,
                 RasterColorEffect::Dilation(if font_smoothing_allowed_by_user() {
@@ -573,7 +597,7 @@ mod renderer {
                 MacGlyphRasterizer::new(),
             );
             let emoji_font = emoji_system
-                .font_id(&font("Apple Color Emoji"))
+                .font_id(&gpui_font("Apple Color Emoji"))
                 .expect("Apple Color Emoji is available on macOS");
             let emoji = emoji_system
                 .rasterize_glyph(&RenderGlyphParams {
