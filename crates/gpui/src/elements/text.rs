@@ -1209,7 +1209,7 @@ fn truncate_to_shaped_layout<'a>(
 
     let mut boundaries = text
         .grapheme_indices(true)
-        .map(|(idx, _)| idx)
+        .map(|(index, _)| index)
         .collect::<Vec<_>>();
     boundaries.push(text.len());
     let grapheme_count = boundaries.len().saturating_sub(1);
@@ -1286,23 +1286,23 @@ fn update_runs_after_truncation(
     let mut retained = result.len().saturating_sub(affix.len());
     match direction {
         TruncateFrom::Start => {
-            for run_idx in (0..runs.len()).rev() {
-                if runs[run_idx].len <= retained {
-                    retained -= runs[run_idx].len;
+            for run_index in (0..runs.len()).rev() {
+                if runs[run_index].len <= retained {
+                    retained -= runs[run_index].len;
                 } else {
-                    runs[run_idx].len = retained + affix.len();
-                    runs.drain(..run_idx);
+                    runs[run_index].len = retained + affix.len();
+                    runs.drain(..run_index);
                     break;
                 }
             }
         }
         TruncateFrom::End => {
-            for run_idx in 0..runs.len() {
-                if runs[run_idx].len <= retained {
-                    retained -= runs[run_idx].len;
+            for run_index in 0..runs.len() {
+                if runs[run_index].len <= retained {
+                    retained -= runs[run_index].len;
                 } else {
-                    runs[run_idx].len = retained + affix.len();
-                    runs.truncate(run_idx + 1);
+                    runs[run_index].len = retained + affix.len();
+                    runs.truncate(run_index + 1);
                     break;
                 }
             }
@@ -1681,7 +1681,7 @@ mod tests {
         ];
         let mut boundaries = text
             .grapheme_indices(true)
-            .map(|(idx, _)| idx)
+            .map(|(index, _)| index)
             .collect::<Vec<_>>();
         boundaries.push(text.len());
 

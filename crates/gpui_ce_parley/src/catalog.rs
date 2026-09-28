@@ -190,9 +190,9 @@ fn resolve(state: &mut CatalogState, request: &FaceRequest<'_>) -> Option<Resolv
         });
     }
 
-    selected.map(|(data, idx, synthesis)| ResolvedFace {
+    selected.map(|(data, index, synthesis)| ResolvedFace {
         data,
-        index: idx,
+        index,
         synthesis,
     })
 }

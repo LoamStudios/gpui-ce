@@ -1535,11 +1535,11 @@ mod tests {
 
     fn add_test_inline_box_advances(layout: &mut LineLayout, request: InlineLayoutRequest<'_>) {
         for fragment in &mut layout.paint_fragments {
-            for (glyph, (idx, _)) in fragment.glyphs.iter_mut().zip(request.text.char_indices()) {
+            for (glyph, (index, _)) in fragment.glyphs.iter_mut().zip(request.text.char_indices()) {
                 glyph.position.x += request
                     .boxes
                     .iter()
-                    .filter(|inline_box| inline_box.index <= idx)
+                    .filter(|inline_box| inline_box.index <= index)
                     .map(|inline_box| inline_box.size.width)
                     .sum::<Pixels>();
             }

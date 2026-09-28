@@ -351,9 +351,9 @@ impl DirectWriteGlyphRasterizer {
             )?;
         }
 
-        for pixel_idx in (0..pixel_count).rev() {
-            let source = pixel_idx * 3;
-            let target = pixel_idx * 4;
+        for pixel_index in (0..pixel_count).rev() {
+            let source = pixel_index * 3;
+            let target = pixel_index * 4;
             let red = pixels[source];
             let green = pixels[source + 1];
             let blue = pixels[source + 2];
@@ -508,14 +508,14 @@ impl DirectWriteGlyphRasterizer {
                         continue;
                     }
 
-                    let source_idx = (layer_y as usize * layer_width as usize) + layer_x as usize;
-                    let target_idx = target_y as usize * width as usize + target_x as usize;
+                    let source_index = (layer_y as usize * layer_width as usize) + layer_x as usize;
+                    let target_index = target_y as usize * width as usize + target_x as usize;
                     let corrected = corrected_coverage(
-                        f32::from(coverage[source_idx]) / 255.0,
+                        f32::from(coverage[source_index]) / 255.0,
                         color,
                         &self.color_rendering,
                     );
-                    composite_color(&mut premultiplied[target_idx], color, corrected);
+                    composite_color(&mut premultiplied[target_index], color, corrected);
                 }
             }
         }

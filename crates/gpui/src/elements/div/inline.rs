@@ -67,6 +67,7 @@ impl InlineParagraph {
     }
 }
 
+#[derive(Default)]
 pub(super) struct InlineDivFrameState {
     paragraphs: Vec<InlineParagraph>,
     /// Text and inline containers whose bounds come from paragraph fragments.
@@ -171,8 +172,8 @@ impl InlineParagraphCollector<'_> {
     }
 
     fn record_open_span_ranges(&mut self, text_start: usize, box_start: usize) {
-        for idx in 0..self.open_span_layout_ids.len() {
-            self.record_span_ranges(self.open_span_layout_ids[idx], text_start, box_start);
+        for index in 0..self.open_span_layout_ids.len() {
+            self.record_span_ranges(self.open_span_layout_ids[index], text_start, box_start);
         }
     }
 
@@ -284,12 +285,7 @@ impl InlineDivFrameState {
         context: &mut App,
     ) -> (LayoutId, Self) {
         let mut paragraph_collector = InlineParagraphCollector {
-            frame_state: Self {
-                paragraphs: Vec::new(),
-                span_layout_ids: Vec::new(),
-                flow_child_layout_ids: Vec::new(),
-            },
-
+            frame_state: Self::default(),
             current_document: InlineDocument::default(),
             open_span_layout_ids: Vec::new(),
             text_style: window.text_style(),

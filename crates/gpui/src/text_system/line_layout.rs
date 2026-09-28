@@ -548,8 +548,8 @@ pub struct CaretSelection {
 }
 
 impl From<usize> for CaretSelection {
-    fn from(idx: usize) -> Self {
-        CaretPosition::attached_to_next_cluster(idx).into()
+    fn from(index: usize) -> Self {
+        CaretPosition::attached_to_next_cluster(index).into()
     }
 }
 

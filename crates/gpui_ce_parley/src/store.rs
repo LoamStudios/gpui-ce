@@ -334,11 +334,11 @@ impl FontStore {
     pub(crate) fn intern_synthesized(
         &mut self,
         data: Blob<u8>,
-        idx: u32,
+        index: u32,
         synthesis: Synthesis,
     ) -> Result<FontId> {
         let normalized_coords = {
-            let font = FontRef::from_index(data.as_ref(), idx)
+            let font = FontRef::from_index(data.as_ref(), index)
                 .context("cannot intern a font face Skrifa cannot parse")?;
             font.axes()
                 .location(synthesis.variation_settings().iter().copied())
@@ -346,22 +346,22 @@ impl FontStore {
                 .to_vec()
         };
 
-        self.intern(data, idx, &normalized_coords, synthesis)
+        self.intern(data, index, &normalized_coords, synthesis)
     }
 
     /// Interns a selected font instance and returns its canonical GPUI ID.
     pub(crate) fn intern(
         &mut self,
         data: Blob<u8>,
-        idx: u32,
+        index: u32,
         normalized_coords: &[NormalizedCoord],
         synthesis: Synthesis,
     ) -> Result<FontId> {
-        let font = FontRef::from_index(data.as_ref(), idx)
+        let font = FontRef::from_index(data.as_ref(), index)
             .context("cannot intern a font face Skrifa cannot parse")?;
         let key = FontKey {
             source_identity: SourceIdentity::from(&data),
-            face_index: idx,
+            face_index: index,
             normalized_coords: normalized_coords.to_vec(),
             synthesis: synthesis.into(),
         };
@@ -382,7 +382,7 @@ impl FontStore {
         let source_identity = SourceIdentity::from(&data);
         self.fonts.push(LoadedFont {
             data,
-            index: idx,
+            index,
             normalized_coords: normalized_coords.to_vec(),
             variations,
             synthesis,
@@ -396,7 +396,7 @@ impl FontStore {
 
     /// Returns the stored font for a canonical ID.
     pub(crate) fn get(&self, font_id: FontId) -> Option<&LoadedFont> {
-        canonical_index(font_id).and_then(|idx| self.fonts.get(idx))
+        canonical_index(font_id).and_then(|index| self.fonts.get(index))
     }
 }
 
@@ -416,16 +416,16 @@ fn design_variations(
     // Revisit every axis so version 2 `avar` mappings which couple axes converge as well as the
     // ordinary per-axis segment maps. Native APIs will apply the same mapping to these values.
     for _ in 0..4 {
-        for (axis_idx, axis) in axis_records.iter().enumerate() {
+        for (axis_index, axis) in axis_records.iter().enumerate() {
             let target = normalized_coords
-                .get(axis_idx)
+                .get(axis_index)
                 .copied()
                 .unwrap_or_default()
                 .to_f32();
             let mut low = axis.min_value();
             let mut high = axis.max_value();
             for _ in 0..24 {
-                values[axis_idx] = (low + high) * 0.5;
+                values[axis_index] = (low + high) * 0.5;
                 let normalized = axes
                     .location(
                         axis_records
@@ -434,19 +434,19 @@ fn design_variations(
                             .map(|(axis, value)| (axis.tag(), *value)),
                     )
                     .coords()
-                    .get(axis_idx)
+                    .get(axis_index)
                     .copied()
                     .unwrap_or_default()
                     .to_f32();
 
                 if normalized < target {
-                    low = values[axis_idx];
+                    low = values[axis_index];
                 } else {
-                    high = values[axis_idx];
+                    high = values[axis_index];
                 }
             }
 
-            values[axis_idx] = (low + high) * 0.5;
+            values[axis_index] = (low + high) * 0.5;
         }
     }
 
