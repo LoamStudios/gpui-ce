@@ -319,6 +319,7 @@ impl Element for EditableTextElement {
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
         let entity = self.find_or_create_state(window, cx);
+        entity.update(cx, |state, cx| state.observe_blur(window, cx));
         let caret = self.find_or_create_caret(&entity, window, cx);
 
         if let Some(duration) = self.caret_blink_interval.take()
@@ -885,8 +886,8 @@ mod tests {
     use super::*;
     use crate::editable_text::StringStorage;
     use gpui::{
-        AppContext as _, Context, HeadlessAppContext, Render, ScaledPixels, TestTextSystem, div,
-        hsla, prelude::*,
+        AppContext as _, CaretPosition, CaretSelection, Context, HeadlessAppContext, Render,
+        ScaledPixels, TestTextSystem, div, hsla, prelude::*, rgba,
     };
     use std::{collections::HashSet, sync::Arc};
 
@@ -998,12 +999,52 @@ mod tests {
             );
         }
     }
-}
 
-#[cfg(test)]
-mod customization_tests {
-    use super::*;
-    use gpui::rgba;
+    #[test]
+    fn editable_text_clears_selection_when_blurred() {
+        let text = "selected text";
+        let mut cx = HeadlessAppContext::new(Arc::new(TestTextSystem));
+        let window = cx
+            .open_window(size(px(420.0), px(260.0)), |_window, cx| {
+                let input = cx.new(|cx| EditableTextState::new(StringStorage::from(text), cx));
+                cx.new(|_| CenteredEditableTextView { extent: 0.0, input })
+            })
+            .unwrap();
+
+        cx.run_until_parked();
+        let input = window
+            .update(&mut cx, |view, window, cx| {
+                window.activate();
+                let focus_handle = view.input.read(cx).focus_handle(cx);
+                window.focus(&focus_handle, cx);
+                view.input
+                    .update(cx, |state, cx| state.select_to(text.len(), cx));
+
+                view.input.clone()
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(input.read(cx).selected_byte_range(), 0..text.len());
+        });
+
+        window
+            .update(&mut cx, |_view, window, cx| window.blur(cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(
+                input.read(cx).caret_selection(),
+                CaretSelection::from(CaretPosition::attached_to_next_cluster(text.len()))
+            );
+        });
+        assert!(
+            cx.solid_quad_bounds(window.into(), SELECTION_COLOR)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn custom_placeholder_color_and_caret_size() {

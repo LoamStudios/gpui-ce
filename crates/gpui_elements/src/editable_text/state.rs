@@ -5,8 +5,8 @@ use crate::editable_text::{
 use gpui::{
     App, Bounds, CaretAffinity, CaretPosition, CaretSelection, CaretSelectionMovement,
     ClipboardItem, Context, ElementId, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    Focusable, NavigationDirection, Pixels, Point, TextDirection as Direction, TextMovement,
-    TextRangeExt, TextSelectionKind, UTF16Selection, Window, WrappedLine, point,
+    Focusable, NavigationDirection, Pixels, Point, Subscription, TextDirection as Direction,
+    TextMovement, TextRangeExt, TextSelectionKind, UTF16Selection, Window, WrappedLine, point,
     utf16_to_utf8_offset,
 };
 use std::{
@@ -37,33 +37,29 @@ impl SelectionGroup {
 #[derive(Debug)]
 struct OldDocumentVersion;
 
-/// Internal state for EditableText elements.
+/// Internal state for an editable text element.
 pub struct EditableTextState {
-    /// The storage medium backing this element-state. Hypothetically supports both
-    /// std String and other crates (e.g. long document text).
+    /// Backing text storage, usually `StringStorage`; custom storage can support long documents.
     storage: Box<dyn UnicodeTextStorage>,
 
-    /// The affinity-aware selection and horizontal coordinate retained during vertical navigation.
-    /// The coordinate is measured from the layout's left edge and is reset by operations other
-    /// than consecutive vertical movements.
-    ///
-    /// NOTE: because each input has its own selection state, its trivial for users to have
-    /// multiple selections active across multiple inputs at the same time.
-    /// This could be considered undesirable behavior, and could prompt the question of
-    /// whether there should be a mechanism to clear selection when focus is lost.
+    /// This input's affinity-aware selection and horizontal coordinate retained during vertical
+    /// navigation. The caret is the cursor, and the anchor remains fixed while extending the
+    /// selection. The coordinate is measured from the layout's left edge and is reset by operations
+    /// other than consecutive vertical movements.
     selection: CaretSelectionMovement,
 
-    /// The utf-8 character range of `storage` which is being composed by IME
+    /// UTF-8 byte range in `storage` under IME composition.
     marked_range: Option<Range<usize>>,
 
-    /// True while the user is in the act of highlighting a section of the text (e.g. during mouse pressed & dragging).
+    /// True while a mouse selection is in progress.
     is_selecting: bool,
-    /// The last ui location relative to the element that the user clicked. Used to filter when a user clicks multiple times in the same area.
+    /// Last click's position relative to this element, used to match nearby clicks.
     last_click_position: Option<Point<Pixels>>,
-    /// The number of times the user has clicked `last_click_position`. Used to determine which click behavior to trigger, depending on single, double, or triple clicks.
+    /// Count of consecutive nearby clicks, used to choose single, double, or triple-click behavior.
     click_count: usize,
 
     focus_handle: FocusHandle,
+    blur_subscription: Option<Subscription>,
     history: Option<EditableTextHistory>,
     accessibility_text_metrics: RefCell<Option<AccessibilityTextMetrics>>,
 
@@ -154,6 +150,7 @@ impl EditableTextState {
             click_count: 0,
 
             focus_handle: cx.focus_handle(),
+            blur_subscription: None,
             // TODO: what is the best way to give users access to configure this via element
             history: Some(EditableTextHistory::default()),
             accessibility_text_metrics: RefCell::default(),
@@ -197,6 +194,29 @@ impl EditableTextState {
             result: selection.into(),
             vertical_navigation_x: None,
         };
+    }
+
+    pub(super) fn observe_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.blur_subscription.is_some() {
+            return;
+        }
+
+        let focus_handle = self.focus_handle.clone();
+        let subscription = cx.on_blur(&focus_handle, window, |_state, window, cx| {
+            cx.defer_in(window, |state, _window, cx| {
+                state.clear_selection(cx);
+            });
+        });
+        self.blur_subscription = Some(subscription);
+    }
+
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.set_selection(self.caret());
+        self.is_selecting = false;
+        self.last_click_position = None;
+        self.click_count = 0;
+
+        cx.notify();
     }
 
     /// Returns the IME marked range for character operations.
@@ -409,44 +429,54 @@ impl EditableTextState {
 
     fn line_range_for_cut(&self) -> Range<usize> {
         let caret = self.caret();
-        let range = if let Ok(document) = self.current_document() {
-            let [start, end] = [
-                Direction::Start.with_boundary(TextBoundary::HardLine),
-                Direction::End.with_boundary(TextBoundary::HardLine),
-            ]
-            .map(|movement| document.caret_movement(caret, movement, None).result.index);
-            start.min(end)..start.max(end)
-        } else {
-            let start = self.storage.offset_from_caret(
-                caret.index,
-                NavigationDirection::Back,
-                TextBoundary::HardLine,
-            );
-            let end = self.storage.offset_from_caret(
-                caret.index,
-                NavigationDirection::Forward,
-                TextBoundary::HardLine,
-            );
+        let range = match self.current_document() {
+            Ok(document) => {
+                let [start, end] = [Direction::Start, Direction::End].map(|direction| {
+                    let movement = direction.with_boundary(TextBoundary::HardLine);
 
-            start..end
+                    document.caret_movement(caret, movement, None).result.index
+                });
+
+                start.min(end)..start.max(end)
+            }
+            Err(OldDocumentVersion) => {
+                let start = self.storage.offset_from_caret(
+                    caret.index,
+                    NavigationDirection::Back,
+                    TextBoundary::HardLine,
+                );
+
+                let end = self.storage.offset_from_caret(
+                    caret.index,
+                    NavigationDirection::Forward,
+                    TextBoundary::HardLine,
+                );
+
+                start..end
+            }
         };
 
         if range.end < self.as_str().len() {
-            range.start
-                ..self.storage.offset_from_caret(
-                    range.end,
-                    NavigationDirection::Forward,
-                    TextBoundary::Cluster,
-                )
-        } else if range.start > 0 {
-            self.storage.offset_from_caret(
+            let end = self.storage.offset_from_caret(
+                range.end,
+                NavigationDirection::Forward,
+                TextBoundary::Cluster,
+            );
+
+            return range.start..end;
+        }
+
+        if range.start > 0 {
+            let start = self.storage.offset_from_caret(
                 range.start,
                 NavigationDirection::Back,
                 TextBoundary::Cluster,
-            )..range.end
-        } else {
-            range
+            );
+
+            return start..range.end;
         }
+
+        range
     }
 }
 
