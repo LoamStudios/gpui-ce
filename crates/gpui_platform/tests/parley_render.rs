@@ -1,7 +1,7 @@
 #[cfg(target_os = "macos")]
 use gpui::{
-    AppContext, Context, IntoElement, ParentElement, Render, Styled, VisualTestAppContext, Window,
-    div, px, rgb, white,
+    AppContext as _, Context, IntoElement, ParentElement as _, Render, Styled as _,
+    VisualTestAppContext, Window, div, px, rgb, white,
 };
 
 #[cfg(target_os = "macos")]

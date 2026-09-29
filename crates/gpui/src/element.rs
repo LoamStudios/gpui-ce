@@ -36,7 +36,6 @@ use crate::{
     FocusHandle, InspectorElementId, LayoutId, Pixels, Point, Size, Style, Window,
     util::FluentBuilder, window::with_element_arena,
 };
-
 use derive_more::{Deref, DerefMut};
 use std::{
     any::Any,
@@ -324,7 +323,6 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
         prepaint: PrepaintState,
         inline_fragments: Option<Arc<[Bounds<Pixels>]>>,
     },
-
     Painted,
 }
 
@@ -546,7 +544,6 @@ impl<E: Element> Drawable<E> {
                     inline_fragments,
                 };
             }
-
             _ => panic!("must call request_layout before prepaint"),
         }
     }
@@ -616,7 +613,6 @@ impl<E: Element> Drawable<E> {
                 self.phase = ElementDrawPhase::Painted;
                 (request_layout, prepaint)
             }
-
             _ => panic!("must call prepaint before paint"),
         }
     }

@@ -6,7 +6,6 @@ use crate::{
         round_to_device_pixel,
     },
 };
-
 use collections::{FxHashMap, FxHashSet};
 use std::{fmt::Debug, ops::Range, sync::Arc};
 use taffy::{
@@ -460,7 +459,6 @@ impl TaffyLayoutEngine {
         let Some(parent_id) = self.taffy.parent(node_id.0).map(LayoutId::from) else {
             return self.layout_bounds(node_id, scale_factor);
         };
-
         let parent_bounds = self.layout_bounds(parent_id, scale_factor);
         let layout = self.taffy.layout(node_id.into()).expect(EXPECT_MESSAGE);
         let local_origin = Point::from(layout.location).map(round_half_toward_zero);

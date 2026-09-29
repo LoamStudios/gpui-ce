@@ -1223,12 +1223,16 @@ pub trait PlatformTextSystem: Send + Sync {
 
 #[cfg(any(test, feature = "test-support"))]
 mod tests {
-    use super::*;
     use crate::{
-        CaretAffinity, CaretMovement, CaretPosition, InlineVisualLine, PaintFragment, PaintStyle,
-        PlatformTextLayout, PositionedInlineBox, ShapedGlyph, TextBoundary, TextDirection,
-        TextMovement, TextSelectionKind, VisualDirection, VisualLine, align_inline_boxes, size,
+        Bounds, CaretAffinity, CaretMovement, CaretPosition, Font, FontId, FontMetrics, GlyphId,
+        InlineLayout, InlineLayoutRequest, InlineVisualLine, LineLayout, PaintFragment, PaintStyle,
+        Pixels, PlatformTextLayout, PlatformTextSystem, Point, PositionedInlineBox,
+        RasterizedGlyph, RasterizedGlyphFormat, RenderGlyphParams, ShapedGlyph, Size, TextBoundary,
+        TextDirection, TextLayoutRequest, TextMovement, TextRenderingMode, TextSelectionKind,
+        VisualDirection, VisualLine, align_inline_boxes, point, px, size,
     };
+    use anyhow::Result;
+    use std::{borrow::Cow, ops::Range, sync::Arc};
 
     #[expect(missing_docs)]
     pub struct TestTextSystem;
@@ -1484,7 +1488,6 @@ mod tests {
                 .map_or(0, |offset| {
                     offset + self.text[offset..].chars().next().unwrap().len_utf8()
                 });
-
             let end = self.text[index..]
                 .find(char::is_whitespace)
                 .map_or(self.text.len(), |offset| index + offset);
@@ -1660,7 +1663,6 @@ mod tests {
                         tracking += spacing * (n - 1) as f32;
                     }
                 }
-
                 tracking_covered = end;
             }
 

@@ -852,11 +852,7 @@ mod tests {
     }
 
     impl Render for CenteredEditableTextView {
-        fn render(
-            &mut self,
-            _window: &mut Window,
-            _context: &mut Context<Self>,
-        ) -> impl IntoElement {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div()
                 .flex()
                 .items_center()

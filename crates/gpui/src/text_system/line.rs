@@ -262,11 +262,9 @@ fn paint_visual_line(
         pass,
         text_system,
     };
-
     for fragment in &layout.paint_fragments[visual_line.fragment_range.clone()] {
         paint_text_fragment(fragment, &context, window)?;
     }
-
     Ok(())
 }
 
@@ -284,7 +282,6 @@ fn paint_text_fragment(
         window,
         context.pass == TextPaintPass::Foreground,
     );
-
     if context.pass == TextPaintPass::Background {
         return Ok(());
     }
@@ -293,13 +290,11 @@ fn paint_text_fragment(
         .text_system
         .bounding_box(fragment.font_id, fragment.font_size)
         .size;
-
     for glyph in &fragment.glyphs {
         let cull_origin = point(
             context.line_origin.x + glyph.position.x,
             context.line_origin.y,
         );
-
         if !Bounds::new(cull_origin, max_glyph_size).intersects(&window.content_mask().bounds) {
             continue;
         }
@@ -308,7 +303,6 @@ fn paint_text_fragment(
             context.line_origin.x + glyph.position.x,
             context.baseline_y + glyph.position.y,
         );
-
         if glyph.is_emoji {
             window.paint_emoji(glyph_origin, fragment.font_id, glyph.id, fragment.font_size)?;
         } else {
@@ -321,7 +315,6 @@ fn paint_text_fragment(
             )?;
         }
     }
-
     Ok(())
 }
 
@@ -389,7 +382,6 @@ fn paint_visual_background(
     if visual_lines.is_empty() {
         return Ok(());
     }
-
     let paint_width = visual_lines
         .iter()
         .map(|line| line.advance_width)
@@ -436,7 +428,6 @@ fn paint_fragment_decorations_at(
     foreground: bool,
 ) {
     let range = line_origin.x + fragment.x_range.start..line_origin.x + fragment.x_range.end;
-
     if foreground {
         if let Some(mut underline) = fragment.style.underline {
             underline.color = Some(underline.color.unwrap_or(fragment.style.color));
@@ -449,7 +440,6 @@ fn paint_fragment_decorations_at(
                 &underline,
             );
         }
-
         if let Some(mut strike) = fragment.style.strikethrough {
             strike.color = Some(strike.color.unwrap_or(fragment.style.color));
             let strike_y = baseline_y

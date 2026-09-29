@@ -1,12 +1,3 @@
-#[cfg(test)]
-use crate::{
-    AvailableSpace, Context, Hsla, Render, ScaledPixels, TestApp, TestAppContext, div, hsla,
-    prelude::*, size,
-};
-
-#[cfg(test)]
-use std::collections::HashSet;
-
 use crate::{
     ActiveTooltip, AnyView, App, AppContext, Bounds, DispatchPhase, Element, ElementId,
     GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
@@ -548,7 +539,6 @@ impl StyledText {
     /// Set the text runs for this piece of text.
     pub fn with_runs(mut self, runs: Vec<TextRun>) -> Self {
         let mut text = &*self.text;
-
         for run in &runs {
             text = text.get(run.len..).unwrap_or_else(|| {
                 #[cfg(debug_assertions)]
@@ -881,7 +871,6 @@ impl TextLayout {
         let Some(truncate_width) = truncation.width else {
             return (text, Cow::Borrowed(runs));
         };
-
         truncate_to_shaped_layout(
             text,
             font_size,
@@ -1046,7 +1035,6 @@ impl TextLayout {
 
         let line_height = element_state.line_height;
         let text_style = window.text_style();
-
         if let Some(document) = &element_state.document {
             document
                 .paint_background(
@@ -1194,7 +1182,6 @@ fn truncate_to_shaped_layout<'a>(
         ) else {
             return false;
         };
-
         let width = wrap_width.unwrap_or(truncate_width);
         max_lines.is_none_or(|max_lines| document.line_count() <= max_lines.max(1))
             && document
@@ -1221,14 +1208,12 @@ fn truncate_to_shaped_layout<'a>(
     while low < high {
         let middle = low + (high - low).div_ceil(2);
         let (candidate_text, candidate_runs) = candidate(middle);
-
         if fits(&candidate_text, &candidate_runs, window) {
             low = middle;
         } else {
             high = middle - 1;
         }
     }
-
     let (result, result_runs) = candidate(low);
     (result, Cow::Owned(result_runs))
 }
@@ -1247,10 +1232,8 @@ fn make_truncation_candidate(
     match direction {
         TruncateFrom::End => {
             let end = boundaries[keep];
-            let prefix = text[..end].trim_end_matches(|character: char| {
-                character.is_whitespace() || character.is_ascii_punctuation()
-            });
-
+            let prefix = text[..end]
+                .trim_end_matches(|ch: char| ch.is_whitespace() || ch.is_ascii_punctuation());
             let result = SharedString::from(format!("{prefix}{affix}"));
             update_runs_after_truncation(&result, affix, &mut candidate_runs, direction);
             (result, candidate_runs)
@@ -1322,16 +1305,13 @@ fn update_runs_after_middle_truncation(
     let mut byte_offset = 0usize;
     for run in &original {
         let run_end = byte_offset + run.len;
-
         if byte_offset < front_end {
             let mut retained = run.clone();
             retained.len = run_end.min(front_end) - byte_offset;
             result.push(retained);
         }
-
         byte_offset = run_end;
     }
-
     if let Some(last) = result.last_mut() {
         last.len += affix.len();
     } else if let Some(first) = original.first() {
@@ -1339,21 +1319,59 @@ fn update_runs_after_middle_truncation(
         affix_run.len = affix.len();
         result.push(affix_run);
     }
-
     byte_offset = 0;
     for run in &original {
         let run_end = byte_offset + run.len;
-
         if run_end > back_start {
             let mut retained = run.clone();
             retained.len = run_end - back_start.max(byte_offset);
             result.push(retained);
         }
-
         byte_offset = run_end;
     }
-
     *runs = result;
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+
+    #[test]
+    fn truncation_candidates_keep_complete_graphemes_and_cover_output_with_runs() {
+        const FAMILY: &str = "👩‍👩‍👧‍👦";
+        let text = format!("Ae\u{301}{FAMILY}Z");
+        let split = "Ae\u{301}".len();
+        let runs = [
+            TextRun {
+                len: split,
+                ..Default::default()
+            },
+            TextRun {
+                len: text.len() - split,
+                ..Default::default()
+            },
+        ];
+        let mut boundaries = text
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        boundaries.push(text.len());
+
+        for (direction, keep, expected) in [
+            (TruncateFrom::Start, 2, format!("…{FAMILY}Z")),
+            (TruncateFrom::End, 2, "Ae\u{301}…".to_owned()),
+            (TruncateFrom::Middle, 3, "Ae\u{301}…Z".to_owned()),
+        ] {
+            let (candidate, candidate_runs) =
+                make_truncation_candidate(&text, &boundaries, keep, "…", &runs, direction);
+            assert_eq!(candidate.as_ref(), expected, "{direction:?}");
+            assert_eq!(
+                candidate_runs.iter().map(|run| run.len).sum::<usize>(),
+                candidate.len(),
+                "style runs must cover {candidate:?} after {direction:?} truncation"
+            );
+        }
+    }
 }
 
 /// A text element that can be interacted with.
@@ -1663,43 +1681,11 @@ impl IntoElement for InteractiveText {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn truncation_candidates_keep_complete_graphemes_and_cover_output_with_runs() {
-        const FAMILY: &str = "👩‍👩‍👧‍👦";
-        let text = format!("Ae\u{301}{FAMILY}Z");
-        let split = "Ae\u{301}".len();
-        let runs = [
-            TextRun {
-                len: split,
-                ..Default::default()
-            },
-            TextRun {
-                len: text.len() - split,
-                ..Default::default()
-            },
-        ];
-        let mut boundaries = text
-            .grapheme_indices(true)
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        boundaries.push(text.len());
-
-        for (direction, keep, expected) in [
-            (TruncateFrom::Start, 2, format!("…{FAMILY}Z")),
-            (TruncateFrom::End, 2, "Ae\u{301}…".to_owned()),
-            (TruncateFrom::Middle, 3, "Ae\u{301}…Z".to_owned()),
-        ] {
-            let (candidate, candidate_runs) =
-                make_truncation_candidate(&text, &boundaries, keep, "…", &runs, direction);
-            assert_eq!(candidate.as_ref(), expected, "{direction:?}");
-            assert_eq!(
-                candidate_runs.iter().map(|run| run.len).sum::<usize>(),
-                candidate.len(),
-                "style runs must cover {candidate:?} after {direction:?} truncation"
-            );
-        }
-    }
+    use crate::{
+        AvailableSpace, Context, Hsla, Render, ScaledPixels, TestApp, TestAppContext, div, hsla,
+        prelude::*, size,
+    };
+    use std::collections::HashSet;
 
     const CONTAINER_COLOR: Hsla = hsla(0.72, 0.45, 0.32, 1.0);
     const TEXT_BACKGROUND_COLOR: Hsla = hsla(0.37, 0.65, 0.42, 1.0);
@@ -1773,11 +1759,7 @@ mod tests {
     }
 
     impl Render for CenteredTextView {
-        fn render(
-            &mut self,
-            _window: &mut Window,
-            _context: &mut Context<Self>,
-        ) -> impl IntoElement {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div()
                 .flex()
                 .items_center()
@@ -1871,7 +1853,6 @@ mod tests {
                 window.set_scale_factor(scale_factor);
                 CenteredTextView { extent: 0.0 }
             });
-
             test_window.draw();
 
             let (initial_container, initial_background) = test_window.update(|_, window, _| {
@@ -1880,7 +1861,6 @@ mod tests {
                     only_quad(window, TEXT_BACKGROUND_COLOR),
                 )
             });
-
             let expected_offset = initial_background.origin - initial_container.origin;
             let mut container_origins = HashSet::from([(
                 initial_container.origin.x.as_f32() as i32,
@@ -1888,11 +1868,10 @@ mod tests {
             )]);
 
             for step in 1..=32 {
-                test_window.update(|view, _, context| {
+                test_window.update(|view, _, cx| {
                     view.extent = step as f32;
-                    context.notify();
+                    cx.notify();
                 });
-
                 test_window.draw();
 
                 let (container, background) = test_window.update(|_, window, _| {
@@ -1901,7 +1880,6 @@ mod tests {
                         only_quad(window, TEXT_BACKGROUND_COLOR),
                     )
                 });
-
                 assert_eq!(
                     background.origin - container.origin,
                     expected_offset,

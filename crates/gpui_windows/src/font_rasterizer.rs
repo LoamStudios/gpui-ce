@@ -1,12 +1,3 @@
-#[cfg(test)]
-use gpui::{GlyphId, PlatformTextSystem, font, rgba};
-
-#[cfg(test)]
-use gpui_parley::{ParleyTextSystem, SystemFonts};
-
-#[cfg(test)]
-use std::borrow::Cow;
-
 use anyhow::{Context as _, Result, bail, ensure};
 use gpui::{
     Bounds, DevicePixels, GlyphRenderMode, PreparedRasterStyle, RasterColorEffect, RasterColorExt,
@@ -848,6 +839,9 @@ fn get_system_subpixel_rendering() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{GlyphId, PlatformTextSystem, font, rgba};
+    use gpui_parley::{ParleyTextSystem, SystemFonts};
+    use std::borrow::Cow;
 
     const SOURCE_SERIF: &[u8] =
         include_bytes!("../../../assets/fonts/source-serif-4/SourceSerif4[opsz,wght].ttf");

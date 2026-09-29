@@ -366,15 +366,15 @@ impl FontStore {
             synthesis: synthesis.into(),
         };
 
-        if let Some(font_id) = self.ids_by_key.get(&key) {
-            return Ok(*font_id);
+        if let Some(id) = self.ids_by_key.get(&key) {
+            return Ok(*id);
         }
 
         if self.fonts.len() >= CANONICAL_FONT_ID_BIT {
             bail!("canonical font store exhausted its FontId namespace");
         }
 
-        let font_id = FontId(CANONICAL_FONT_ID_BIT | self.fonts.len());
+        let id = FontId(CANONICAL_FONT_ID_BIT | self.fonts.len());
         let variations = design_variations(&font, normalized_coords);
         let has_color_glyphs = [*b"CBDT", *b"sbix", *b"COLR", *b"SVG "]
             .into_iter()
@@ -390,13 +390,13 @@ impl FontStore {
             source_identity,
         });
 
-        self.ids_by_key.insert(key, font_id);
-        Ok(font_id)
+        self.ids_by_key.insert(key, id);
+        Ok(id)
     }
 
     /// Returns the stored font for a canonical ID.
-    pub(crate) fn get(&self, font_id: FontId) -> Option<&LoadedFont> {
-        canonical_index(font_id).and_then(|index| self.fonts.get(index))
+    pub(crate) fn get(&self, id: FontId) -> Option<&LoadedFont> {
+        canonical_index(id).and_then(|index| self.fonts.get(index))
     }
 }
 
@@ -460,8 +460,8 @@ fn design_variations(
         .collect()
 }
 
-fn canonical_index(font_id: FontId) -> Option<usize> {
-    (font_id.0 & CANONICAL_FONT_ID_BIT != 0).then_some(font_id.0 & !CANONICAL_FONT_ID_BIT)
+fn canonical_index(id: FontId) -> Option<usize> {
+    (id.0 & CANONICAL_FONT_ID_BIT != 0).then_some(id.0 & !CANONICAL_FONT_ID_BIT)
 }
 
 /// Swash raster state used by Linux, web, and explicit fallback construction.

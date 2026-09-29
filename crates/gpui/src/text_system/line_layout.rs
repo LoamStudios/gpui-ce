@@ -970,7 +970,6 @@ impl LineLayoutCache {
 
     fn sync_font_generation(&self) {
         let generation = self.platform_text_system.font_generation();
-
         if self.font_generation.load(Ordering::Acquire) != generation {
             self.clear();
             self.font_generation.store(generation, Ordering::Release);
@@ -1065,7 +1064,6 @@ impl LineLayoutCache {
                 } else {
                     self.layout_line::<&SharedString>(&text, font_size, runs)
                 };
-
             let layout = Arc::new(WrappedLineLayout {
                 layout: document_layout,
                 wrap_width,
@@ -1126,7 +1124,6 @@ impl LineLayoutCache {
                 wrap_width: None,
                 line_clamp: None,
             });
-
             let key = Arc::new(CacheKey {
                 text,
                 font_size,

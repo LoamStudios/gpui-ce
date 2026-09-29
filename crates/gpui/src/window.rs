@@ -4818,7 +4818,6 @@ impl Window {
         } else {
             GlyphRenderMode::Grayscale
         };
-
         let raster_style = self
             .text_system()
             .prepare_raster_style(color, requested_mode);
@@ -4852,7 +4851,6 @@ impl Window {
                 metadata
             }
         };
-
         if metadata.bounds.is_zero() {
             return Ok(());
         }
@@ -4864,26 +4862,21 @@ impl Window {
                 Some(rasterized) => rasterized,
                 None => text_system.rasterize_glyph(&params)?,
             };
-
             uploaded_metadata = Some(rasterized.metadata());
-
             if rasterized.bounds.is_zero() {
                 return Ok(None);
             }
-
             Ok(Some((rasterized.size, Cow::Owned(rasterized.pixels))))
         })?
         else {
             return Ok(());
         };
-
         let metadata = uploaded_metadata.unwrap_or(metadata);
         debug_assert_eq!(metadata.bounds.size, tile.bounds.size.map(Into::into));
         let bounds = Bounds {
             origin: integer_origin + metadata.bounds.origin.map(Into::into),
             size: tile.bounds.size.map(Into::into),
         };
-
         let content_mask = self.snapped_content_mask();
 
         match metadata.format {
@@ -8129,7 +8122,6 @@ mod tests {
                 ),
                 node_id => anyhow::bail!("unexpected scripted glyph {node_id}"),
             };
-
             let size = size(DevicePixels(2), DevicePixels(1));
             Ok(RasterizedGlyph {
                 bounds: Bounds {

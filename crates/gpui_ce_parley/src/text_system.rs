@@ -1,23 +1,7 @@
-#[cfg(test)]
-use crate::{FontSynthesis, FontVariation, RasterFace};
-
-#[cfg(test)]
-use gpui::{
-    AppContext, CaretSelection, Context, FontFallbacks, FontFeatures as GpuiFontFeatures,
-    FontStyle as GpuiFontStyle, FontWeight as GpuiFontWeight, GlyphRenderMode, HeadlessAppContext,
-    HighlightStyle, Hsla, IntoElement, Point, RasterizedGlyphFormat, Render, ScaledPixels,
-    StrikethroughStyle, Styled, StyledText, TextSystem, UnderlineStyle, VerticalAlign, Window,
-    WindowHandle, WindowTextSystem, div, font, hsla, prelude::*,
-};
-
-#[cfg(test)]
-use std::{cell::Cell, cell::RefCell, rc::Rc, sync::Arc};
-
 use crate::{
     CatalogState, FaceFamily, FaceRequest, FontCatalog, FontStore, GlyphRasterizer,
     SwashGlyphRasterizer, SystemFonts,
 };
-
 use anyhow::{Context as _, Result};
 use gpui::{
     Bounds, CaretAffinity, CaretMovement, CaretPosition, Font, FontId, FontMetrics, GlyphId,
@@ -29,7 +13,6 @@ use gpui::{
     TextRenderingMode, TextRun, TextSelectionKind, VisualDirection, VisualLine, align_inline_boxes,
     point, px, size,
 };
-
 use parking_lot::{Mutex, RwLock};
 use parley::setting::Tag;
 use parley::{
@@ -371,13 +354,15 @@ impl PlatformTextLayout for ParleyLayout {
         let inverse_position = Self::cursor_position(&self.layout, inverse);
         let current_position = Self::cursor_position(&self.layout, cursor);
 
-        if moved_position == (adjacent.block, adjacent.inline)
+        let result = if moved_position == (adjacent.block, adjacent.inline)
             && inverse_position == current_position
         {
-            Some(Self::caret_position(moved))
+            moved
         } else {
-            Some(Self::caret_position(adjacent.cursor))
-        }
+            adjacent.cursor
+        };
+
+        Some(Self::caret_position(result))
     }
 
     fn selection_bounds(
@@ -458,7 +443,7 @@ impl PlatformTextLayout for ParleyLayout {
         &self,
         caret: CaretPosition,
         movement: TextMovement,
-        preferred_x: Option<Pixels>,
+        vertical_navigation_x: Option<Pixels>,
     ) -> CaretMovement {
         let cursor = self.cursor(caret);
         let moved = match (movement.direction, movement.boundary) {
@@ -509,10 +494,10 @@ impl PlatformTextLayout for ParleyLayout {
                             && (geometry.y0 as f32) < metrics.block_max_coord
                     })
                     .unwrap_or_else(|| self.layout.len().saturating_sub(1));
-                let target_index = line_index
+                let target_ix = line_index
                     .checked_add_signed(delta)
-                    .filter(|&target_index| self.layout.get(target_index).is_some());
-                let Some(target_index) = target_index else {
+                    .filter(|&target_ix| self.layout.get(target_ix).is_some());
+                let Some(target_ix) = target_ix else {
                     let selection = Selection::from(cursor);
                     let moved = if delta < 0 {
                         selection.previous_line(&self.layout, false)
@@ -521,14 +506,13 @@ impl PlatformTextLayout for ParleyLayout {
                     };
                     return CaretMovement {
                         result: Self::caret_position(moved.focus()),
-                        vertical_navigation_x: preferred_x,
+                        vertical_navigation_x,
                     };
                 };
 
-                let x = preferred_x
+                let x = vertical_navigation_x
                     .map_or_else(|| cursor.geometry(&self.layout, 0.0).x0 as f32, f32::from);
-                let moved =
-                    Cursor::from_point(&self.layout, x, self.native_y_for_line(target_index));
+                let moved = Cursor::from_point(&self.layout, x, self.native_y_for_line(target_ix));
                 return CaretMovement {
                     result: Self::caret_position(moved),
                     vertical_navigation_x: Some(px(x)),
@@ -1127,10 +1111,7 @@ fn push_face_families<'a>(
         families.push(FaceFamily::SystemUi);
         families.push(FaceFamily::Named(system_font_fallback));
     } else {
-        families.push(FaceFamily::Named(canonical_family(
-            name,
-            system_font_fallback,
-        )));
+        families.push(FaceFamily::Named(name));
     }
 }
 
@@ -1145,18 +1126,7 @@ fn push_parley_families<'a>(
             system_font_fallback.to_string(),
         )));
     } else {
-        families.push(FontFamilyName::Named(Cow::Owned(
-            canonical_family(name, system_font_fallback).to_string(),
-        )));
-    }
-}
-
-fn canonical_family<'a>(name: &'a str, system: &'a str) -> &'a str {
-    match name {
-        ".SystemUIFont" => system,
-        ".ZedSans" | "Zed Plex Sans" => "IBM Plex Sans",
-        ".ZedMono" | "Zed Plex Mono" => "Lilex",
-        _ => name,
+        families.push(FontFamilyName::Named(Cow::Owned(name.to_string())));
     }
 }
 
@@ -1175,7 +1145,7 @@ impl PlatformTextSystem for ParleyTextSystem {
 
     fn all_font_names(&self) -> Vec<String> {
         let mut names = self.catalog.family_names();
-        names.extend([".SystemUIFont", ".ZedSans", ".ZedMono"].map(str::to_owned));
+        names.push(".SystemUIFont".to_owned());
         names.sort_unstable();
         names.dedup();
         names
@@ -1214,12 +1184,8 @@ impl PlatformTextSystem for ParleyTextSystem {
             .advance(glyph_id)
     }
 
-    fn glyph_for_char(&self, font_id: FontId, character: char) -> Option<GlyphId> {
-        self.fonts
-            .read()
-            .get(font_id)?
-            .glyph_for_char(character)
-            .ok()?
+    fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+        self.fonts.read().get(font_id)?.glyph_for_char(ch).ok()?
     }
 
     fn rasterize_glyph(&self, params: &RenderGlyphParams) -> Result<RasterizedGlyph> {
@@ -1309,12 +1275,13 @@ mod tests {
     };
     use crate::{FontSynthesis, FontVariation, RasterFace};
     use gpui::{
-        CaretSelection, FontFallbacks, FontFeatures as GpuiFontFeatures,
+        AppContext, CaretSelection, Context, FontFallbacks, FontFeatures as GpuiFontFeatures,
         FontStyle as GpuiFontStyle, FontWeight as GpuiFontWeight, GlyphRenderMode,
-        RasterizedGlyphFormat, StrikethroughStyle, TextSystem, UnderlineStyle, WindowTextSystem,
-        font, hsla,
+        HeadlessAppContext, HighlightStyle, Hsla, IntoElement, Point, RasterizedGlyphFormat,
+        Render, ScaledPixels, StrikethroughStyle, Styled, StyledText, TextSystem, UnderlineStyle,
+        VerticalAlign, Window, WindowHandle, WindowTextSystem, div, font, hsla, prelude::*,
     };
-    use std::sync::Arc;
+    use std::{cell::Cell, cell::RefCell, rc::Rc, sync::Arc};
 
     #[test]
     fn caret_affinity_round_trips_through_parley() {

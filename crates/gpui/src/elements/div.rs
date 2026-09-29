@@ -2374,7 +2374,6 @@ impl Element for Div {
 
         let mut child_min = point(Pixels::MAX, Pixels::MAX);
         let mut child_max = Point::default();
-
         if let Some(handle) = self.interactivity.scroll_anchor.as_ref() {
             *handle.last_origin.borrow_mut() = bounds.origin - window.element_offset();
         }
@@ -3706,7 +3705,6 @@ impl Interactivity {
                             && source_hitbox.contains(&window.mouse_position())
                     }
                 });
-
                 let check_is_hovered = Rc::new({
                     let hitbox = hitbox.clone();
                     move |window: &Window| {

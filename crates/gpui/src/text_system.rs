@@ -242,7 +242,6 @@ impl TextSystem {
 
         let metadata = glyph.metadata();
         let cached = self.raster_metadata.upgradable_read();
-
         if let Some(previous) = cached.get(params) {
             anyhow::ensure!(
                 *previous == metadata,
@@ -252,7 +251,6 @@ impl TextSystem {
             let mut cached = RwLockUpgradableReadGuard::upgrade(cached);
             cached.insert(params.clone(), metadata);
         }
-
         Ok(glyph)
     }
 
@@ -592,38 +590,28 @@ impl Hash for TextRun {
         self.len.hash(state);
         self.font.hash(state);
         hash_color(self.color, state);
-
         if let Some(color) = self.background_color {
             hash_color(color, state);
         }
-
         self.background_color.is_some().hash(state);
         self.underline.is_some().hash(state);
-
         if let Some(underline) = self.underline {
             hash_float(underline.thickness.into(), state);
             underline.color.is_some().hash(state);
-
             if let Some(color) = underline.color {
                 hash_color(color, state);
             }
-
             underline.wavy.hash(state);
         }
-
         self.strikethrough.is_some().hash(state);
-
         if let Some(strikethrough) = self.strikethrough {
             hash_float(strikethrough.thickness.into(), state);
             strikethrough.color.is_some().hash(state);
-
             if let Some(color) = strikethrough.color {
                 hash_color(color, state);
             }
         }
-
         self.letter_spacing.is_some().hash(state);
-
         if let Some(letter_spacing) = self.letter_spacing {
             hash_float(letter_spacing.into(), state);
         }
@@ -827,7 +815,6 @@ impl RasterizedGlyph {
             .0
             .try_into()
             .map_err(|_| anyhow::anyhow!("glyph raster height is negative"))?;
-
         if width == 0 || height == 0 {
             anyhow::ensure!(
                 width == 0 && height == 0 && self.pixels.is_empty(),
@@ -835,12 +822,10 @@ impl RasterizedGlyph {
             );
             return Ok(());
         }
-
         let bytes_per_pixel = match self.format {
             RasterizedGlyphFormat::AlphaMask => 1,
             RasterizedGlyphFormat::BgraSubpixelMask | RasterizedGlyphFormat::BgraColor => 4,
         };
-
         let expected_len = width
             .checked_mul(height)
             .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
@@ -1220,7 +1205,6 @@ mod raster_contract_tests {
             attempts: AtomicUsize::new(0),
             fail_until_valid: true,
         });
-
         let text_system = TextSystem::new(backend.clone());
         let params = params(PreparedRasterStyle::independent(GlyphRenderMode::Grayscale));
 
@@ -1277,7 +1261,6 @@ mod raster_contract_tests {
 
         fn rasterize_glyph(&self, _params: &RenderGlyphParams) -> Result<RasterizedGlyph> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
-
             if !self.fail_until_valid {
                 return Ok(RasterizedGlyph {
                     bounds: Bounds {
@@ -1289,7 +1272,6 @@ mod raster_contract_tests {
                     pixels: vec![0x7f],
                 });
             }
-
             match attempt {
                 0 => Err(anyhow!("transient native failure")),
                 1 => Ok(RasterizedGlyph {
