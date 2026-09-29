@@ -23,9 +23,9 @@ const CANONICAL_FONT_ID_BIT: usize = 1 << (usize::BITS - 1);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct SourceIdentity(u64);
 
-impl SourceIdentity {
+impl From<&Blob<u8>> for SourceIdentity {
     /// Returns the stable identity carried by a Fontique blob.
-    fn of(data: &Blob<u8>) -> Self {
+    fn from(data: &Blob<u8>) -> Self {
         Self(data.id())
     }
 }
@@ -354,7 +354,7 @@ impl FontStore {
         let font = FontRef::from_index(data.as_ref(), index)
             .context("cannot intern a font face Skrifa cannot parse")?;
         let key = FontKey {
-            source_identity: SourceIdentity::of(&data),
+            source_identity: SourceIdentity::from(&data),
             face_index: index,
             normalized_coords: normalized_coords.to_vec(),
             synthesis: synthesis.into(),
@@ -370,7 +370,7 @@ impl FontStore {
         let has_color_glyphs = [*b"CBDT", *b"sbix", *b"COLR", *b"SVG "]
             .into_iter()
             .any(|tag| font.table_data(Tag::new(&tag)).is_some());
-        let source_identity = SourceIdentity::of(&data);
+        let source_identity = SourceIdentity::from(&data);
         self.fonts.push(LoadedFont {
             data,
             index,
