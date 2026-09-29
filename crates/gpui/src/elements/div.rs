@@ -28,6 +28,7 @@ use crate::{
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
+use itertools::Either;
 use refineable::Refineable;
 use smallvec::SmallVec;
 use std::{
@@ -2359,15 +2360,13 @@ impl Element for Div {
                 window.with_image_cache(image_cache, |window| {
                     window.with_style_transition_containing_bounds(bounds, |window| {
                         window.with_element_offset(scroll_offset, |window| {
-                            if let Some(order_fn) = &self.prepaint_order_fn {
-                                let order = order_fn(window, cx);
-                                for idx in order {
-                                    if let Some(child) = self.children.get_mut(idx) {
-                                        child.prepaint(window, cx);
-                                    }
-                                }
-                            } else {
-                                for child in &mut self.children {
+                            let order = match &self.prepaint_order_fn {
+                                Some(order_fn) => Either::Left(order_fn(window, cx).into_iter()),
+                                None => Either::Right(0..self.children.len()),
+                            };
+
+                            for index in order {
+                                if let Some(child) = self.children.get_mut(index) {
                                     child.prepaint(window, cx);
                                 }
                             }
@@ -4847,6 +4846,85 @@ mod tests {
         util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
+
+    struct ChildPrepaintTestView {
+        custom_order: bool,
+        visits: Rc<RefCell<Vec<(usize, Point<Pixels>)>>>,
+        callback_offsets: Rc<RefCell<Vec<Point<Pixels>>>>,
+        scroll_handle: ScrollHandle,
+    }
+
+    impl Render for ChildPrepaintTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let children = (0..3).map(|index| {
+                let visits = self.visits.clone();
+
+                canvas(
+                    move |_bounds, window, _cx| {
+                        visits.borrow_mut().push((index, window.element_offset()));
+                    },
+                    |_bounds, _state, _window, _cx| {},
+                )
+                .w_full()
+                .h(px(40.))
+                .flex_shrink_0()
+            });
+            let mut element = div().size_full().flex().flex_col().children(children);
+
+            if self.custom_order {
+                let visits = self.visits.clone();
+                let callback_offsets = self.callback_offsets.clone();
+                element = element.with_dynamic_prepaint_order(move |window, _cx| {
+                    assert!(visits.borrow().is_empty());
+                    callback_offsets.borrow_mut().push(window.element_offset());
+
+                    SmallVec::from_slice(&[2, 9, 0, 1])
+                });
+            }
+
+            element
+                .id("prepaint-order")
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll_handle)
+        }
+    }
+
+    #[gpui::test]
+    fn child_prepaint_preserves_order_and_scroll_offset(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let origin = point(px(20.), px(30.));
+        let scroll_offset = point(px(0.), px(-15.));
+        let expected_offset = origin + scroll_offset;
+
+        for custom_order in [false, true] {
+            let visits = Rc::new(RefCell::new(Vec::new()));
+            let callback_offsets = Rc::new(RefCell::new(Vec::new()));
+            let scroll_handle = ScrollHandle::new();
+            scroll_handle.set_offset(scroll_offset);
+
+            cx.draw(origin, size(px(50.), px(50.)), |_window, cx| {
+                cx.new(|_cx| ChildPrepaintTestView {
+                    custom_order,
+                    visits: visits.clone(),
+                    callback_offsets: callback_offsets.clone(),
+                    scroll_handle,
+                })
+                .into_any_element()
+            });
+
+            let expected_order = if custom_order { [2, 0, 1] } else { [0, 1, 2] };
+            assert_eq!(
+                *visits.borrow(),
+                expected_order.map(|index| (index, expected_offset)),
+            );
+
+            if custom_order {
+                assert_eq!(*callback_offsets.borrow(), [expected_offset]);
+            } else {
+                assert!(callback_offsets.borrow().is_empty());
+            }
+        }
+    }
 
     struct GroupHoverTestView {
         render_count: Rc<Cell<usize>>,
