@@ -311,7 +311,7 @@ impl CaretPosition {
 ///
 /// The anchor stays fixed while the caret is the active endpoint. Either endpoint may be the
 /// logical start or end of the selected byte range.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CaretSelection {
     /// The fixed position of the selection, which may be its logical start or end.
     pub anchor: CaretPosition,
@@ -370,7 +370,7 @@ impl CaretSelection {
 }
 
 /// The result of calculating movement through a laid-out document.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CaretMovement<T = CaretPosition> {
     /// The value at the requested destination.
     pub result: T,
