@@ -421,7 +421,7 @@ impl EditableTextState {
 
     fn line_range_for_cut(&self) -> Range<usize> {
         let caret = self.caret_selection().caret;
-        let range = match self.current_document() {
+        let mut range = match self.current_document() {
             Ok(document) => {
                 let [start, end] = [Direction::Start, Direction::End].map(|direction| {
                     let movement = direction.with_boundary(TextBoundary::HardLine);
@@ -432,40 +432,31 @@ impl EditableTextState {
                 start.min(end)..start.max(end)
             }
             Err(OldDocumentVersion) => {
-                let start = self.storage.offset_from_caret(
-                    caret.index,
-                    NavigationDirection::Back,
-                    TextBoundary::HardLine,
-                );
-
-                let end = self.storage.offset_from_caret(
-                    caret.index,
-                    NavigationDirection::Forward,
-                    TextBoundary::HardLine,
-                );
+                let [start, end] =
+                    [NavigationDirection::Back, NavigationDirection::Forward].map(|direction| {
+                        self.storage.offset_from_caret(
+                            caret.index,
+                            direction,
+                            TextBoundary::HardLine,
+                        )
+                    });
 
                 start..end
             }
         };
 
-        if range.end < self.as_str().len() {
-            let end = self.storage.offset_from_caret(
-                range.end,
-                NavigationDirection::Forward,
-                TextBoundary::Cluster,
-            );
+        let adjustment = if range.end < self.as_str().len() {
+            Some((&mut range.end, NavigationDirection::Forward))
+        } else if range.start > 0 {
+            Some((&mut range.start, NavigationDirection::Back))
+        } else {
+            None
+        };
 
-            return range.start..end;
-        }
-
-        if range.start > 0 {
-            let start = self.storage.offset_from_caret(
-                range.start,
-                NavigationDirection::Back,
-                TextBoundary::Cluster,
-            );
-
-            return start..range.end;
+        if let Some((endpoint, direction)) = adjustment {
+            *endpoint = self
+                .storage
+                .offset_from_caret(*endpoint, direction, TextBoundary::Cluster);
         }
 
         range
@@ -1214,14 +1205,13 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
             return;
         }
 
-        let range_to_cut = match self.selection_movement.result.is_empty() {
-            // selection is more than a caret, use that range of text
-            false => self.selection_movement.result.byte_range(),
-            // No selection: cut the entire current line (including newline)
-            true => self.line_range_for_cut(),
+        let range = self.selected_byte_range();
+        let range_to_cut = if range.is_empty() {
+            self.line_range_for_cut()
+        } else {
+            range
         };
 
-        // Cut selected text
         let slice = &self.storage.content_utf8()[range_to_cut.clone()];
         cx.write_to_clipboard(ClipboardItem::new_string(slice.to_string()));
         self.replace_text(range_to_cut, "");
@@ -1231,10 +1221,14 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
     }
 
     fn copy(&mut self, _: &Copy, _w: &mut Window, cx: &mut Context<'app, Self>) {
-        if !self.selection_movement.result.is_empty() {
-            let slice = &self.storage.content_utf8()[self.selection_movement.result.byte_range()];
-            cx.write_to_clipboard(ClipboardItem::new_string(slice.to_string()));
+        let range = self.selected_byte_range();
+
+        if range.is_empty() {
+            return;
         }
+
+        let slice = &self.storage.content_utf8()[range];
+        cx.write_to_clipboard(ClipboardItem::new_string(slice.to_string()));
     }
 
     fn paste(&mut self, _: &Paste, _w: &mut Window, cx: &mut Context<'app, Self>) {
@@ -2761,30 +2755,79 @@ mod tests {
 
     #[gpui::test]
     fn cut_without_selection_removes_complete_hard_line(cx: &mut TestAppContext) {
-        for (name, text, caret, remaining, expected_clipboard) in [
+        for (name, text, caret, remaining, expected_clipboard, current_layout) in [
             (
                 "middle",
                 "line1\nline2\nline3",
                 8,
                 "line1\nline3",
                 "line2\n",
+                false,
             ),
-            ("first CRLF", "line1\r\nline2", 2, "line2", "line1\r\n"),
-            ("last", "line1\nline2", 8, "line1", "\nline2"),
-            ("empty", "line1\n\nline3", 6, "line1\nline3", "\n"),
-            ("only", "hello", 2, "", "hello"),
+            (
+                "first CRLF",
+                "line1\r\nline2",
+                2,
+                "line2",
+                "line1\r\n",
+                false,
+            ),
+            ("last", "line1\nline2", 8, "line1", "\nline2", false),
+            ("empty", "line1\n\nline3", 6, "line1\nline3", "\n", false),
+            ("only", "hello", 2, "", "hello", false),
+            ("empty document", "", 0, "", "", false),
+            ("empty final line", "line1\n", 6, "line1", "\n", false),
+            (
+                "multibyte separator fallback",
+                "line1\u{2028}line2",
+                2,
+                "",
+                "line1\u{2028}line2",
+                false,
+            ),
+            ("only current layout", "hello", 2, "", "hello", true),
+            ("empty current layout", "", 0, "", "", true),
         ] {
             let view = create_test_input(cx, text, caret);
             view.update(cx, |view, window, cx| {
+                let document = current_layout.then(|| {
+                    window
+                        .text_system()
+                        .shape_text(
+                            text,
+                            gpui::px(16.),
+                            &[window.text_style().to_run(text.len())],
+                            None,
+                            None,
+                        )
+                        .unwrap()
+                });
+
                 view.input.update(cx, |input, cx| {
+                    if let Some(document) = document {
+                        input.layout_data.document = Some(document.into());
+                        input.layout_data.state.last_seen_storage_version = input.version();
+                    }
+
+                    assert_eq!(input.current_document().is_ok(), current_layout, "{name}");
+                    without_history_grouping(input);
+
                     input.cut(&Cut, window, cx);
                     assert_eq!(input.as_str(), remaining, "{name}");
+
+                    input.undo(&Undo, window, cx);
+                    assert_eq!(input.as_str(), text, "{name}");
+                    assert_eq!(input.caret_selection(), caret.into(), "{name}");
                 });
             })
             .unwrap();
 
             let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
-            assert_eq!(clipboard.as_deref(), Some(expected_clipboard), "{name}");
+            assert_eq!(
+                clipboard.as_deref().unwrap_or_default(),
+                expected_clipboard,
+                "{name}"
+            );
         }
     }
 
