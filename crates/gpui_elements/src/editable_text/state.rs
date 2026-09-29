@@ -517,12 +517,14 @@ impl EditableTextState {
         self.move_to_caret(CaretPosition::attached_to_next_cluster(caret_pos), cx);
     }
 
-    fn move_to_caret(&mut self, mut caret: CaretPosition, cx: &mut Context<Self>) {
-        cx.emit(CaretNotify::PauseBlinking);
-        caret.index = caret.index.min(self.storage.content_utf8().len());
-        self.set_selection(caret);
-        self.scroll_to_caret();
-        cx.notify();
+    fn move_to_caret(&mut self, caret: CaretPosition, cx: &mut Context<Self>) {
+        self.apply_selection_movement(
+            CaretSelectionMovement {
+                result: caret.into(),
+                vertical_navigation_x: None,
+            },
+            cx,
+        );
     }
 
     /// Changes the current selection to extend to the provided position.
@@ -533,10 +535,27 @@ impl EditableTextState {
         self.select_to_caret(CaretPosition::attached_to_next_cluster(caret_pos), cx);
     }
 
-    fn select_to_caret(&mut self, mut caret: CaretPosition, cx: &mut Context<Self>) {
+    fn select_to_caret(&mut self, caret: CaretPosition, cx: &mut Context<Self>) {
+        self.apply_selection_movement(
+            CaretSelectionMovement {
+                result: self.selection_movement.result.with_caret(caret),
+                vertical_navigation_x: None,
+            },
+            cx,
+        );
+    }
+
+    fn apply_selection_movement(
+        &mut self,
+        mut moved: CaretSelectionMovement,
+        cx: &mut Context<Self>,
+    ) {
+        let storage_len = self.storage.content_utf8().len();
+        moved.result.caret.index = moved.result.caret.index.min(storage_len);
+        moved.result.anchor.index = moved.result.anchor.index.min(storage_len);
+        self.selection_movement = moved;
+
         cx.emit(CaretNotify::PauseBlinking);
-        caret.index = caret.index.min(self.as_str().len());
-        self.set_selection(self.selection_movement.result.with_caret(caret));
         self.scroll_to_caret();
         cx.notify();
     }
@@ -601,34 +620,43 @@ impl EditableTextState {
         boundary: TextBoundary,
         cx: &mut Context<Self>,
     ) {
-        let caret_pos = match self.selection_movement.result.is_empty() {
-            false => match direction {
-                NavigationDirection::Back => self.selection_movement.result.caret.index,
-                NavigationDirection::Forward => self.selection_movement.result.anchor.index,
-            },
-            true => self.storage.offset_from_caret(
-                self.caret_selection().caret.index,
-                direction,
-                boundary,
-            ),
+        self.move_linear(direction, boundary, false, cx);
+    }
+
+    fn nav_semantic(&mut self, movement: TextMovement, cx: &mut Context<Self>) {
+        self.move_semantic(movement, false, cx);
+    }
+
+    fn select_semantic(&mut self, movement: TextMovement, cx: &mut Context<Self>) {
+        self.move_semantic(movement, true, cx);
+    }
+
+    /// Calculates destinations for both navigation and selection extension.
+    fn move_semantic(&mut self, movement: TextMovement, extend: bool, cx: &mut Context<Self>) {
+        let document_endpoint = match (movement.direction, movement.boundary) {
+            (Direction::Start, TextBoundary::Document) => Some(0),
+            (Direction::End, TextBoundary::Document) => Some(self.storage.content_utf8().len()),
+            _ => None,
         };
 
-        self.move_to(caret_pos, cx);
-    }
+        if let Some(index) = document_endpoint {
+            // The core layout backend does not handle document boundaries.
+            let caret = CaretPosition::attached_to_next_cluster(index);
+            self.apply_selection_movement(
+                CaretSelectionMovement {
+                    result: if extend {
+                        self.selection_movement.result.with_caret(caret)
+                    } else {
+                        caret.into()
+                    },
+                    vertical_navigation_x: None,
+                },
+                cx,
+            );
 
-    fn move_visual(&mut self, forward: bool, extend: bool, cx: &mut Context<Self>) {
-        self.move_semantic(
-            if forward {
-                Direction::Right.with_boundary(TextBoundary::Cluster)
-            } else {
-                Direction::Left.with_boundary(TextBoundary::Cluster)
-            },
-            extend,
-            cx,
-        );
-    }
+            return;
+        }
 
-    fn move_semantic(&mut self, movement: TextMovement, extend: bool, cx: &mut Context<Self>) {
         if let Ok(document) = self.current_document() {
             let moved = document.selection_movement(
                 self.selection_movement.result,
@@ -637,14 +665,7 @@ impl EditableTextState {
                 self.selection_movement.vertical_navigation_x,
                 self.layout_data.line_height,
             );
-            cx.emit(CaretNotify::PauseBlinking);
-            let storage_len = self.storage.content_utf8().len();
-            let mut moved = moved;
-            moved.result.caret.index = moved.result.caret.index.min(storage_len);
-            moved.result.anchor.index = moved.result.anchor.index.min(storage_len);
-            self.selection_movement = moved;
-            self.scroll_to_caret();
-            cx.notify();
+            self.apply_selection_movement(moved, cx);
 
             return;
         }
@@ -658,28 +679,73 @@ impl EditableTextState {
             && matches!(boundary, TextBoundary::Cluster | TextBoundary::Word);
         let collapse_selection =
             !extend && !self.selection_movement.result.is_empty() && horizontal;
-        let base = if collapse_selection {
+        let index = if collapse_selection {
             let selected_range = self.selection_movement.result.byte_range();
-            let index = match direction {
+
+            match direction {
                 NavigationDirection::Back => selected_range.start,
                 NavigationDirection::Forward => selected_range.end,
-            };
+            }
+        } else {
+            self.storage
+                .offset_from_caret(self.caret_selection().caret.index, direction, boundary)
+        };
+        let caret = CaretPosition::attached_to_next_cluster(index);
 
-            self.move_to_caret(CaretPosition::attached_to_next_cluster(index), cx);
+        self.apply_selection_movement(
+            CaretSelectionMovement {
+                result: if extend {
+                    self.selection_movement.result.with_caret(caret)
+                } else {
+                    caret.into()
+                },
+                vertical_navigation_x: None,
+            },
+            cx,
+        );
+    }
+
+    fn move_linear(
+        &mut self,
+        direction: NavigationDirection,
+        boundary: TextBoundary,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if boundary == TextBoundary::Document {
+            let direction = match direction {
+                NavigationDirection::Back => Direction::Start,
+                NavigationDirection::Forward => Direction::End,
+            };
+            self.move_semantic(direction.with_boundary(boundary), extend, cx);
 
             return;
-        } else {
-            self.caret_selection().caret.index
-        };
-        let caret = CaretPosition::attached_to_next_cluster(
-            self.storage.offset_from_caret(base, direction, boundary),
-        );
-
-        if extend {
-            self.select_to_caret(caret, cx);
-        } else {
-            self.move_to_caret(caret, cx);
         }
+
+        let index = if !extend && !self.selection_movement.result.is_empty() {
+            let selected_range = self.selection_movement.result.byte_range();
+
+            match direction {
+                NavigationDirection::Back => selected_range.start,
+                NavigationDirection::Forward => selected_range.end,
+            }
+        } else {
+            self.storage
+                .offset_from_caret(self.caret_selection().caret.index, direction, boundary)
+        };
+        let caret = CaretPosition::attached_to_next_cluster(index);
+
+        self.apply_selection_movement(
+            CaretSelectionMovement {
+                result: if extend {
+                    self.selection_movement.result.with_caret(caret)
+                } else {
+                    caret.into()
+                },
+                vertical_navigation_x: None,
+            },
+            cx,
+        );
     }
 
     /// Sets the current selection to be the entire text in the storage medium
@@ -702,10 +768,7 @@ impl EditableTextState {
         boundary: TextBoundary,
         cx: &mut Context<Self>,
     ) {
-        let caret_pos =
-            self.storage
-                .offset_from_caret(self.caret_selection().caret.index, direction, boundary);
-        self.select_to(caret_pos, cx);
+        self.move_linear(direction, boundary, true, cx);
     }
 
     /// Updates the mouse-click tracker so we can detect when a mouse click results in different actions.
@@ -1054,79 +1117,55 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
     }
 
     fn nav_left(&mut self, _: &NavLeft, _w: &mut Window, cx: &mut Context<'app, Self>) {
-        self.move_visual(false, false, cx);
+        self.nav_semantic(Direction::Left.with_boundary(TextBoundary::Cluster), cx);
     }
 
     fn nav_right(&mut self, _: &NavRight, _w: &mut Window, cx: &mut Context<'app, Self>) {
-        self.move_visual(true, false, cx);
+        self.nav_semantic(Direction::Right.with_boundary(TextBoundary::Cluster), cx);
     }
 
     fn nav_up(&mut self, _: &NavUp, _window: &mut Window, cx: &mut Context<'app, Self>) {
-        if !self.layout_data.supports_multiline {
-            self.move_semantic(
-                Direction::Start.with_boundary(TextBoundary::VisualLine),
-                false,
-                cx,
-            );
-            return;
-        }
-        self.move_semantic(
-            Direction::Up.with_boundary(TextBoundary::VisualLine),
-            false,
-            cx,
-        );
+        let direction = if self.layout_data.supports_multiline {
+            Direction::Up
+        } else {
+            Direction::Start
+        };
+
+        self.nav_semantic(direction.with_boundary(TextBoundary::VisualLine), cx);
     }
 
     fn nav_down(&mut self, _: &NavDown, _window: &mut Window, cx: &mut Context<'app, Self>) {
-        if !self.layout_data.supports_multiline {
-            self.move_semantic(
-                Direction::End.with_boundary(TextBoundary::VisualLine),
-                false,
-                cx,
-            );
-            return;
-        }
-        self.move_semantic(
-            Direction::Down.with_boundary(TextBoundary::VisualLine),
-            false,
-            cx,
-        );
+        let direction = if self.layout_data.supports_multiline {
+            Direction::Down
+        } else {
+            Direction::End
+        };
+
+        self.nav_semantic(direction.with_boundary(TextBoundary::VisualLine), cx);
     }
 
     fn nav_line_start(&mut self, _: &NavLineStart, _w: &mut Window, cx: &mut Context<'app, Self>) {
-        self.move_semantic(
-            Direction::Start.with_boundary(TextBoundary::HardLine),
-            false,
-            cx,
-        );
+        self.nav_semantic(Direction::Start.with_boundary(TextBoundary::HardLine), cx);
     }
 
     fn nav_line_end(&mut self, _: &NavLineEnd, _w: &mut Window, cx: &mut Context<'app, Self>) {
-        self.move_semantic(
-            Direction::End.with_boundary(TextBoundary::HardLine),
-            false,
-            cx,
-        );
+        self.nav_semantic(Direction::End.with_boundary(TextBoundary::HardLine), cx);
     }
 
     fn nav_start(&mut self, _: &NavDocumentStart, _w: &mut Window, cx: &mut Context<'app, Self>) {
-        self.nav_linear(NavigationDirection::Back, TextBoundary::Document, cx);
+        self.nav_semantic(Direction::Start.with_boundary(TextBoundary::Document), cx);
     }
 
     fn nav_end(&mut self, _: &NavDocumentEnd, _w: &mut Window, cx: &mut Context<'app, Self>) {
-        self.nav_linear(NavigationDirection::Forward, TextBoundary::Document, cx);
+        self.nav_semantic(Direction::End.with_boundary(TextBoundary::Document), cx);
     }
 
     fn nav_left_word(&mut self, _: &NavWordLeft, _w: &mut Window, cx: &mut Context<'app, Self>) {
-        self.move_semantic(Direction::Left.with_boundary(TextBoundary::Word), false, cx);
+        self.nav_semantic(Direction::Left.with_boundary(TextBoundary::Word), cx);
     }
 
     fn nav_right_word(&mut self, _: &NavWordRight, _w: &mut Window, cx: &mut Context<'app, Self>) {
-        self.move_semantic(
-            Direction::Right.with_boundary(TextBoundary::Word),
-            false,
-            cx,
-        );
+        self.nav_semantic(Direction::Right.with_boundary(TextBoundary::Word), cx);
     }
 
     fn select_all(&mut self, _: &SelectAll, _w: &mut Window, cx: &mut Context<'app, Self>) {
@@ -1134,39 +1173,31 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
     }
 
     fn select_left(&mut self, _: &SelectLeft, _w: &mut Window, cx: &mut Context<'app, Self>) {
-        self.move_visual(false, true, cx);
+        self.select_semantic(Direction::Left.with_boundary(TextBoundary::Cluster), cx);
     }
 
     fn select_right(&mut self, _: &SelectRight, _w: &mut Window, cx: &mut Context<'app, Self>) {
-        self.move_visual(true, true, cx);
+        self.select_semantic(Direction::Right.with_boundary(TextBoundary::Cluster), cx);
     }
 
     fn select_up(&mut self, _: &SelectUp, _window: &mut Window, cx: &mut Context<'app, Self>) {
-        if !self.layout_data.supports_multiline {
-            // semantically equivalent to select document
-            self.select_linear(NavigationDirection::Back, TextBoundary::Document, cx);
-            return;
-        }
+        let movement = if self.layout_data.supports_multiline {
+            Direction::Up.with_boundary(TextBoundary::VisualLine)
+        } else {
+            Direction::Start.with_boundary(TextBoundary::Document)
+        };
 
-        self.move_semantic(
-            Direction::Up.with_boundary(TextBoundary::VisualLine),
-            true,
-            cx,
-        );
+        self.select_semantic(movement, cx);
     }
 
     fn select_down(&mut self, _: &SelectDown, _window: &mut Window, cx: &mut Context<'app, Self>) {
-        if !self.layout_data.supports_multiline {
-            // semantically equivalent to select document
-            self.select_linear(NavigationDirection::Forward, TextBoundary::Document, cx);
-            return;
-        }
+        let movement = if self.layout_data.supports_multiline {
+            Direction::Down.with_boundary(TextBoundary::VisualLine)
+        } else {
+            Direction::End.with_boundary(TextBoundary::Document)
+        };
 
-        self.move_semantic(
-            Direction::Down.with_boundary(TextBoundary::VisualLine),
-            true,
-            cx,
-        );
+        self.select_semantic(movement, cx);
     }
 
     fn select_start(
@@ -1175,11 +1206,11 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
         _w: &mut Window,
         cx: &mut Context<'app, Self>,
     ) {
-        self.select_linear(NavigationDirection::Back, TextBoundary::Document, cx);
+        self.select_semantic(Direction::Start.with_boundary(TextBoundary::Document), cx);
     }
 
     fn select_end(&mut self, _: &SelectDocumentEnd, _w: &mut Window, cx: &mut Context<'app, Self>) {
-        self.select_linear(NavigationDirection::Forward, TextBoundary::Document, cx);
+        self.select_semantic(Direction::End.with_boundary(TextBoundary::Document), cx);
     }
 
     fn select_left_word(
@@ -1188,7 +1219,7 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
         _w: &mut Window,
         cx: &mut Context<'app, Self>,
     ) {
-        self.move_semantic(Direction::Left.with_boundary(TextBoundary::Word), true, cx);
+        self.select_semantic(Direction::Left.with_boundary(TextBoundary::Word), cx);
     }
 
     fn select_right_word(
@@ -1197,7 +1228,7 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
         _w: &mut Window,
         cx: &mut Context<'app, Self>,
     ) {
-        self.move_semantic(Direction::Right.with_boundary(TextBoundary::Word), true, cx);
+        self.select_semantic(Direction::Right.with_boundary(TextBoundary::Word), cx);
     }
 
     fn cut(&mut self, _: &Cut, _w: &mut Window, cx: &mut Context<'app, Self>) {
@@ -1316,11 +1347,18 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
 ///     permutations of: single and multiline fields, wrap vs no-wrap, overflow scroll vs no scroll
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
     use super::*;
     use crate::editable_text::StringStorage;
-    use gpui::{AppContext, Entity, IntoElement, Render, TestAppContext, WindowHandle, div};
+    use gpui::{
+        AppContext, Entity, IntoElement, PlatformTextSystem, Render, TestAppContext, TextRun,
+        TextSystem, WindowHandle, WindowTextSystem, div, font, px,
+    };
+    use gpui_parley::{ParleyTextSystem, SystemFonts};
+
+    type TestMovementAction =
+        fn(&mut EditableTextState, &mut Window, &mut Context<'_, EditableTextState>);
 
     struct TestView {
         input: Entity<EditableTextState>,
@@ -1408,6 +1446,46 @@ mod tests {
             });
             TestView { input }
         })
+    }
+
+    fn movement_document(text: &str, wrap_width: Option<Pixels>) -> Arc<WrappedLine> {
+        let backend = Arc::new(
+            ParleyTextSystem::new_with_system_font(SystemFonts::Skip, "IBM Plex Sans")
+                .with_fallback_families(["IBM Plex Sans", "Noto Color Emoji"]),
+        );
+        backend
+            .add_fonts(vec![
+                Cow::Borrowed(include_bytes!(
+                    "../../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
+                )),
+                Cow::Borrowed(include_bytes!(
+                    "../../../../assets/fonts/noto-color-emoji/NotoColorEmoji.subset.ttf"
+                )),
+            ])
+            .unwrap();
+        let text_system = WindowTextSystem::new(Arc::new(TextSystem::new(backend)));
+        let run = TextRun {
+            len: text.len(),
+            font: font("IBM Plex Sans"),
+            ..Default::default()
+        };
+
+        Arc::new(
+            text_system
+                .shape_text(text, px(18.), &[run], wrap_width, None)
+                .unwrap(),
+        )
+    }
+
+    fn update_movement_input(
+        view: WindowHandle<TestView>,
+        cx: &mut TestAppContext,
+        update: impl FnOnce(&mut EditableTextState, &mut Window, &mut Context<EditableTextState>),
+    ) {
+        view.update(cx, |view, window, cx| {
+            view.input.update(cx, |input, cx| update(input, window, cx));
+        })
+        .unwrap();
     }
 
     // Disable grouping for predictable test behavior
@@ -3140,5 +3218,398 @@ mod tests {
             });
         })
         .unwrap();
+    }
+
+    #[gpui::test]
+    fn document_movements_reach_endpoints_with_current_or_stale_layout(cx: &mut TestAppContext) {
+        let actions: [(&str, bool, bool, TestMovementAction); 10] = [
+            ("nav start", false, false, |input, window, cx| {
+                input.nav_start(&NavDocumentStart, window, cx);
+            }),
+            ("nav end", true, false, |input, window, cx| {
+                input.nav_end(&NavDocumentEnd, window, cx);
+            }),
+            ("select start", false, true, |input, window, cx| {
+                input.select_start(&SelectDocumentStart, window, cx);
+            }),
+            ("select end", true, true, |input, window, cx| {
+                input.select_end(&SelectDocumentEnd, window, cx);
+            }),
+            ("single-line select up", false, true, |input, window, cx| {
+                input.select_up(&SelectUp, window, cx);
+            }),
+            (
+                "single-line select down",
+                true,
+                true,
+                |input, window, cx| {
+                    input.select_down(&SelectDown, window, cx);
+                },
+            ),
+            ("logical nav start", false, false, |input, _window, cx| {
+                input.nav_linear(NavigationDirection::Back, TextBoundary::Document, cx);
+            }),
+            ("logical nav end", true, false, |input, _window, cx| {
+                input.nav_linear(NavigationDirection::Forward, TextBoundary::Document, cx);
+            }),
+            ("logical select start", false, true, |input, _window, cx| {
+                input.select_linear(NavigationDirection::Back, TextBoundary::Document, cx);
+            }),
+            ("logical select end", true, true, |input, _window, cx| {
+                input.select_linear(NavigationDirection::Forward, TextBoundary::Document, cx);
+            }),
+        ];
+
+        for (text, current_layout) in [("a😀bc", true), ("a😀bc", false), ("", true), ("", false)]
+        {
+            let document = movement_document(text, None);
+            let view = create_test_input(cx, text, 0);
+            let start = 1.min(text.len());
+            let end = "a😀".len().min(text.len());
+            let initial_selections = [
+                CaretPosition::attached_to_previous_cluster(start).into(),
+                CaretSelection {
+                    anchor: CaretPosition::attached_to_previous_cluster(start),
+                    caret: CaretPosition::attached_to_next_cluster(end),
+                },
+                CaretSelection {
+                    anchor: CaretPosition::attached_to_previous_cluster(end),
+                    caret: CaretPosition::attached_to_next_cluster(start),
+                },
+            ];
+
+            for initial in initial_selections {
+                for (name, to_end, extend, action) in actions {
+                    update_movement_input(view, cx, |input, window, cx| {
+                        input.layout_data.document = Some(document.clone());
+                        input.layout_data.line_height = px(24.);
+                        input.layout_data.state.last_seen_storage_version = if current_layout {
+                            input.version()
+                        } else {
+                            input.version().wrapping_sub(1)
+                        };
+                        input.selection_movement = CaretSelectionMovement {
+                            result: initial,
+                            vertical_navigation_x: Some(px(37.)),
+                        };
+                        assert_eq!(input.current_document().is_ok(), current_layout);
+
+                        action(input, window, cx);
+
+                        let index = if to_end { text.len() } else { 0 };
+                        let caret = CaretPosition::attached_to_next_cluster(index);
+                        let expected = if extend {
+                            initial.with_caret(caret)
+                        } else {
+                            caret.into()
+                        };
+                        assert_eq!(
+                            input.caret_selection(),
+                            expected,
+                            "{name}, {text:?}, current={current_layout}, initial={initial:?}"
+                        );
+                        assert_eq!(
+                            input.selection_movement.vertical_navigation_x, None,
+                            "{name}"
+                        );
+                    });
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn current_layout_preserves_visual_destinations_and_selection_affinity(
+        cx: &mut TestAppContext,
+    ) {
+        let actions: [(
+            Direction,
+            TextBoundary,
+            TestMovementAction,
+            TestMovementAction,
+        ); 4] = [
+            (
+                Direction::Left,
+                TextBoundary::Cluster,
+                |input, window, cx| input.nav_left(&NavLeft, window, cx),
+                |input, window, cx| input.select_left(&SelectLeft, window, cx),
+            ),
+            (
+                Direction::Right,
+                TextBoundary::Cluster,
+                |input, window, cx| input.nav_right(&NavRight, window, cx),
+                |input, window, cx| input.select_right(&SelectRight, window, cx),
+            ),
+            (
+                Direction::Left,
+                TextBoundary::Word,
+                |input, window, cx| input.nav_left_word(&NavWordLeft, window, cx),
+                |input, window, cx| input.select_left_word(&SelectWordLeft, window, cx),
+            ),
+            (
+                Direction::Right,
+                TextBoundary::Word,
+                |input, window, cx| input.nav_right_word(&NavWordRight, window, cx),
+                |input, window, cx| input.select_right_word(&SelectWordRight, window, cx),
+            ),
+        ];
+
+        for (text, index) in [
+            ("אבג דהו", 2),
+            ("abc אבג xyz", 4),
+            ("a👩🏽‍💻b", 1),
+            ("ab\ncd", 2),
+        ] {
+            let document = movement_document(text, None);
+            let view = create_test_input(cx, text, 0);
+            let initial = CaretSelection {
+                anchor: CaretPosition::attached_to_previous_cluster(text.len()),
+                caret: CaretPosition::attached_to_next_cluster(index),
+            };
+
+            for (direction, boundary, nav, select) in actions {
+                for (extend, action) in [(false, nav), (true, select)] {
+                    update_movement_input(view, cx, |input, window, cx| {
+                        input.layout_data.document = Some(document.clone());
+                        input.layout_data.line_height = px(24.);
+                        input.layout_data.state.last_seen_storage_version = input.version();
+                        input.set_selection(initial);
+                        assert!(input.current_document().is_ok());
+                        let expected = document.selection_movement(
+                            initial,
+                            direction.with_boundary(boundary),
+                            extend,
+                            None,
+                            px(24.),
+                        );
+
+                        action(input, window, cx);
+
+                        assert_eq!(
+                            input.selection_movement, expected,
+                            "{text:?}, {direction:?}, {boundary:?}, extend={extend}"
+                        );
+                        assert!(text.is_char_boundary(input.caret_selection().caret.index));
+
+                        if extend {
+                            assert_eq!(input.caret_selection().anchor, initial.anchor);
+                        } else {
+                            assert!(input.caret_selection().is_empty());
+                        }
+                    });
+                }
+            }
+
+            update_movement_input(view, cx, |input, window, cx| {
+                input.set_selection(CaretPosition::attached_to_next_cluster(index));
+                let expected = document
+                    .caret_movement(
+                        input.caret_selection().caret,
+                        Direction::Right.with_boundary(TextBoundary::Cluster),
+                        None,
+                    )
+                    .result;
+
+                input.nav_right(&NavRight, window, cx);
+
+                assert_eq!(input.caret_selection(), expected.into());
+                assert_ne!(input.caret_selection().caret.index, index);
+
+                if text == "אבג דהו" {
+                    assert_eq!(
+                        input.caret_selection().caret.index,
+                        0,
+                        "visual right traverses RTL toward earlier storage bytes"
+                    );
+                }
+
+                if text == "a👩🏽‍💻b" {
+                    assert_eq!(input.caret_selection().caret.index, "a👩🏽‍💻".len());
+                }
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn vertical_movement_retains_horizontal_target_until_nonvertical_action(
+        cx: &mut TestAppContext,
+    ) {
+        for wrap_width in [None, Some(px(65.))] {
+            let text = "abcd efgh ijkl\nm\nabcd efgh ijkl";
+            let document = movement_document(text, wrap_width);
+            assert!(document.visual_lines().len() >= 3);
+            let view = create_test_input(cx, text, 3);
+            update_movement_input(view, cx, |input, window, cx| {
+                input.layout_data.document = Some(document.clone());
+                input.layout_data.line_height = px(24.);
+                input.layout_data.supports_multiline = true;
+                input.layout_data.state.last_seen_storage_version = input.version();
+                assert!(input.current_document().is_ok());
+                let anchor = input.caret_selection().caret;
+
+                input.select_down(&SelectDown, window, cx);
+
+                let retained_x = input.selection_movement.vertical_navigation_x;
+                assert!(retained_x.is_some());
+                assert_eq!(input.caret_selection().anchor, anchor);
+                let first_caret = input.caret_selection().caret;
+
+                input.select_down(&SelectDown, window, cx);
+
+                assert_eq!(input.selection_movement.vertical_navigation_x, retained_x);
+                assert_ne!(input.caret_selection().caret, first_caret);
+                assert_eq!(input.caret_selection().anchor, anchor);
+
+                input.nav_up(&NavUp, window, cx);
+
+                assert_eq!(input.selection_movement.vertical_navigation_x, retained_x);
+                assert!(input.caret_selection().is_empty());
+
+                input.nav_right(&NavRight, window, cx);
+
+                assert_eq!(input.selection_movement.vertical_navigation_x, None);
+
+                input.layout_data.state.last_seen_storage_version = input.version().wrapping_sub(1);
+                input.selection_movement.vertical_navigation_x = retained_x;
+                input.nav_down(&NavDown, window, cx);
+
+                assert_eq!(input.selection_movement.vertical_navigation_x, None);
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn logical_and_absolute_movements_preserve_storage_order_and_apply_once(
+        cx: &mut TestAppContext,
+    ) {
+        let text = "אבג";
+        let document = movement_document(text, None);
+        let view = create_test_input(cx, text, 2);
+        let entity = view
+            .update(cx, |view, _window, _cx| view.input.clone())
+            .unwrap();
+        let blink_events = Rc::new(Cell::new(0));
+        let notifications = Rc::new(Cell::new(0));
+        let subscriptions = cx.update(|cx| {
+            let events = blink_events.clone();
+            let subscription = cx.subscribe(&entity, move |_entity, _event: &CaretNotify, _cx| {
+                events.set(events.get() + 1);
+            });
+            let changes = notifications.clone();
+            let observer = cx.observe(&entity, move |_entity, _cx| {
+                changes.set(changes.get() + 1);
+            });
+
+            (subscription, observer)
+        });
+
+        for current_layout in [true, false] {
+            for (direction, expected_index) in [
+                (NavigationDirection::Back, 0),
+                (NavigationDirection::Forward, 4),
+            ] {
+                let previous_events = blink_events.get();
+                let previous_notifications = notifications.get();
+                update_movement_input(view, cx, |input, _window, cx| {
+                    input.layout_data.document = Some(document.clone());
+                    input.layout_data.state.last_seen_storage_version = if current_layout {
+                        input.version()
+                    } else {
+                        input.version().wrapping_sub(1)
+                    };
+                    input.set_selection(2);
+                    input.nav_linear(direction, TextBoundary::Cluster, cx);
+
+                    assert_eq!(input.caret_selection(), expected_index.into());
+                });
+                assert_eq!(blink_events.get(), previous_events + 1);
+                assert_eq!(notifications.get(), previous_notifications + 1);
+            }
+
+            update_movement_input(view, cx, |input, _window, cx| {
+                let initial = CaretSelection {
+                    anchor: CaretPosition::attached_to_previous_cluster(0),
+                    caret: CaretPosition::attached_to_next_cluster(2),
+                };
+                input.set_selection(initial);
+                input.select_linear(NavigationDirection::Forward, TextBoundary::Cluster, cx);
+
+                assert_eq!(
+                    input.caret_selection(),
+                    initial.with_caret(CaretPosition::attached_to_next_cluster(4))
+                );
+
+                for (caret, anchor) in [(0, 4), (4, 0)] {
+                    let initial = CaretSelection {
+                        caret: CaretPosition::attached_to_next_cluster(caret),
+                        anchor: CaretPosition::attached_to_previous_cluster(anchor),
+                    };
+                    input.set_selection(initial);
+                    input.nav_linear(NavigationDirection::Back, TextBoundary::Word, cx);
+
+                    assert_eq!(input.caret_selection(), 0.into());
+
+                    input.set_selection(initial);
+                    input.nav_linear(NavigationDirection::Forward, TextBoundary::Word, cx);
+
+                    assert_eq!(input.caret_selection(), 4.into());
+                }
+
+                input.selection_movement.vertical_navigation_x = Some(px(11.));
+                let caret = CaretPosition::attached_to_previous_cluster(100);
+                input.move_to_caret(caret, cx);
+
+                assert_eq!(
+                    input.caret_selection(),
+                    CaretPosition::attached_to_previous_cluster(text.len()).into()
+                );
+                assert_eq!(input.selection_movement.vertical_navigation_x, None);
+
+                input.selection_movement.vertical_navigation_x = Some(px(11.));
+                input.select_to_caret(CaretPosition::attached_to_next_cluster(0), cx);
+
+                assert_eq!(
+                    input.caret_selection().anchor,
+                    CaretPosition::attached_to_previous_cluster(text.len())
+                );
+                assert_eq!(
+                    input.caret_selection().caret,
+                    CaretPosition::attached_to_next_cluster(0)
+                );
+                assert_eq!(input.selection_movement.vertical_navigation_x, None);
+            });
+        }
+
+        let actions: [TestMovementAction; 4] = [
+            |input, window, cx| input.nav_start(&NavDocumentStart, window, cx),
+            |input, window, cx| input.nav_left(&NavLeft, window, cx),
+            |input, _window, cx| {
+                input.move_to_caret(CaretPosition::attached_to_previous_cluster(4), cx)
+            },
+            |input, _window, cx| {
+                input.select_to_caret(CaretPosition::attached_to_previous_cluster(4), cx)
+            },
+        ];
+
+        for current_layout in [true, false] {
+            for action in actions {
+                let previous_events = blink_events.get();
+                let previous_notifications = notifications.get();
+                update_movement_input(view, cx, |input, window, cx| {
+                    input.layout_data.document = Some(document.clone());
+                    input.layout_data.state.last_seen_storage_version = if current_layout {
+                        input.version()
+                    } else {
+                        input.version().wrapping_sub(1)
+                    };
+                    input.set_selection(2);
+                    action(input, window, cx);
+                });
+                assert_eq!(blink_events.get(), previous_events + 1);
+                assert_eq!(notifications.get(), previous_notifications + 1);
+            }
+        }
+
+        drop(subscriptions);
     }
 }
