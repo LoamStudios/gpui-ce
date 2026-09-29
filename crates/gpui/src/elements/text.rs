@@ -949,7 +949,7 @@ impl TextLayout {
                 );
                 let len = text.len();
 
-                let Some(document) = window
+                let document = window
                     .text_system()
                     .shape_text(
                         text,
@@ -958,32 +958,20 @@ impl TextLayout {
                         wrap_width,            // Wrap if we know the width.
                         text_style.line_clamp, // Limit the number of lines if line_clamp is set.
                     )
-                    .log_err()
-                else {
-                    element_state
-                        .0
-                        .layout
-                        .borrow_mut()
-                        .replace(TextLayoutInner {
-                            document: None,
-                            len: 0,
-                            line_height,
-                            wrap_width,
-                            truncate_width,
-                            size: Some(Size::default()),
-                            bounds: None,
-                        });
-                    return Size::default();
-                };
+                    .log_err();
 
-                let size = document.size(line_height);
+                let size = document
+                    .as_ref()
+                    .map_or_else(Size::default, |document| document.size(line_height));
+
+                let len = if document.is_some() { len } else { 0 };
 
                 element_state
                     .0
                     .layout
                     .borrow_mut()
                     .replace(TextLayoutInner {
-                        document: Some(document),
+                        document,
                         len,
                         line_height,
                         wrap_width,
@@ -1669,11 +1657,78 @@ impl IntoElement for InteractiveText {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Context, Hsla, Render, ScaledPixels, TestApp, div, hsla, prelude::*};
+    use crate::{
+        AvailableSpace, Context, Hsla, Render, ScaledPixels, TestApp, TestAppContext, div, hsla,
+        prelude::*, size,
+    };
     use std::collections::HashSet;
 
     const CONTAINER_COLOR: Hsla = hsla(0.72, 0.45, 0.32, 1.0);
     const TEXT_BACKGROUND_COLOR: Hsla = hsla(0.37, 0.65, 0.42, 1.0);
+
+    #[gpui::test]
+    fn text_measurement_replaces_state_when_wrap_width_changes(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        cx.draw(Point::default(), size(px(240.), px(100.)), |window, cx| {
+            let layout = TextLayout::default();
+            let text = SharedString::from("Measure café over multiple words");
+
+            for (width, cached) in [(240., false), (240., true), (80., false)] {
+                let previous_bounds = layout
+                    .0
+                    .layout
+                    .borrow()
+                    .as_ref()
+                    .and_then(|state| state.bounds);
+
+                let previous_document = layout
+                    .0
+                    .layout
+                    .borrow()
+                    .as_ref()
+                    .and_then(|state| state.document.as_ref())
+                    .map(|document| document.layout.clone());
+
+                let layout_id = layout.layout(text.clone(), None, window, cx);
+
+                window.compute_layout(
+                    layout_id,
+                    size(
+                        AvailableSpace::Definite(px(width)),
+                        AvailableSpace::MaxContent,
+                    ),
+                    cx,
+                );
+
+                let bounds = window.layout_bounds(layout_id);
+
+                {
+                    let state = layout.0.layout.borrow();
+                    let state = state.as_ref().unwrap();
+                    let document = state.document.as_ref().unwrap();
+
+                    assert_eq!(document.text, text);
+                    assert_eq!(state.len, text.len());
+                    assert_eq!(state.size, Some(bounds.size));
+                    assert_eq!(state.size, Some(document.size(state.line_height)));
+                    assert_eq!(state.wrap_width, Some(px(width)));
+                    assert_eq!(state.truncate_width, None);
+                    assert_eq!(state.bounds, if cached { previous_bounds } else { None });
+
+                    if let Some(previous_document) = previous_document {
+                        assert_eq!(Arc::ptr_eq(&document.layout, &previous_document), cached);
+                    }
+                }
+
+                layout.prepaint(bounds, &text, window);
+
+                assert_eq!(layout.bounds(), bounds);
+            }
+
+            div()
+        });
+    }
 
     struct CenteredTextView {
         extent: f32,
