@@ -53,6 +53,7 @@ fn raster_case() -> (TextSystem, RenderGlyphParams) {
         wrap_width: None,
         line_clamp: None,
     });
+
     let fragment = &layout.paint_fragments[0];
     let glyph = &fragment.glyphs[0];
     let params = RenderGlyphParams {
@@ -67,6 +68,7 @@ fn raster_case() -> (TextSystem, RenderGlyphParams) {
             GlyphRenderMode::Grayscale
         }),
     };
+
     (TextSystem::new(Arc::new(system)), params)
 }
 
@@ -82,6 +84,7 @@ fn bench_text_pipeline(c: &mut Criterion) {
             len: code.len(),
             ..base_run.clone()
         }];
+
         b.iter(|| {
             system.layout_text(TextLayoutRequest {
                 text: &code,
@@ -92,11 +95,13 @@ fn bench_text_pipeline(c: &mut Criterion) {
             })
         });
     });
+
     group.bench_function("layout_multilingual_warm", |b| {
         let runs = [TextRun {
             len: multilingual.len(),
             ..base_run.clone()
         }];
+
         b.iter(|| {
             system.layout_text(TextLayoutRequest {
                 text: &multilingual,
@@ -107,11 +112,13 @@ fn bench_text_pipeline(c: &mut Criterion) {
             })
         });
     });
+
     group.bench_function("wrap_multilingual_warm", |b| {
         let runs = [TextRun {
             len: multilingual.len(),
             ..base_run.clone()
         }];
+
         b.iter(|| {
             system.layout_text(TextLayoutRequest {
                 text: &multilingual,
@@ -122,6 +129,7 @@ fn bench_text_pipeline(c: &mut Criterion) {
             })
         });
     });
+
     group.bench_function("layout_multilingual_cold", |b| {
         b.iter_batched(
             text_system,
@@ -130,6 +138,7 @@ fn bench_text_pipeline(c: &mut Criterion) {
                     len: multilingual.len(),
                     ..run
                 }];
+
                 system.layout_text(TextLayoutRequest {
                     text: &multilingual,
                     font_size: px(16.0),
@@ -141,6 +150,7 @@ fn bench_text_pipeline(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+
     group.bench_function("first_glyph_rasterization", |b| {
         b.iter_batched(
             raster_case,
@@ -148,11 +158,13 @@ fn bench_text_pipeline(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+
     group.bench_function("cached_glyph_rasterization", |b| {
         let (system, params) = raster_case();
         system.rasterize_glyph(&params).unwrap();
         b.iter(|| system.rasterize_glyph(&params).unwrap());
     });
+
     group.finish();
 }
 

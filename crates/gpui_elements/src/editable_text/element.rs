@@ -788,10 +788,12 @@ impl PrepaintElements {
 
         let line_height = window.line_height();
         let mut caret_point = None::<Point<Pixels>>;
+
         if let Some(document) = &state.layout_data.document {
             let line_y = scroll_offset.y;
             let line_bottom = line_y + line_height * document.line_count() as f32;
             let line_visible = line_bottom >= Pixels::ZERO && line_y <= inner_bounds.size.height;
+
             if line_visible {
                 let document_origin = inner_bounds.origin + point(scroll_offset.x, line_y);
                 elements.lines.push(PrepaintLine {
@@ -949,6 +951,7 @@ mod tests {
                         state.select_document(cx);
                         state
                     });
+
                     cx.new(|_| CenteredEditableTextView { extent: 0.0, input })
                 })
                 .unwrap();

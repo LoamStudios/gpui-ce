@@ -198,12 +198,14 @@ impl ColorGlyphClassifier<'_> {
     /// Returns the artwork format used by this glyph.
     pub(crate) fn kind(&self, glyph_id: GlyphId) -> Option<ColorGlyphKind> {
         let skrifa_id = skrifa::GlyphId::new(glyph_id.0);
+
         if let Some(glyph) = self.colr.get(skrifa_id) {
             return Some(match glyph.format() {
                 skrifa::color::ColorGlyphFormat::ColrV0 => ColorGlyphKind::ColrV0,
                 skrifa::color::ColorGlyphFormat::ColrV1 => ColorGlyphKind::ColrV1,
             });
         }
+
         let has_color_bitmap = matches!(
             self.bitmap_strikes.format(),
             Some(skrifa::bitmap::BitmapFormat::Sbix | skrifa::bitmap::BitmapFormat::Cbdt)
@@ -211,9 +213,11 @@ impl ColorGlyphClassifier<'_> {
             .bitmap_strikes
             .iter()
             .any(|strike| strike.get(skrifa_id).is_some());
+
         if has_color_bitmap {
             return Some(ColorGlyphKind::Bitmap);
         }
+
         self.svg_ranges
             .iter()
             .any(|&(start, end)| (start..=end).contains(&glyph_id.0))
@@ -310,6 +314,7 @@ impl LoadedFont {
         let Some(bounds) = bounds else {
             return Ok(Bounds::default());
         };
+
         Ok(Bounds {
             origin: point(bounds.x_min, bounds.y_min),
             size: size(bounds.x_max - bounds.x_min, bounds.y_max - bounds.y_min),
@@ -340,6 +345,7 @@ impl FontStore {
                 .coords()
                 .to_vec()
         };
+
         self.intern(data, index, &normalized_coords, synthesis)
     }
 
@@ -359,12 +365,15 @@ impl FontStore {
             normalized_coords: normalized_coords.to_vec(),
             synthesis: synthesis.into(),
         };
+
         if let Some(id) = self.ids_by_key.get(&key) {
             return Ok(*id);
         }
+
         if self.fonts.len() >= CANONICAL_FONT_ID_BIT {
             bail!("canonical font store exhausted its FontId namespace");
         }
+
         let id = FontId(CANONICAL_FONT_ID_BIT | self.fonts.len());
         let variations = design_variations(&font, normalized_coords);
         let has_color_glyphs = [*b"CBDT", *b"sbix", *b"COLR", *b"SVG "]
@@ -380,6 +389,7 @@ impl FontStore {
             has_color_glyphs,
             source_identity,
         });
+
         self.ids_by_key.insert(key, id);
         Ok(id)
     }
@@ -428,12 +438,14 @@ fn design_variations(
                     .copied()
                     .unwrap_or_default()
                     .to_f32();
+
                 if normalized < target {
                     low = values[axis_index];
                 } else {
                     high = values[axis_index];
                 }
             }
+
             values[axis_index] = (low + high) * 0.5;
         }
     }
@@ -496,12 +508,15 @@ impl GlyphRasterizer for SwashGlyphRasterizer {
                 GlyphRenderMode::Color => RasterizedGlyphFormat::BgraColor,
                 GlyphRenderMode::Grayscale => RasterizedGlyphFormat::AlphaMask,
             };
+
             return Ok(RasterizedGlyph::empty(format));
         };
+
         let bounds = Bounds {
             origin: point(image.placement.left.into(), (-image.placement.top).into()),
             size: size(image.placement.width.into(), image.placement.height.into()),
         };
+
         let (format, pixels) = match image.content {
             swash::scale::image::Content::Color => {
                 let premultiplied = matches!(image.source, Source::ColorOutline(_));
@@ -512,6 +527,7 @@ impl GlyphRasterizer for SwashGlyphRasterizer {
                         pixel.swap(0, 2);
                     }
                 }
+
                 (RasterizedGlyphFormat::BgraColor, image.data)
             }
             swash::scale::image::Content::SubpixelMask => {
@@ -539,6 +555,7 @@ impl GlyphRasterizer for SwashGlyphRasterizer {
                         bail!("color glyph rasterization cannot use a dilation style")
                     }
                 };
+
                 let pixels = image
                     .data
                     .into_iter()
@@ -552,6 +569,7 @@ impl GlyphRasterizer for SwashGlyphRasterizer {
             }
             swash::scale::image::Content::Mask => (RasterizedGlyphFormat::AlphaMask, image.data),
         };
+
         Ok(RasterizedGlyph {
             bounds,
             size: bounds.size,
@@ -600,25 +618,32 @@ impl SwashGlyphRasterizer {
         } else {
             &[Source::Bitmap(StrikeWith::ExactSize), Source::Outline]
         };
+
         let mut renderer = Render::new(sources);
+
         if params.raster_style.mode == GlyphRenderMode::Subpixel {
             renderer.format(Format::subpixel_bgra());
         } else {
             renderer.format(Format::Alpha);
         }
+
         if let gpui::RasterColorEffect::Preblend(color) = params.raster_style.color_effect {
             renderer.default_color([color.red, color.green, color.blue, color.alpha]);
         }
+
         renderer.offset(subpixel_offset);
+
         if face.synthesis.embolden {
             renderer.embolden(f32::from(params.font_size) * params.scale_factor / 48.0);
         }
+
         if let Some(degrees) = face.synthesis.skew_degrees {
             renderer.transform(Some(Transform::skew(
                 Angle::from_degrees(degrees),
                 Angle::ZERO,
             )));
         }
+
         let glyph_id: u16 = params.glyph_id.0.try_into()?;
         Ok(renderer.render(&mut scaler, glyph_id))
     }
@@ -676,6 +701,7 @@ mod tests {
             scene_color: rgba(0xe02010cc),
             requested_mode: GlyphRenderMode::Color,
         });
+
         assert_eq!(style.mode, GlyphRenderMode::Color);
         assert_eq!(
             style.color_effect,
@@ -691,6 +717,7 @@ mod tests {
                 scale_factor,
                 raster_style: style,
             };
+
             assert_eq!(subpixel_offset(&params), Vector::new(0.75, 0.0));
         }
     }

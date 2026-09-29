@@ -117,6 +117,7 @@ impl ParleyLayout {
                 });
             }
         }
+
         stops.sort_by(|left, right| {
             left.block
                 .total_cmp(&right.block)
@@ -135,9 +136,11 @@ impl ParleyLayout {
                     stop.inline as f32,
                     ((geometry.y0 + geometry.y1) * 0.5) as f32,
                 );
+
                 if Self::cursor_position(layout, hit) == (stop.block, stop.inline) {
                     previous.cursor = hit;
                 }
+
                 continue;
             }
 
@@ -147,11 +150,14 @@ impl ParleyLayout {
                 stop.inline as f32,
                 ((geometry.y0 + geometry.y1) * 0.5) as f32,
             );
+
             if Self::cursor_position(layout, hit) == (stop.block, stop.inline) {
                 stop.cursor = hit;
             }
+
             unique_stops.push(stop);
         }
+
         unique_stops
     }
 
@@ -235,12 +241,14 @@ impl PlatformTextLayout for ParleyLayout {
         let Some(line) = self.layout.get(line_ix) else {
             return Err(closest);
         };
+
         let metrics = line.metrics();
         let left = metrics.inline_min_coord + metrics.offset;
         let right = left + metrics.advance;
         if f32::from(pixel_point.x) < left || f32::from(pixel_point.x) >= right {
             return Err(closest);
         }
+
         Cluster::from_point(
             &self.layout,
             pixel_point.x.into(),
@@ -260,6 +268,7 @@ impl PlatformTextLayout for ParleyLayout {
         } else {
             0
         };
+
         let caret = Self::caret_position(Cursor::from_point(
             &self.layout,
             pixel_point.x.into(),
@@ -268,6 +277,7 @@ impl PlatformTextLayout for ParleyLayout {
         let Some(line) = self.layout.get(line_ix) else {
             return Err(caret);
         };
+
         let metrics = line.metrics();
         let left = metrics.inline_min_coord + metrics.offset;
         let right = left + metrics.advance;
@@ -286,6 +296,7 @@ impl PlatformTextLayout for ParleyLayout {
         if caret.index > self.len() {
             return None;
         }
+
         let cursor = self.cursor(caret);
         let geometry = cursor.geometry(&self.layout, 0.0);
         let line_ix = self
@@ -407,6 +418,7 @@ impl PlatformTextLayout for ParleyLayout {
                 } else {
                     1
                 };
+
                 let geometry = cursor.geometry(&self.layout, 0.0);
                 let line_ix = self
                     .layout
@@ -459,6 +471,7 @@ impl PlatformTextLayout for ParleyLayout {
         } else {
             0
         };
+
         let y = self.native_y_for_line(line_ix);
         match kind {
             TextSelectionKind::Word => {
@@ -481,6 +494,7 @@ impl ParleyState {
             shared: true,
             system_fonts: system_fonts == SystemFonts::Load,
         });
+
         let source_cache = fontique::SourceCache::new_shared();
         let catalog = FontCatalog::from_shared(collection.clone(), source_cache.clone());
         (
@@ -567,14 +581,17 @@ impl ParleyTextSystem {
             descriptor.family.as_ref(),
             &self.system_font_fallback,
         );
+
         if let Some(fallbacks) = &descriptor.fallbacks {
             for family in fallbacks.fallback_list() {
                 push_face_families(&mut families, family, &self.system_font_fallback);
             }
         }
+
         for family in &self.additional_fallbacks {
             push_face_families(&mut families, family, &self.system_font_fallback);
         }
+
         let resolved = self
             .catalog
             .resolve(&FaceRequest {
@@ -605,16 +622,21 @@ impl ParleyTextSystem {
             let Some(end) = expected_start.checked_add(run.len) else {
                 anyhow::bail!("text run length overflowed the input range");
             };
+
             if end > text.len() {
                 anyhow::bail!("text runs extend past the input text");
             }
+
             let range = expected_start..end;
+
             if !text.is_char_boundary(range.start) || !text.is_char_boundary(range.end) {
                 anyhow::bail!("text runs do not align with the input text");
             }
+
             expected_start = range.end;
             run_ranges.push(range);
         }
+
         if expected_start != text.len() {
             anyhow::bail!("text runs do not cover the input text");
         }
@@ -629,11 +651,13 @@ impl ParleyTextSystem {
                     descriptor.family.as_ref(),
                     &self.system_font_fallback,
                 );
+
                 if let Some(fallbacks) = &descriptor.fallbacks {
                     for family in fallbacks.fallback_list() {
                         push_parley_families(&mut families, family, &self.system_font_fallback);
                     }
                 }
+
                 families.extend(
                     self.additional_fallbacks
                         .iter()
@@ -656,6 +680,7 @@ impl ParleyTextSystem {
                         let value = (*value).try_into().with_context(|| {
                             format!("OpenType feature '{tag}' value is larger than u16")
                         })?;
+
                         Ok(FontFeature::new(tag, value))
                     })
                     .collect::<Result<Vec<_>>>()
@@ -686,6 +711,7 @@ impl ParleyTextSystem {
                 }),
                 range.clone(),
             );
+
             if !feature_lists[run_index].is_empty() {
                 builder.push(
                     StyleProperty::FontFeatures(FontFeatures::from(
@@ -694,14 +720,17 @@ impl ParleyTextSystem {
                     range.clone(),
                 );
             }
+
             if let Some(letter_spacing) = run.letter_spacing {
                 builder.push(
                     StyleProperty::LetterSpacing(f32::from(letter_spacing)),
                     range.clone(),
                 );
             }
+
             let paint_style = PaintStyle::from(run);
             builder.push(StyleProperty::Brush(paint_style.clone()), range.clone());
+
             if let Some(underline) = run.underline {
                 builder.push(StyleProperty::Underline(true), range.clone());
                 builder.push(
@@ -713,6 +742,7 @@ impl ParleyTextSystem {
                     range.clone(),
                 );
             }
+
             if let Some(strikethrough) = run.strikethrough {
                 builder.push(StyleProperty::Strikethrough(true), range.clone());
                 builder.push(
@@ -727,6 +757,7 @@ impl ParleyTextSystem {
         }
 
         let mut layout = builder.build(text);
+
         if let Some((wrap_width, max_lines)) = wrap {
             if let Some(max_lines) = max_lines {
                 let mut breaker = layout.break_lines();
@@ -734,11 +765,13 @@ impl ParleyTextSystem {
                 breaker
                     .state_mut()
                     .set_line_max_advance(f32::from(wrap_width));
+
                 for _ in 0..max_lines.saturating_sub(1) {
                     if breaker.break_next().is_none() {
                         break;
                     }
                 }
+
                 breaker.break_remaining(f32::MAX);
             } else {
                 layout.break_all_lines(Some(f32::from(wrap_width)));
@@ -751,9 +784,11 @@ impl ParleyTextSystem {
         let mut width = px(0.0);
         let mut ascent = px(0.0);
         let mut descent = px(0.0);
+
         let mut saw_line = false;
         for line in layout.lines() {
             saw_line = true;
+
             let fragment_start = paint_fragments.len();
             let metrics = *line.metrics();
             let line_x = px(metrics.inline_min_coord + metrics.offset);
@@ -761,6 +796,7 @@ impl ParleyTextSystem {
                 let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                     continue;
                 };
+
                 let run = glyph_run.run();
                 let normalized_coords = run
                     .normalized_coords()
@@ -774,6 +810,7 @@ impl ParleyTextSystem {
                     &normalized_coords,
                     run.synthesis(),
                 )?;
+
                 let baseline = glyph_run.baseline();
                 let run_metrics = glyph_run.run().metrics();
                 let parley_style = glyph_run.style();
@@ -784,6 +821,7 @@ impl ParleyTextSystem {
                     paint_style.underline = Some(underline);
                     px(decoration.offset.unwrap_or(run_metrics.underline_offset))
                 });
+
                 let strikethrough_offset = parley_style.strikethrough.as_ref().map(|decoration| {
                     let mut strikethrough = decoration.brush.strikethrough.unwrap_or_default();
                     strikethrough.thickness =
@@ -793,6 +831,7 @@ impl ParleyTextSystem {
                         .offset
                         .unwrap_or(run_metrics.strikethrough_offset))
                 });
+
                 let glyphs = {
                     let fonts = self.fonts.read();
                     let color_glyphs = fonts
@@ -814,6 +853,7 @@ impl ParleyTextSystem {
                         })
                         .collect()
                 };
+
                 let start = px(glyph_run.offset()) - line_x;
                 paint_fragments.push(PaintFragment {
                     font_id,
@@ -838,6 +878,7 @@ impl ParleyTextSystem {
             ascent = ascent.max(px(metrics.ascent));
             descent = descent.max(px(metrics.descent));
         }
+
         if !saw_line {
             anyhow::bail!("Parley produced no line");
         }
@@ -1100,6 +1141,7 @@ mod tests {
             assert_eq!(pair[0].text_range.end, pair[1].text_range.start);
             assert_eq!(pair[0].fragment_range.end, pair[1].fragment_range.start);
         }
+
         for line in &layout.visual_lines {
             assert!(text.is_char_boundary(line.text_range.start));
             assert!(text.is_char_boundary(line.text_range.end));
@@ -1133,6 +1175,7 @@ mod tests {
             let Some(next) = wrapped.adjacent_visual_caret(caret, VisualDirection::Right) else {
                 break;
             };
+
             caret = next;
         }
         assert!(
@@ -1144,6 +1187,7 @@ mod tests {
             let Some(previous) = wrapped.adjacent_visual_caret(caret, VisualDirection::Left) else {
                 break;
             };
+
             caret = previous;
         }
         assert!(
@@ -1158,6 +1202,7 @@ mod tests {
                 .expect("native caret must have geometry");
             assert!(f32::from(bounds.x).is_finite() && f32::from(bounds.y).is_finite());
         }
+
         if text.chars().any(|character| !character.is_whitespace()) {
             assert!(
                 !wrapped
@@ -1215,6 +1260,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let layout = layout_wrapped(&system, text, px(18.0), &runs, width, max_lines);
             assert_document_contract(text, &layout);
+
             if max_lines.is_some() {
                 assert_eq!(layout.visual_lines.len(), minimum_lines, "{name}");
             } else {
@@ -1309,6 +1355,7 @@ mod tests {
             color: None,
             wavy: true,
         });
+
         decorated_runs[1].strikethrough = Some(StrikethroughStyle {
             thickness: px(1.0),
             color: None,
@@ -1328,11 +1375,13 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
+
         assert_eq!(plain.width, decorated.width);
         assert_eq!(geometry(&plain), geometry(&decorated));
         assert!(decorated.paint_fragments.iter().any(|fragment| {
             fragment.style.background_color.is_some() && fragment.style.underline.is_some()
         }));
+
         assert!(
             decorated
                 .paint_fragments
@@ -1569,6 +1618,7 @@ mod tests {
                 gpui::RasterizedGlyphFormat::BgraSubpixelMask
                 | gpui::RasterizedGlyphFormat::BgraColor => 4,
             };
+
             assert_eq!(raster.format, expected_format);
             assert_eq!(
                 raster.pixels.len(),
@@ -1682,6 +1732,7 @@ mod tests {
                 synthesis: face.synthesis,
                 has_color_glyphs: face.has_color_glyphs,
             });
+
             Ok(RasterizedGlyph::empty(RasterizedGlyphFormat::AlphaMask))
         }
     }
