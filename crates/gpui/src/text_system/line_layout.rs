@@ -272,7 +272,7 @@ impl CaretAffinity {
             return Self::Downstream;
         };
 
-        if is_paragraph_separator(last_character) || last_character == '\u{2028}' {
+        if HARD_LINE_BREAK_CHARACTERS.contains(&last_character) {
             return Self::Downstream;
         }
 
@@ -287,6 +287,12 @@ pub struct CaretPosition {
     pub index: usize,
     /// The logical neighbor that owns this position.
     pub affinity: CaretAffinity,
+}
+
+impl From<(usize, CaretAffinity)> for CaretPosition {
+    fn from((index, affinity): (usize, CaretAffinity)) -> Self {
+        Self { index, affinity }
+    }
 }
 
 impl CaretPosition {

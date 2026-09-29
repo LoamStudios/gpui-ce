@@ -323,11 +323,9 @@ impl EditableTextState {
         let end_pos = range.start + text_to_insert.len();
         self.record_history(range.clone(), text_to_insert.len());
         self.storage.replace_range(range, text_to_insert);
+
         let affinity = CaretAffinity::for_inserted_text(text_to_insert);
-        self.set_selection(CaretPosition {
-            index: end_pos,
-            affinity,
-        });
+        self.set_selection(CaretPosition::from((end_pos, affinity)));
         self.marked_range = None;
     }
 
