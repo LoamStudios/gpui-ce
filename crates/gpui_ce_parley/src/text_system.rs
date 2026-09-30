@@ -10,8 +10,8 @@ use gpui::{
     PlatformTextLayout, PlatformTextSystem, PositionedInlineBox, PreparedRasterStyle,
     RasterStyleRequest, RasterizedGlyph, RenderGlyphParams, ShapedGlyph, Size, TextAlign,
     TextBoundary as Boundary, TextDirection as Direction, TextLayoutRequest, TextMovement,
-    TextRenderingMode, TextRun, TextSelectionKind, VisualDirection, VisualLine, align_inline_boxes,
-    point, px, size,
+    TextRenderingMode, TextSelectionKind, VisualDirection, VisualLine, align_inline_boxes, point,
+    px, size,
 };
 use parking_lot::{Mutex, RwLock};
 use parley::setting::Tag;
@@ -28,6 +28,19 @@ use unicode_segmentation::UnicodeSegmentation as _;
 struct ParleyState {
     fonts: FontContext,
     layout: LayoutContext<PaintStyle>,
+}
+
+struct ParleyLayoutParams<'a> {
+    text: TextLayoutRequest<'a>,
+    inline: Option<ParleyInlineLayoutParams<'a>>,
+}
+
+struct ParleyInlineLayoutParams<'a> {
+    boxes: &'a [InlineBoxRequest],
+    text_styles: &'a [InlineTextStyle],
+    line_height: Pixels,
+    text_metrics: InlineTextMetrics,
+    text_align: TextAlign,
 }
 
 struct ParleyLayoutResult {
@@ -675,18 +688,30 @@ impl ParleyTextSystem {
         Ok(font_id)
     }
 
-    fn parley_layout(
-        &self,
-        text: &str,
-        font_size: Pixels,
-        runs: &[TextRun],
-        wrap: Option<(Pixels, Option<usize>)>,
-        inline_boxes: &[InlineBoxRequest],
-        text_styles: &[InlineTextStyle],
-        line_height: Option<Pixels>,
-        inline_text_metrics: Option<InlineTextMetrics>,
-        text_align: Option<TextAlign>,
-    ) -> Result<ParleyLayoutResult> {
+    fn parley_layout(&self, params: ParleyLayoutParams<'_>) -> Result<ParleyLayoutResult> {
+        let TextLayoutRequest {
+            text,
+            font_size,
+            runs,
+            wrap_width,
+            line_clamp,
+        } = params.text;
+
+        let wrap = (wrap_width.is_some() || line_clamp.is_some())
+            .then_some((wrap_width.unwrap_or(Pixels::MAX), line_clamp));
+
+        let (inline_boxes, text_styles, line_height, inline_text_metrics, text_align) =
+            match params.inline {
+                Some(inline) => (
+                    inline.boxes,
+                    inline.text_styles,
+                    Some(inline.line_height),
+                    Some(inline.text_metrics),
+                    Some(inline.text_align),
+                ),
+                None => (&[][..], &[][..], None, None, None),
+            };
+
         let mut expected_start = 0usize;
         let mut run_ranges = Vec::with_capacity(runs.len());
         for run in runs {
@@ -1220,42 +1245,32 @@ impl PlatformTextSystem for ParleyTextSystem {
     }
 
     fn layout_text(&self, request: TextLayoutRequest<'_>) -> LineLayout {
-        let wrap = (request.wrap_width.is_some() || request.line_clamp.is_some()).then_some((
-            request.wrap_width.unwrap_or(Pixels::MAX),
-            request.line_clamp,
-        ));
-        self.parley_layout(
-            request.text,
-            request.font_size,
-            request.runs,
-            wrap,
-            &[],
-            &[],
-            None,
-            None,
-            None,
-        )
+        self.parley_layout(ParleyLayoutParams {
+            text: request,
+            inline: None,
+        })
         .expect("Parley failed to lay out a validated GPUI document")
         .layout
     }
 
     fn layout_inline(&self, request: InlineLayoutRequest<'_>) -> InlineLayout {
-        let wrap = (request.wrap_width.is_some() || request.line_clamp.is_some()).then_some((
-            request.wrap_width.unwrap_or(Pixels::MAX),
-            request.line_clamp,
-        ));
         let result = self
-            .parley_layout(
-                request.text,
-                request.font_size,
-                request.runs,
-                wrap,
-                request.boxes,
-                request.text_styles,
-                Some(request.line_height),
-                Some(request.text_metrics),
-                Some(request.text_align),
-            )
+            .parley_layout(ParleyLayoutParams {
+                text: TextLayoutRequest {
+                    text: request.text,
+                    font_size: request.font_size,
+                    runs: request.runs,
+                    wrap_width: request.wrap_width,
+                    line_clamp: request.line_clamp,
+                },
+                inline: Some(ParleyInlineLayoutParams {
+                    boxes: request.boxes,
+                    text_styles: request.text_styles,
+                    line_height: request.line_height,
+                    text_metrics: request.text_metrics,
+                    text_align: request.text_align,
+                }),
+            })
             .expect("Parley failed to lay out a validated GPUI inline document");
         InlineLayout {
             layout: std::sync::Arc::new(result.layout),
@@ -1278,8 +1293,9 @@ mod tests {
         AppContext, CaretSelection, Context, FontFallbacks, FontFeatures as GpuiFontFeatures,
         FontStyle as GpuiFontStyle, FontWeight as GpuiFontWeight, GlyphRenderMode,
         HeadlessAppContext, HighlightStyle, Hsla, IntoElement, Point, RasterizedGlyphFormat,
-        Render, ScaledPixels, StrikethroughStyle, Styled, StyledText, TextSystem, UnderlineStyle,
-        VerticalAlign, Window, WindowHandle, WindowTextSystem, div, font, hsla, prelude::*,
+        Render, ScaledPixels, StrikethroughStyle, Styled, StyledText, TextRun, TextSystem,
+        UnderlineStyle, VerticalAlign, Window, WindowHandle, WindowTextSystem, div, font, hsla,
+        prelude::*,
     };
     use std::{cell::Cell, cell::RefCell, rc::Rc, sync::Arc};
 
