@@ -201,9 +201,9 @@ impl ParleyLayout {
         }
     }
 
-    fn native_y_for_line(&self, line_ix: usize) -> f32 {
+    fn native_y_for_line(&self, line_index: usize) -> f32 {
         self.layout
-            .get(line_ix)
+            .get(line_index)
             .map(|line| {
                 let metrics = line.metrics();
                 (metrics.block_min_coord + metrics.block_max_coord) * 0.5
@@ -237,8 +237,8 @@ impl PlatformTextLayout for ParleyLayout {
         if pixel_point.y < Pixels::ZERO || line_height <= Pixels::ZERO {
             return Err(closest);
         }
-        let line_ix = (pixel_point.y / line_height) as usize;
-        let Some(line) = self.layout.get(line_ix) else {
+        let line_index = (pixel_point.y / line_height) as usize;
+        let Some(line) = self.layout.get(line_index) else {
             return Err(closest);
         };
 
@@ -252,7 +252,7 @@ impl PlatformTextLayout for ParleyLayout {
         Cluster::from_point(
             &self.layout,
             pixel_point.x.into(),
-            self.native_y_for_line(line_ix),
+            self.native_y_for_line(line_index),
         )
         .map(|(cluster, _)| cluster.text_range().start)
         .ok_or(closest)
@@ -263,7 +263,7 @@ impl PlatformTextLayout for ParleyLayout {
         pixel_point: gpui::Point<Pixels>,
         line_height: Pixels,
     ) -> std::result::Result<CaretPosition, CaretPosition> {
-        let line_ix = if line_height > px(0.0) && pixel_point.y >= Pixels::ZERO {
+        let line_index = if line_height > px(0.0) && pixel_point.y >= Pixels::ZERO {
             (pixel_point.y / line_height) as usize
         } else {
             0
@@ -272,9 +272,9 @@ impl PlatformTextLayout for ParleyLayout {
         let caret = Self::caret_position(Cursor::from_point(
             &self.layout,
             pixel_point.x.into(),
-            self.native_y_for_line(line_ix),
+            self.native_y_for_line(line_index),
         ));
-        let Some(line) = self.layout.get(line_ix) else {
+        let Some(line) = self.layout.get(line_index) else {
             return Err(caret);
         };
 
@@ -299,7 +299,7 @@ impl PlatformTextLayout for ParleyLayout {
 
         let cursor = self.cursor(caret);
         let geometry = cursor.geometry(&self.layout, 0.0);
-        let line_ix = self
+        let line_index = self
             .layout
             .lines()
             .position(|line| {
@@ -309,8 +309,8 @@ impl PlatformTextLayout for ParleyLayout {
             })
             .unwrap_or_else(|| self.layout.len().saturating_sub(1));
         Some(Bounds::from_corners(
-            point(px(geometry.x0 as f32), line_height * line_ix),
-            point(px(geometry.x1 as f32), line_height * (line_ix + 1)),
+            point(px(geometry.x0 as f32), line_height * line_index),
+            point(px(geometry.x1 as f32), line_height * (line_index + 1)),
         ))
     }
 
@@ -350,10 +350,10 @@ impl PlatformTextLayout for ParleyLayout {
         Selection::new(anchor, focus)
             .geometry(&self.layout)
             .into_iter()
-            .map(|(geometry, line_ix)| {
+            .map(|(geometry, line_index)| {
                 Bounds::from_corners(
-                    point(px(geometry.x0 as f32), line_height * line_ix),
-                    point(px(geometry.x1 as f32), line_height * (line_ix + 1)),
+                    point(px(geometry.x0 as f32), line_height * line_index),
+                    point(px(geometry.x1 as f32), line_height * (line_index + 1)),
                 )
             })
             .collect()
@@ -420,7 +420,7 @@ impl PlatformTextLayout for ParleyLayout {
                 };
 
                 let geometry = cursor.geometry(&self.layout, 0.0);
-                let line_ix = self
+                let line_index = self
                     .layout
                     .lines()
                     .position(|line| {
@@ -429,7 +429,7 @@ impl PlatformTextLayout for ParleyLayout {
                             && (geometry.y0 as f32) < metrics.block_max_coord
                     })
                     .unwrap_or_else(|| self.layout.len().saturating_sub(1));
-                let target_ix = line_ix
+                let target_ix = line_index
                     .checked_add_signed(delta)
                     .filter(|&target_ix| self.layout.get(target_ix).is_some());
                 let Some(target_ix) = target_ix else {
@@ -466,13 +466,13 @@ impl PlatformTextLayout for ParleyLayout {
         line_height: Pixels,
         kind: TextSelectionKind,
     ) -> std::ops::Range<usize> {
-        let line_ix = if line_height > Pixels::ZERO && pixel_point.y >= Pixels::ZERO {
+        let line_index = if line_height > Pixels::ZERO && pixel_point.y >= Pixels::ZERO {
             (pixel_point.y / line_height) as usize
         } else {
             0
         };
 
-        let y = self.native_y_for_line(line_ix);
+        let y = self.native_y_for_line(line_index);
         match kind {
             TextSelectionKind::Word => {
                 Selection::word_from_point(&self.layout, pixel_point.x.into(), y)

@@ -72,20 +72,20 @@ fn raster_case() -> (TextSystem, RenderGlyphParams) {
     (TextSystem::new(Arc::new(system)), params)
 }
 
-fn bench_text_pipeline(c: &mut Criterion) {
+fn bench_text_pipeline(criterion: &mut Criterion) {
     let (system, base_run) = text_system();
     let code = code_text();
     let multilingual =
         "office cafe\u{301} العربية אבג 日本語 ไทย 👩🏽‍💻 🇬🇧 one two three four".repeat(16);
 
-    let mut group = c.benchmark_group("parley_text_pipeline");
-    group.bench_function("layout_code_warm", |b| {
+    let mut group = criterion.benchmark_group("parley_text_pipeline");
+    group.bench_function("layout_code_warm", |bencher| {
         let runs = [TextRun {
             len: code.len(),
             ..base_run.clone()
         }];
 
-        b.iter(|| {
+        bencher.iter(|| {
             system.layout_text(TextLayoutRequest {
                 text: &code,
                 font_size: px(14.0),
@@ -96,13 +96,13 @@ fn bench_text_pipeline(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("layout_multilingual_warm", |b| {
+    group.bench_function("layout_multilingual_warm", |bencher| {
         let runs = [TextRun {
             len: multilingual.len(),
             ..base_run.clone()
         }];
 
-        b.iter(|| {
+        bencher.iter(|| {
             system.layout_text(TextLayoutRequest {
                 text: &multilingual,
                 font_size: px(16.0),
@@ -113,13 +113,13 @@ fn bench_text_pipeline(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("wrap_multilingual_warm", |b| {
+    group.bench_function("wrap_multilingual_warm", |bencher| {
         let runs = [TextRun {
             len: multilingual.len(),
             ..base_run.clone()
         }];
 
-        b.iter(|| {
+        bencher.iter(|| {
             system.layout_text(TextLayoutRequest {
                 text: &multilingual,
                 font_size: px(16.0),
@@ -130,8 +130,8 @@ fn bench_text_pipeline(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("layout_multilingual_cold", |b| {
-        b.iter_batched(
+    group.bench_function("layout_multilingual_cold", |bencher| {
+        bencher.iter_batched(
             text_system,
             |(system, run)| {
                 let runs = [TextRun {
@@ -151,18 +151,18 @@ fn bench_text_pipeline(c: &mut Criterion) {
         );
     });
 
-    group.bench_function("first_glyph_rasterization", |b| {
-        b.iter_batched(
+    group.bench_function("first_glyph_rasterization", |bencher| {
+        bencher.iter_batched(
             raster_case,
             |(system, params)| system.rasterize_glyph(&params).unwrap(),
             BatchSize::SmallInput,
         );
     });
 
-    group.bench_function("cached_glyph_rasterization", |b| {
+    group.bench_function("cached_glyph_rasterization", |bencher| {
         let (system, params) = raster_case();
         system.rasterize_glyph(&params).unwrap();
-        b.iter(|| system.rasterize_glyph(&params).unwrap());
+        bencher.iter(|| system.rasterize_glyph(&params).unwrap());
     });
 
     group.finish();
