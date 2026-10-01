@@ -324,7 +324,7 @@ impl EditableTextState {
         self.record_history(range.clone(), text_to_insert.len());
         self.storage.replace_range(range, text_to_insert);
 
-        let affinity = CaretAffinity::for_inserted_text(text_to_insert);
+        let affinity = CaretAffinity::from(text_to_insert);
         self.set_selection(CaretPosition::from((end_pos, affinity)));
         self.marked_range = None;
     }
@@ -518,13 +518,7 @@ impl EditableTextState {
     }
 
     fn move_to_caret(&mut self, caret: CaretPosition, cx: &mut Context<Self>) {
-        self.apply_selection_movement(
-            CaretSelectionMovement {
-                result: caret.into(),
-                vertical_navigation_x: None,
-            },
-            cx,
-        );
+        self.apply_selection_movement(self.selection_movement.move_or_select_to(caret, false), cx);
     }
 
     /// Changes the current selection to extend to the provided position.
@@ -536,13 +530,7 @@ impl EditableTextState {
     }
 
     fn select_to_caret(&mut self, caret: CaretPosition, cx: &mut Context<Self>) {
-        self.apply_selection_movement(
-            CaretSelectionMovement {
-                result: self.selection_movement.result.with_caret(caret),
-                vertical_navigation_x: None,
-            },
-            cx,
-        );
+        self.apply_selection_movement(self.selection_movement.move_or_select_to(caret, true), cx);
     }
 
     fn apply_selection_movement(
@@ -643,14 +631,7 @@ impl EditableTextState {
             // The core layout backend does not handle document boundaries.
             let caret = CaretPosition::attached_to_next_cluster(index);
             self.apply_selection_movement(
-                CaretSelectionMovement {
-                    result: if extend {
-                        self.selection_movement.result.with_caret(caret)
-                    } else {
-                        caret.into()
-                    },
-                    vertical_navigation_x: None,
-                },
+                self.selection_movement.move_or_select_to(caret, extend),
                 cx,
             );
 
@@ -692,17 +673,7 @@ impl EditableTextState {
         };
         let caret = CaretPosition::attached_to_next_cluster(index);
 
-        self.apply_selection_movement(
-            CaretSelectionMovement {
-                result: if extend {
-                    self.selection_movement.result.with_caret(caret)
-                } else {
-                    caret.into()
-                },
-                vertical_navigation_x: None,
-            },
-            cx,
-        );
+        self.apply_selection_movement(self.selection_movement.move_or_select_to(caret, extend), cx);
     }
 
     fn move_linear(
@@ -735,17 +706,7 @@ impl EditableTextState {
         };
         let caret = CaretPosition::attached_to_next_cluster(index);
 
-        self.apply_selection_movement(
-            CaretSelectionMovement {
-                result: if extend {
-                    self.selection_movement.result.with_caret(caret)
-                } else {
-                    caret.into()
-                },
-                vertical_navigation_x: None,
-            },
-            cx,
-        );
+        self.apply_selection_movement(self.selection_movement.move_or_select_to(caret, extend), cx);
     }
 
     /// Sets the current selection to be the entire text in the storage medium

@@ -130,7 +130,13 @@ pub enum TextDirection {
 /// The boundary at which a semantic text movement stops.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextBoundary {
-    /// One backend-defined caret step, which may span several Unicode scalar values.
+    /// One backend-defined caret step. [`PlatformTextLayout::normalized_caret`] and
+    /// [`PlatformTextLayout::adjacent_visual_caret`] govern visual stops, while
+    /// [`PlatformTextLayout::logical_cluster_before`] and
+    /// [`PlatformTextLayout::logical_cluster_after`] return logical ranges.
+    /// [`PlatformTextSystem::layout_text`] provides [`LineLayout::platform_layout`].
+    /// Platform constructors use `gpui_ce_parley`, whose logical ranges are graphemes and
+    /// visual movement follows Parley cursors. Other backends may differ.
     Cluster,
     /// A word boundary.
     Word,
@@ -268,6 +274,12 @@ pub fn is_paragraph_separator(character: char) -> bool {
 impl CaretAffinity {
     /// Returns the affinity for a caret placed after inserted text.
     pub fn for_inserted_text(text: &str) -> Self {
+        Self::from(text)
+    }
+}
+
+impl From<&str> for CaretAffinity {
+    fn from(text: &str) -> Self {
         let Some(last_character) = text.chars().next_back() else {
             return Self::Downstream;
         };
@@ -387,6 +399,22 @@ pub struct CaretMovement<T = CaretPosition> {
 
 /// The result of calculating a selection movement through a laid-out document.
 pub type CaretSelectionMovement = CaretMovement<CaretSelection>;
+
+impl CaretMovement<CaretSelection> {
+    /// Moves or extends the selection to `caret`, clearing the retained vertical coordinate.
+    pub fn move_or_select_to(self, caret: CaretPosition, extend: bool) -> Self {
+        let result = if extend {
+            self.result.with_caret(caret)
+        } else {
+            caret.into()
+        };
+
+        Self {
+            result,
+            vertical_navigation_x: None,
+        }
+    }
+}
 
 /// A document layout with its optional wrapping constraint.
 #[derive(Debug)]
@@ -1016,27 +1044,25 @@ mod tests {
 
     #[test]
     fn inserted_text_affinity_tracks_trailing_paragraph_separators() {
-        assert_eq!(
-            CaretAffinity::for_inserted_text(""),
-            CaretAffinity::Downstream
-        );
-        assert_eq!(
-            CaretAffinity::for_inserted_text("ordinary text"),
-            CaretAffinity::Upstream
-        );
-
-        for text in [
-            "\n", "\r", "\u{001c}", "\u{001d}", "\u{001e}", "\u{0085}", "\u{2028}", "\u{2029}",
+        for (text, expected) in [
+            ("", CaretAffinity::Downstream),
+            ("ordinary text", CaretAffinity::Upstream),
+            ("\n", CaretAffinity::Downstream),
+            ("\r", CaretAffinity::Downstream),
+            ("\u{001c}", CaretAffinity::Downstream),
+            ("\u{001d}", CaretAffinity::Downstream),
+            ("\u{001e}", CaretAffinity::Downstream),
+            ("\u{0085}", CaretAffinity::Downstream),
+            ("\u{2028}", CaretAffinity::Downstream),
+            ("\u{2029}", CaretAffinity::Downstream),
+            ("\nordinary text", CaretAffinity::Upstream),
         ] {
+            assert_eq!(CaretAffinity::from(text), expected, "From({text:?})");
             assert_eq!(
                 CaretAffinity::for_inserted_text(text),
-                CaretAffinity::Downstream
+                expected,
+                "for_inserted_text({text:?})"
             );
         }
-
-        assert_eq!(
-            CaretAffinity::for_inserted_text("\nordinary text"),
-            CaretAffinity::Upstream
-        );
     }
 }
