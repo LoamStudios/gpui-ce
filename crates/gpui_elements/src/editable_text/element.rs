@@ -504,6 +504,7 @@ impl Element for EditableTextElement {
 
         let accepts_input = self.accepts_input;
         let hitbox = prepaint.interactivity.hitbox.clone();
+        let line_height = request_layout.state.read(cx).layout_data.line_height;
         let perform_paint = |style: &Style, window: &mut Window, cx: &mut App| {
             if style.display == Display::None {
                 return;
@@ -515,12 +516,10 @@ impl Element for EditableTextElement {
             }
 
             // Actually draw the elements we constructed during prepaint
-            let line_h = window.line_height();
-
             if let Some(document) = prepaint.elements.document.take() {
                 let _ = document.paint(
                     prepaint.interactivity.document_origin(),
-                    line_h,
+                    line_height,
                     TextAlign::Left,
                     Some(bounds),
                     window,
@@ -593,7 +592,7 @@ impl EditableTextElement {
         cx: &mut App,
     ) {
         let inner_bounds = prepaint.interactivity.inner_bounds;
-        let to_local_position = -(bounds.origin + prepaint.interactivity.scroll_offset);
+        let document_origin = prepaint.interactivity.document_origin();
 
         let ime_handler = ElementInputHandler::new(inner_bounds, entity.clone());
         window.handle_input(&prepaint.focus_handle, ime_handler, cx);
@@ -615,7 +614,7 @@ impl EditableTextElement {
                 cx.stop_propagation();
                 window.focus(&focus_handle, cx);
 
-                let text_position = event.position + to_local_position;
+                let text_position = event.position - document_origin;
                 state.update(cx, |state, cx| {
                     state.on_mouse_down(event, text_position, window, cx);
                 });
@@ -643,7 +642,7 @@ impl EditableTextElement {
                     return;
                 }
 
-                let text_position = event.position + to_local_position;
+                let text_position = event.position - document_origin;
                 state.update(cx, |state, cx| {
                     state.on_mouse_move(event, text_position, window, cx);
                 });
@@ -772,7 +771,7 @@ impl PrepaintElements {
             return elements;
         };
 
-        let line_height = window.line_height();
+        let line_height = state.layout_data.line_height;
         let document_top = prepaint.scroll_offset.y;
         let document_bottom = document_top + line_height * document.line_count() as f32;
 

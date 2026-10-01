@@ -43,8 +43,8 @@ pub struct EditableTextState {
     storage: Box<dyn UnicodeTextStorage>,
 
     /// This input's affinity-aware selection and horizontal coordinate retained during vertical
-    /// navigation. The caret is the cursor, and the anchor remains fixed while extending the
-    /// selection. The coordinate is measured from the layout's left edge and is reset by operations
+    /// navigation. The caret is the cursor, and the anchor is the other selection endpoint.
+    /// The coordinate is measured from the layout's left edge and is reset by operations
     /// other than consecutive vertical movements.
     selection_movement: CaretSelectionMovement,
 
@@ -1290,30 +1290,25 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
         &mut self,
         event: &gpui::MouseDownEvent,
         text_position: Point<Pixels>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<'app, Self>,
     ) {
         const DOUBLE_CLICK: usize = 2;
         const TRIPLE_CLICK: usize = 3;
 
-        let caret = self.caret_for_pixel_point(text_position, window.line_height());
+        let line_height = self.layout_data.line_height;
+        let caret = self.caret_for_pixel_point(text_position, line_height);
 
         self.is_selecting = true;
         self.apply_click(event.click_count, text_position);
 
         match self.click_count {
-            DOUBLE_CLICK => self.select_group_at(
-                text_position,
-                window.line_height(),
-                SelectionGroup::Word,
-                cx,
-            ),
-            TRIPLE_CLICK => self.select_group_at(
-                text_position,
-                window.line_height(),
-                SelectionGroup::Line,
-                cx,
-            ),
+            DOUBLE_CLICK => {
+                self.select_group_at(text_position, line_height, SelectionGroup::Word, cx)
+            }
+            TRIPLE_CLICK => {
+                self.select_group_at(text_position, line_height, SelectionGroup::Line, cx)
+            }
             _ if event.modifiers.shift => self.select_to_caret(caret, cx),
             _ => self.move_to_caret(caret, cx),
         }
@@ -1332,11 +1327,11 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
         &mut self,
         _event: &gpui::MouseMoveEvent,
         text_position: Point<Pixels>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<'app, Self>,
     ) {
         if self.is_selecting && self.click_count == 1 {
-            let caret = self.caret_for_pixel_point(text_position, window.line_height());
+            let caret = self.caret_for_pixel_point(text_position, self.layout_data.line_height);
             self.select_to_caret(caret, cx);
         }
     }
