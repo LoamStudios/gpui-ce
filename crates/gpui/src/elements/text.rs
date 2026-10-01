@@ -947,8 +947,6 @@ impl TextLayout {
                     window,
                     cx,
                 );
-                let len = text.len();
-
                 let document = window
                     .text_system()
                     .shape_text(
@@ -964,7 +962,10 @@ impl TextLayout {
                     .as_ref()
                     .map_or_else(Size::default, |document| document.size(line_height));
 
-                let len = if document.is_some() { len } else { 0 };
+                let len = document
+                    .as_ref()
+                    .map(|document| document.len())
+                    .unwrap_or_default();
 
                 element_state
                     .0
