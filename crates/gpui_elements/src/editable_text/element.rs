@@ -244,6 +244,12 @@ struct InteractivityPrepaint {
     caret_visible: bool,
 }
 
+impl InteractivityPrepaint {
+    fn document_origin(&self) -> Point<Pixels> {
+        self.inner_bounds.origin + self.scroll_offset
+    }
+}
+
 struct AccessibilityPrepaint {
     text_run: accesskit::Node,
     anchor: usize,
@@ -510,15 +516,26 @@ impl Element for EditableTextElement {
 
             // Actually draw the elements we constructed during prepaint
             let line_h = window.line_height();
-            for PrepaintLine { line, point, align } in prepaint.elements.lines.drain(..) {
-                let _ = line.paint(point, line_h, align, Some(bounds), window, cx);
+
+            if let Some(document) = prepaint.elements.document.take() {
+                let _ = document.paint(
+                    prepaint.interactivity.document_origin(),
+                    line_h,
+                    TextAlign::Left,
+                    Some(bounds),
+                    window,
+                    cx,
+                );
             }
+
             for quad in prepaint.elements.ime_marked.drain(..) {
                 window.paint_quad(quad);
             }
+
             for quad in prepaint.elements.selection.drain(..) {
                 window.paint_quad(quad);
             }
+
             if let Some(quad) = prepaint.elements.caret.take() {
                 window.paint_quad(quad);
             }
@@ -733,38 +750,15 @@ impl PrelayoutState {
     }
 }
 
-struct PrepaintLine {
-    line: Arc<WrappedLine>,
-    point: Point<Pixels>,
-    align: TextAlign,
-}
-
-const STACK_ALLOCATED_LINES: usize = 100usize;
-const STACK_ALLOCATED_QUADS_SELECTION: usize = 20usize;
-const STACK_ALLOCATED_QUADS_IME_MARKED: usize = 2usize;
-
 #[derive(Default)]
 struct PrepaintElements {
-    lines: SmallVec<[PrepaintLine; STACK_ALLOCATED_LINES]>,
-    selection: SmallVec<[PaintQuad; STACK_ALLOCATED_QUADS_SELECTION]>,
-    ime_marked: SmallVec<[PaintQuad; STACK_ALLOCATED_QUADS_IME_MARKED]>,
+    document: Option<Arc<WrappedLine>>,
+    selection: SmallVec<[PaintQuad; 20]>,
+    ime_marked: SmallVec<[PaintQuad; 2]>,
     caret: Option<PaintQuad>,
 }
 
 impl PrepaintElements {
-    fn build_quads(
-        offset_corners: Vec<(Point<Pixels>, Point<Pixels>)>,
-        origin: Point<Pixels>,
-        color: Hsla,
-    ) -> impl Iterator<Item = PaintQuad> {
-        offset_corners
-            .into_iter()
-            .map(move |(offset_start, offset_end)| {
-                let bounds = Bounds::from_corners(origin + offset_start, origin + offset_end);
-                fill(bounds, color)
-            })
-    }
-
     fn build_elements(
         state: &EditableTextState,
         prepaint: &InteractivityPrepaint,
@@ -773,114 +767,70 @@ impl PrepaintElements {
         caret_height: DefiniteLength,
         window: &mut Window,
     ) -> PrepaintElements {
-        let InteractivityPrepaint {
-            hitbox: _,
-            scroll_offset,
-            inner_bounds,
-            caret_visible,
-        } = prepaint;
-
-        let caret = state.caret_selection().caret;
-        let selection = state.selected_byte_range();
-        let ime_range = state.marked_range();
-
         let mut elements = PrepaintElements::default();
+        let Some(document) = &state.layout_data.document else {
+            return elements;
+        };
 
         let line_height = window.line_height();
-        let mut caret_point = None::<Point<Pixels>>;
+        let document_top = prepaint.scroll_offset.y;
+        let document_bottom = document_top + line_height * document.line_count() as f32;
 
-        if let Some(document) = &state.layout_data.document {
-            let line_y = scroll_offset.y;
-            let line_bottom = line_y + line_height * document.line_count() as f32;
-            let line_visible = line_bottom >= Pixels::ZERO && line_y <= inner_bounds.size.height;
-
-            if line_visible {
-                let document_origin = inner_bounds.origin + point(scroll_offset.x, line_y);
-                elements.lines.push(PrepaintLine {
-                    line: document.clone(),
-                    point: document_origin,
-                    align: TextAlign::Left,
-                });
-
-                if !selection.is_empty() {
-                    let offset_corners = build_quad_over_text(
-                        &selection,
-                        document,
-                        line_y,
-                        line_height,
-                        Pixels::ZERO,
-                    );
-                    elements.selection.extend(PrepaintElements::build_quads(
-                        offset_corners,
-                        inner_bounds.origin,
-                        colors.selection,
-                    ));
-                }
-
-                if let Some(ime_range) = &ime_range
-                    && !ime_range.is_empty()
-                {
-                    const MARKED_TEXT_UNDERLINE_THICKNESS: f32 = 2.0;
-                    let underline_thickness = px(MARKED_TEXT_UNDERLINE_THICKNESS);
-                    let underline_offset = line_height - underline_thickness;
-
-                    let offset_corners = build_quad_over_text(
-                        &ime_range,
-                        document,
-                        line_y,
-                        line_height,
-                        underline_offset,
-                    );
-                    elements.ime_marked.extend(PrepaintElements::build_quads(
-                        offset_corners,
-                        inner_bounds.origin,
-                        colors.ime_underline,
-                    ));
-                }
-
-                let caret_px = document
-                    .visual_position_for_caret(caret, line_height)
-                    .unwrap_or_default();
-                caret_point = Some(caret_px + point(scroll_offset.x, line_y));
-            }
+        if document_bottom < Pixels::ZERO || document_top > prepaint.inner_bounds.size.height {
+            return elements;
         }
 
-        if *caret_visible && let Some(caret_point) = caret_point {
+        let document_origin = prepaint.document_origin();
+        let quads = |range: Range<usize>, color, offset_y| {
+            let start = range.start.min(document.text.len());
+            let end = range.end.min(document.text.len());
+
+            document
+                .selection_bounds(start..end, line_height)
+                .into_iter()
+                .map(move |bounds| {
+                    fill(
+                        Bounds::from_corners(
+                            document_origin + bounds.origin + point(Pixels::ZERO, offset_y),
+                            document_origin + bounds.bottom_right(),
+                        ),
+                        color,
+                    )
+                })
+        };
+
+        elements.document = Some(document.clone());
+
+        elements.selection.extend(quads(
+            state.selected_byte_range(),
+            colors.selection,
+            Pixels::ZERO,
+        ));
+
+        if let Some(range) = state.marked_range() {
+            elements
+                .ime_marked
+                .extend(quads(range, colors.ime_underline, line_height - px(2.)));
+        }
+
+        if prepaint.caret_visible {
+            let caret_point = document_origin
+                + document
+                    .visual_position_for_caret(state.caret_selection().caret, line_height)
+                    .unwrap_or_default();
             let caret_height = caret_height.to_pixels(line_height.into(), window.rem_size());
             let vertical_offset = (line_height - caret_height) / 2.;
-            let quad = fill(
+            elements.caret = Some(fill(
                 Bounds::new(
-                    inner_bounds.origin + caret_point + point(Pixels::ZERO, vertical_offset),
+                    caret_point + point(Pixels::ZERO, vertical_offset),
                     size(caret_width, caret_height),
                 ),
                 colors.caret,
-            );
-            elements.caret = Some(quad);
+            ));
         }
 
         elements
     }
-}
-
-fn build_quad_over_text(
-    containing_range: &Range<usize>,
-    document: &WrappedLine,
-    line_y: Pixels,
-    line_height: Pixels,
-    offset_y: Pixels,
-) -> Vec<(Point<Pixels>, Point<Pixels>)> {
-    let start = containing_range.start.min(document.text.len());
-    let end = containing_range.end.min(document.text.len());
-    document
-        .selection_bounds(start..end, line_height)
-        .into_iter()
-        .map(|bounds| {
-            (
-                point(bounds.left(), line_y + bounds.top() + offset_y),
-                point(bounds.right(), line_y + bounds.bottom()),
-            )
-        })
-        .collect()
 }
 
 #[cfg(test)]
