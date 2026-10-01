@@ -200,7 +200,6 @@ impl InlineParagraphCollector<'_> {
 
     fn finish_paragraph(&mut self) {
         if self.current_document.text.is_empty() && self.current_document.boxes.is_empty() {
-            self.current_document = InlineDocument::default();
             return;
         }
 
