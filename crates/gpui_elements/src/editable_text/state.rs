@@ -9,11 +9,7 @@ use gpui::{
     TextMovement, TextRangeExt, TextSelectionKind, UTF16Selection, Window, WrappedLine, point,
     utf16_to_utf8_offset,
 };
-use std::{
-    borrow::Cow,
-    cell::{Ref, RefCell},
-    ops::Range,
-};
+use std::{borrow::Cow, ops::Range};
 
 const CARET_PIXELS_EPSILON: Pixels = gpui::px(4.);
 
@@ -62,7 +58,7 @@ pub struct EditableTextState {
     focus_handle: FocusHandle,
     blur_subscription: Option<Subscription>,
     history: Option<EditableTextHistory>,
-    accessibility_text_metrics: RefCell<Option<AccessibilityTextMetrics>>,
+    accessibility_text_metrics: AccessibilityTextMetrics,
 
     pub(super) layout_data: EditableTextLayoutResult,
 }
@@ -137,6 +133,8 @@ impl EditableTextState {
     /// # }
     /// ```
     pub fn new(storage: impl UnicodeTextStorage + 'static, cx: &mut Context<Self>) -> Self {
+        let accessibility_text_metrics = AccessibilityTextMetrics::new(storage.content_utf8());
+
         Self {
             storage: Box::new(storage),
 
@@ -151,7 +149,7 @@ impl EditableTextState {
             blur_subscription: None,
             // TODO: what is the best way to give users access to configure this via element
             history: Some(EditableTextHistory::default()),
-            accessibility_text_metrics: RefCell::default(),
+            accessibility_text_metrics,
 
             layout_data: EditableTextLayoutResult::default(),
         }
@@ -218,50 +216,37 @@ impl EditableTextState {
         self.marked_range.clone()
     }
 
-    pub(super) fn accessibility_text_metrics(&self) -> Ref<'_, AccessibilityTextMetrics> {
-        let version = self.storage.version();
-        let metrics_are_current = self
-            .accessibility_text_metrics
-            .borrow()
-            .as_ref()
-            .is_some_and(|metrics| metrics.version == version);
-
-        if !metrics_are_current {
-            *self.accessibility_text_metrics.borrow_mut() =
-                Some(AccessibilityTextMetrics::new(self.as_str(), version));
-        }
-
-        Ref::map(self.accessibility_text_metrics.borrow(), |metrics| {
-            metrics
-                .as_ref()
-                .expect("accessibility text metrics were prepared above")
-        })
+    pub(super) fn accessibility_text_metrics(&self) -> &AccessibilityTextMetrics {
+        &self.accessibility_text_metrics
     }
 }
 
 pub(super) struct AccessibilityTextMetrics {
-    version: u16,
     pub(super) character_lengths: Vec<u8>,
     byte_offsets: Vec<usize>,
 }
 
 impl AccessibilityTextMetrics {
-    fn new(text: &str, version: u16) -> Self {
-        let mut byte_offsets = text
-            .char_indices()
-            .map(|(offset, _)| offset)
-            .collect::<Vec<_>>();
+    fn new(text: &str) -> Self {
+        let mut metrics = Self {
+            character_lengths: Vec::new(),
+            byte_offsets: Vec::new(),
+        };
+        metrics.refresh(text);
 
-        byte_offsets.push(text.len());
+        metrics
+    }
 
-        Self {
-            version,
-            character_lengths: text
-                .chars()
-                .map(|character| character.len_utf8() as u8)
-                .collect(),
-            byte_offsets,
+    fn refresh(&mut self, text: &str) {
+        self.character_lengths.clear();
+        self.byte_offsets.clear();
+
+        for (offset, character) in text.char_indices() {
+            self.character_lengths.push(character.len_utf8() as u8);
+            self.byte_offsets.push(offset);
         }
+
+        self.byte_offsets.push(text.len());
     }
 
     pub(super) fn character_indices_for_selection(
@@ -282,6 +267,12 @@ impl AccessibilityTextMetrics {
 }
 
 impl EditableTextState {
+    fn replace_storage_range(&mut self, range: Range<usize>, text: &str) {
+        self.storage.replace_range(range, text);
+        self.accessibility_text_metrics
+            .refresh(self.storage.content_utf8());
+    }
+
     /// Validates/sanitizes incoming text according to the rules of the field.
     fn validate_incoming_text<'text>(
         &self,
@@ -322,7 +313,7 @@ impl EditableTextState {
     fn replace_text(&mut self, range: Range<usize>, text_to_insert: &str) {
         let end_pos = range.start + text_to_insert.len();
         self.record_history(range.clone(), text_to_insert.len());
-        self.storage.replace_range(range, text_to_insert);
+        self.replace_storage_range(range, text_to_insert);
 
         let affinity = CaretAffinity::from(text_to_insert);
         self.set_selection(CaretPosition::from((end_pos, affinity)));
@@ -822,10 +813,7 @@ impl EditableTextState {
     }
 
     fn apply_from_history(&mut self, src: HistoryKind, dst: HistoryKind, cx: &mut Context<Self>) {
-        let Some(history) = &mut self.history else {
-            return;
-        };
-        let Some(entry) = history.take(src) else {
+        let Some(entry) = self.history.as_mut().and_then(|history| history.take(src)) else {
             return;
         };
 
@@ -834,11 +822,14 @@ impl EditableTextState {
         let removed_text = self.storage.content_utf8()[range.clone()].to_string();
 
         // Replace the slice with the history value
-        self.storage.replace_range(range, &entry.old_text);
+        self.replace_storage_range(range, &entry.old_text);
 
         // Push the entry onto the redo stack so the undo can be undone
         let selection = entry.selected_range;
-        history.push(dst, entry.as_inverted(removed_text));
+        self.history
+            .as_mut()
+            .expect("history was available when the entry was taken")
+            .push(dst, entry.as_inverted(removed_text));
         self.set_selection(selection);
 
         self.scroll_to_caret();
@@ -1320,6 +1311,30 @@ mod tests {
         input: Entity<EditableTextState>,
     }
 
+    struct WrappingStorage {
+        text: String,
+        version: u16,
+    }
+
+    impl UnicodeTextStorage for WrappingStorage {
+        fn version(&self) -> u16 {
+            self.version
+        }
+
+        fn content_utf8(&self) -> &str {
+            &self.text
+        }
+
+        fn len_utf16(&self) -> usize {
+            self.text.encode_utf16().count()
+        }
+
+        fn replace_range(&mut self, range: Range<usize>, text: &str) {
+            self.text.replace_range(range, text);
+            self.version = self.version.wrapping_add(1);
+        }
+    }
+
     impl Render for TestView {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             div()
@@ -1335,7 +1350,7 @@ mod tests {
     #[test]
     fn accessibility_selection_uses_character_indices_and_preserves_direction() {
         let text = "A😀日本B";
-        let metrics = AccessibilityTextMetrics::new(text, 0);
+        let metrics = AccessibilityTextMetrics::new(text);
         let start = 1;
         let end = "A😀日本".len();
         let forward = CaretSelection {
@@ -1356,33 +1371,67 @@ mod tests {
     }
 
     #[gpui::test]
-    fn accessibility_metrics_reuse_reads_and_refresh_after_multibyte_edits(
+    fn accessibility_metrics_start_current_and_refresh_after_multibyte_edits(
         cx: &mut TestAppContext,
     ) {
         let view = create_test_input(cx, "A😀B", 5);
         view.update(cx, |view, _window, cx| {
             view.input.update(cx, |input, _cx| {
-                {
-                    let metrics = input.accessibility_text_metrics();
-                    let repeated = input.accessibility_text_metrics();
+                let metrics = input.accessibility_text_metrics();
+                let repeated = input.accessibility_text_metrics();
 
-                    assert!(std::ptr::eq(&*metrics, &*repeated));
-                    assert_eq!(metrics.character_lengths, [1, 4, 1]);
-                    assert_eq!(
-                        repeated.character_indices_for_selection(input.caret_selection()),
-                        (2, 2)
-                    );
-                }
+                assert!(std::ptr::eq(metrics, repeated));
+                assert_eq!(metrics.character_lengths, [1, 4, 1]);
+                assert_eq!(metrics.byte_offsets, [0, 1, 5, 6]);
+                assert_eq!(
+                    repeated.character_indices_for_selection(input.caret_selection()),
+                    (2, 2)
+                );
 
                 input.replace_text(1..5, "日本");
                 assert_eq!(input.as_str(), "A日本B");
 
                 let metrics = input.accessibility_text_metrics();
                 assert_eq!(metrics.character_lengths, [1, 3, 3, 1]);
+                assert_eq!(metrics.byte_offsets, [0, 1, 4, 7, 8]);
                 assert_eq!(
                     metrics.character_indices_for_selection(input.caret_selection()),
                     (3, 3)
                 );
+
+                input.replace_text(0..input.as_str().len(), "");
+                let metrics = input.accessibility_text_metrics();
+                assert!(metrics.character_lengths.is_empty());
+                assert_eq!(metrics.byte_offsets, [0]);
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn accessibility_metrics_refresh_when_storage_version_wraps(cx: &mut TestAppContext) {
+        let view = cx.add_window(|_window, cx| {
+            let input = cx.new(|cx| {
+                EditableTextState::new(
+                    WrappingStorage {
+                        text: "😀".into(),
+                        version: u16::MAX,
+                    },
+                    cx,
+                )
+            });
+
+            TestView { input }
+        });
+
+        view.update(cx, |view, _window, cx| {
+            view.input.update(cx, |input, _cx| {
+                assert_eq!(input.version(), u16::MAX);
+                assert_eq!(input.accessibility_text_metrics().byte_offsets, [0, 4]);
+
+                input.replace_text(0..4, "日本");
+                assert_eq!(input.version(), 0);
+                assert_eq!(input.accessibility_text_metrics().byte_offsets, [0, 3, 6]);
             });
         })
         .unwrap();
@@ -2578,19 +2627,31 @@ mod tests {
 
     #[gpui::test]
     fn test_redo_restores_undone_content(cx: &mut TestAppContext) {
-        let view = create_test_input(cx, "hello", 5);
+        let view = create_test_input(cx, "A😀B", 6);
         view.update(cx, |view, window, cx| {
             view.input.update(cx, |input, cx| {
                 without_history_grouping(input);
 
-                input.replace_text_in_range(None, " world", window, cx);
-                assert_eq!(input.as_str(), "hello world");
+                input.replace_text_in_range(None, "日本", window, cx);
+                assert_eq!(input.as_str(), "A😀B日本");
+                assert_eq!(
+                    input.accessibility_text_metrics().character_lengths,
+                    [1, 4, 1, 3, 3]
+                );
 
                 input.undo(&Undo, window, cx);
-                assert_eq!(input.as_str(), "hello");
+                assert_eq!(input.as_str(), "A😀B");
+                assert_eq!(
+                    input.accessibility_text_metrics().byte_offsets,
+                    [0, 1, 5, 6]
+                );
 
                 input.redo(&Redo, window, cx);
-                assert_eq!(input.as_str(), "hello world");
+                assert_eq!(input.as_str(), "A😀B日本");
+                assert_eq!(
+                    input.accessibility_text_metrics().byte_offsets,
+                    [0, 1, 5, 6, 9, 12]
+                );
             });
         })
         .unwrap();
@@ -3147,6 +3208,10 @@ mod tests {
                 input.replace_and_mark_text_in_range(Some(1..3), "にほん", Some(1..2), window, cx);
                 assert_eq!(input.as_str(), "AにほんB");
                 assert_eq!(
+                    input.accessibility_text_metrics().character_lengths,
+                    [1, 3, 3, 3, 1]
+                );
+                assert_eq!(
                     input.marked_text_range(window, cx),
                     Some(1..4),
                     "marked ranges exposed to the platform use document UTF-16 offsets"
@@ -3159,6 +3224,10 @@ mod tests {
 
                 input.replace_and_mark_text_in_range(None, "日本", None, window, cx);
                 assert_eq!(input.as_str(), "A日本B");
+                assert_eq!(
+                    input.accessibility_text_metrics().byte_offsets,
+                    [0, 1, 4, 7, 8]
+                );
                 assert_eq!(input.marked_text_range(window, cx), Some(1..3));
                 assert_eq!(
                     input.selected_text_range(false, window, cx).unwrap().range,
