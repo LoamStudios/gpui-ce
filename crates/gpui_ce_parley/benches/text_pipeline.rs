@@ -7,25 +7,24 @@ use gpui_ce_parley::{ParleyTextSystem, SystemFonts};
 use std::borrow::Cow;
 use std::sync::Arc;
 
-const IBM_PLEX: &[u8] =
-    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
-const SOURCE_SERIF: &[u8] =
-    include_bytes!("../../../assets/fonts/source-serif-4/SourceSerif4[opsz,wght].ttf");
+#[path = "../src/font_fixtures.rs"]
+mod font_fixtures;
+
+use font_fixtures::{IBM_PLEX, LILEX, SOURCE_SERIF};
 
 fn text_system() -> (ParleyTextSystem, TextRun) {
-    let system = ParleyTextSystem::new_with_system_font(SystemFonts::Skip, "IBM Plex Sans");
+    let system = ParleyTextSystem::new_with_system_font(SystemFonts::Skip, IBM_PLEX.family);
     system
         .add_fonts(vec![
-            Cow::Borrowed(IBM_PLEX),
-            Cow::Borrowed(LILEX),
-            Cow::Borrowed(SOURCE_SERIF),
+            Cow::Borrowed(IBM_PLEX.data),
+            Cow::Borrowed(LILEX.data),
+            Cow::Borrowed(SOURCE_SERIF.data),
         ])
         .unwrap();
-    let mut descriptor = font("IBM Plex Sans");
+    let mut descriptor = font(IBM_PLEX.family);
     descriptor.fallbacks = Some(FontFallbacks::from_fonts(vec![
-        "Source Serif 4".to_string(),
-        "Lilex".to_string(),
+        SOURCE_SERIF.family.to_string(),
+        LILEX.family.to_string(),
     ]));
     (
         system,

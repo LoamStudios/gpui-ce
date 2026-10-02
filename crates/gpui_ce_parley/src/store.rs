@@ -659,14 +659,12 @@ fn subpixel_offset(params: &RenderGlyphParams) -> Vector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::font_fixtures::IBM_PLEX;
     use gpui::{RasterColorEffect, Rgba8, point, px, rgba};
-
-    const IBM_PLEX: &[u8] =
-        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
 
     #[test]
     fn interning_deduplicates_only_equivalent_font_instances() {
-        let data = Blob::from(IBM_PLEX.to_vec());
+        let data = Blob::from(IBM_PLEX.data.to_vec());
         let mut store = FontStore::default();
         let first = store
             .intern(data.clone(), 0, &[], Synthesis::default())
@@ -687,7 +685,12 @@ mod tests {
         assert_ne!(first, varied);
 
         let copied_source = store
-            .intern(Blob::from(IBM_PLEX.to_vec()), 0, &[], Synthesis::default())
+            .intern(
+                Blob::from(IBM_PLEX.data.to_vec()),
+                0,
+                &[],
+                Synthesis::default(),
+            )
             .unwrap();
         assert_ne!(first, copied_source);
         assert!(store.get(first).is_some());

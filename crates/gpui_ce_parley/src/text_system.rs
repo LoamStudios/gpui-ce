@@ -1027,6 +1027,9 @@ impl PlatformTextSystem for ParleyTextSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::font_fixtures::{
+        IBM_PLEX, IBM_PLEX_SEMIBOLD, LILEX, NOTO_COLOR_EMOJI, SOURCE_SERIF,
+    };
     use crate::{FontSynthesis, FontVariation, RasterFace};
     use gpui::{
         CaretSelection, FontFallbacks, FontFeatures as GpuiFontFeatures, FontStyle, FontWeight,
@@ -1034,16 +1037,6 @@ mod tests {
         WindowTextSystem, font, hsla,
     };
     use std::sync::Arc;
-
-    const IBM_PLEX: &[u8] =
-        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-    const IBM_PLEX_SEMIBOLD: &[u8] =
-        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf");
-    const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
-    const SOURCE_SERIF: &[u8] =
-        include_bytes!("../../../assets/fonts/source-serif-4/SourceSerif4[opsz,wght].ttf");
-    const NOTO_COLOR_EMOJI: &[u8] =
-        include_bytes!("../../../assets/fonts/noto-color-emoji/NotoColorEmoji.subset.ttf");
 
     #[test]
     fn caret_affinity_round_trips_through_parley() {
@@ -1056,21 +1049,21 @@ mod tests {
 
     fn test_system() -> Arc<ParleyTextSystem> {
         let system = Arc::new(
-            ParleyTextSystem::new_with_system_font(SystemFonts::Skip, "IBM Plex Sans")
+            ParleyTextSystem::new_with_system_font(SystemFonts::Skip, IBM_PLEX.family)
                 .with_fallback_families([
-                    "IBM Plex Sans",
-                    "Lilex",
-                    "Source Serif 4",
-                    "Noto Color Emoji",
+                    IBM_PLEX.family,
+                    LILEX.family,
+                    SOURCE_SERIF.family,
+                    NOTO_COLOR_EMOJI.family,
                 ]),
         );
         system
             .add_fonts(vec![
-                Cow::Borrowed(IBM_PLEX),
-                Cow::Borrowed(IBM_PLEX_SEMIBOLD),
-                Cow::Borrowed(LILEX),
-                Cow::Borrowed(SOURCE_SERIF),
-                Cow::Borrowed(NOTO_COLOR_EMOJI),
+                Cow::Borrowed(IBM_PLEX.data),
+                Cow::Borrowed(IBM_PLEX_SEMIBOLD.data),
+                Cow::Borrowed(LILEX.data),
+                Cow::Borrowed(SOURCE_SERIF.data),
+                Cow::Borrowed(NOTO_COLOR_EMOJI.data),
             ])
             .unwrap();
         system
@@ -1255,7 +1248,7 @@ mod tests {
 
         for (name, text, width, max_lines, minimum_lines) in cases {
             let runs = (!text.is_empty())
-                .then(|| text_run(text, "IBM Plex Sans"))
+                .then(|| text_run(text, IBM_PLEX.family))
                 .into_iter()
                 .collect::<Vec<_>>();
             let layout = layout_wrapped(&system, text, px(18.0), &runs, width, max_lines);
@@ -1280,22 +1273,22 @@ mod tests {
             (
                 "code punctuation",
                 "Lilex regular: fn main() { println!(\"hello\"); }",
-                "Lilex",
+                LILEX.family,
             ),
             (
                 "prose punctuation",
                 "One sentence with punctuation, followed by another.",
-                "IBM Plex Sans",
+                IBM_PLEX.family,
             ),
             (
                 "nested delimiters",
                 "call(value, other_value) } trailing",
-                "IBM Plex Sans",
+                IBM_PLEX.family,
             ),
             (
                 "mixed scripts",
                 "English العربية 日本語 punctuation.",
-                "IBM Plex Sans",
+                IBM_PLEX.family,
             ),
         ];
 
@@ -1321,11 +1314,11 @@ mod tests {
         let text = "office café العربية";
         let first_end = "office ".len();
         let second_end = first_end + "café ".len();
-        let mut first_font = font("Source Serif 4");
+        let mut first_font = font(SOURCE_SERIF.family);
         first_font.features = GpuiFontFeatures::disable_ligatures();
         first_font.fallbacks = Some(FontFallbacks::from_fonts(vec![
-            "IBM Plex Sans".into(),
-            "Noto Color Emoji".into(),
+            IBM_PLEX.family.into(),
+            NOTO_COLOR_EMOJI.family.into(),
         ]));
         let base_runs = vec![
             TextRun {
@@ -1337,13 +1330,13 @@ mod tests {
             },
             TextRun {
                 len: second_end - first_end,
-                font: font("IBM Plex Sans").bold(),
+                font: font(IBM_PLEX.family).bold(),
                 color: hsla(0.35, 0.7, 0.35, 1.0),
                 ..Default::default()
             },
             TextRun {
                 len: text.len() - second_end,
-                font: font("IBM Plex Sans"),
+                font: font(IBM_PLEX.family),
                 color: hsla(0.6, 0.8, 0.45, 1.0),
                 ..Default::default()
             },
@@ -1393,21 +1386,23 @@ mod tests {
     #[test]
     fn font_registration_invalidates_layouts_and_distinguishes_requested_instances() {
         let backend = Arc::new(
-            ParleyTextSystem::new_with_system_font(SystemFonts::Skip, "IBM Plex Sans")
-                .with_fallback_families(["IBM Plex Sans"]),
+            ParleyTextSystem::new_with_system_font(SystemFonts::Skip, IBM_PLEX.family)
+                .with_fallback_families([IBM_PLEX.family]),
         );
-        backend.add_fonts(vec![Cow::Borrowed(IBM_PLEX)]).unwrap();
+        backend
+            .add_fonts(vec![Cow::Borrowed(IBM_PLEX.data)])
+            .unwrap();
         let text_system = Arc::new(TextSystem::new(backend.clone()));
         let window_text_system = WindowTextSystem::new(text_system);
         let text = "registered later";
-        let run = text_run(text, "Source Serif 4");
+        let run = text_run(text, SOURCE_SERIF.family);
         let before = window_text_system
             .shape_text(text, px(18.0), std::slice::from_ref(&run), None, None)
             .unwrap();
         let fallback_id = before.paint_fragments[0].font_id;
 
         backend
-            .add_fonts(vec![Cow::Borrowed(SOURCE_SERIF)])
+            .add_fonts(vec![Cow::Borrowed(SOURCE_SERIF.data)])
             .unwrap();
         let after = window_text_system
             .shape_text(text, px(18.0), &[run], None, None)
@@ -1415,17 +1410,17 @@ mod tests {
         assert_ne!(fallback_id, after.paint_fragments[0].font_id);
 
         backend
-            .add_fonts(vec![Cow::Borrowed(IBM_PLEX_SEMIBOLD)])
+            .add_fonts(vec![Cow::Borrowed(IBM_PLEX_SEMIBOLD.data)])
             .unwrap();
-        let regular = backend.font_id(&font("IBM Plex Sans")).unwrap();
-        let bold = backend.font_id(&font("IBM Plex Sans").bold()).unwrap();
+        let regular = backend.font_id(&font(IBM_PLEX.family)).unwrap();
+        let bold = backend.font_id(&font(IBM_PLEX.family).bold()).unwrap();
         assert_ne!(regular, bold);
 
-        let mut variable = font("Source Serif 4");
+        let mut variable = font(SOURCE_SERIF.family);
         variable.weight = FontWeight(725.0);
         variable.style = FontStyle::Oblique;
         let variable_id = backend.font_id(&variable).unwrap();
-        let source_serif_regular = backend.font_id(&font("Source Serif 4")).unwrap();
+        let source_serif_regular = backend.font_id(&font(SOURCE_SERIF.family)).unwrap();
         assert_ne!(source_serif_regular, variable_id);
     }
 
@@ -1433,7 +1428,7 @@ mod tests {
     fn native_interaction_handles_bidi_atomic_clusters_and_semantic_selection() {
         let system = test_system();
         for text in ["👩🏽‍💻", "👨‍👩‍👧‍👦", "🇬🇧", "ก้"] {
-            let layout = layout_line(&system, text, px(22.0), &[text_run(text, "IBM Plex Sans")]);
+            let layout = layout_line(&system, text, px(22.0), &[text_run(text, IBM_PLEX.family)]);
             let wrapped = wrapped(layout, px(500.0));
             assert_eq!(
                 wrapped.logical_cluster_after(CaretPosition::default()),
@@ -1448,7 +1443,7 @@ mod tests {
                 &system,
                 single_line_text,
                 px(20.0),
-                &[text_run(single_line_text, "IBM Plex Sans")],
+                &[text_run(single_line_text, IBM_PLEX.family)],
             ),
             px(500.0),
         );
@@ -1482,7 +1477,7 @@ mod tests {
                 &system,
                 text,
                 px(20.0),
-                &[text_run(text, "IBM Plex Sans")],
+                &[text_run(text, IBM_PLEX.family)],
                 px(90.0),
                 None,
             ),
@@ -1562,7 +1557,7 @@ mod tests {
             &system,
             "1 1",
             px(24.0),
-            &[text_run("1 1", "Noto Color Emoji")],
+            &[text_run("1 1", NOTO_COLOR_EMOJI.family)],
         );
         let color_flags = mixed_color_face
             .paint_fragments
@@ -1589,7 +1584,7 @@ mod tests {
             ),
         ] {
             let expect_color = mode == GlyphRenderMode::Color;
-            let layout = layout_line(&system, text, px(24.0), &[text_run(text, "IBM Plex Sans")]);
+            let layout = layout_line(&system, text, px(24.0), &[text_run(text, IBM_PLEX.family)]);
             let glyph = layout
                 .paint_fragments
                 .iter()
@@ -1653,10 +1648,12 @@ mod tests {
         let seen = Arc::new(Mutex::new(None));
         let system = ParleyTextSystem::new_with_rasterizer(
             SystemFonts::Skip,
-            "Source Serif 4",
+            SOURCE_SERIF.family,
             RecordingRasterizer { seen: seen.clone() },
         );
-        system.add_fonts(vec![Cow::Borrowed(SOURCE_SERIF)]).unwrap();
+        system
+            .add_fonts(vec![Cow::Borrowed(SOURCE_SERIF.data)])
+            .unwrap();
 
         let text = "A";
         let layout = layout_line(
@@ -1665,7 +1662,7 @@ mod tests {
             px(22.0),
             &[TextRun {
                 len: text.len(),
-                font: font("Source Serif 4").bold().italic(),
+                font: font(SOURCE_SERIF.family).bold().italic(),
                 ..Default::default()
             }],
         );
@@ -1727,7 +1724,7 @@ mod tests {
             *self.seen.lock() = Some(SeenRasterFace {
                 font_id: face.font_id,
                 face_index: face.face_index,
-                data_matches: face.data == SOURCE_SERIF,
+                data_matches: face.data == SOURCE_SERIF.data,
                 variations: face.variations.to_vec(),
                 synthesis: face.synthesis,
                 has_color_glyphs: face.has_color_glyphs,

@@ -200,21 +200,16 @@ fn resolve(state: &mut CatalogState, request: &FaceRequest<'_>) -> Option<Resolv
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const IBM_PLEX: &[u8] =
-        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-    const IBM_PLEX_SEMIBOLD_ITALIC: &[u8] =
-        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf");
-    const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
+    use crate::font_fixtures::{IBM_PLEX, IBM_PLEX_SEMIBOLD_ITALIC, LILEX};
 
     #[test]
     fn registered_fonts_are_enumerated_and_resolved() {
         let catalog = FontCatalog::new(SystemFonts::Skip);
         catalog
             .register_fonts(vec![
-                Cow::Borrowed(IBM_PLEX),
-                Cow::Borrowed(IBM_PLEX_SEMIBOLD_ITALIC),
-                Cow::Borrowed(LILEX),
+                Cow::Borrowed(IBM_PLEX.data),
+                Cow::Borrowed(IBM_PLEX_SEMIBOLD_ITALIC.data),
+                Cow::Borrowed(LILEX.data),
             ])
             .unwrap();
 
@@ -222,29 +217,29 @@ mod tests {
 
         let latin = catalog
             .resolve(&FaceRequest {
-                families: &[FaceFamily::Named("IBM Plex Sans")],
+                families: &[FaceFamily::Named(IBM_PLEX.family)],
                 weight: 400.0,
                 style: gpui::FontStyle::Normal,
                 character: Some('m'),
             })
             .unwrap();
-        assert_eq!(latin.data.as_ref(), IBM_PLEX);
+        assert_eq!(latin.data.as_ref(), IBM_PLEX.data);
         assert_eq!(latin.index, 0);
 
         let semibold_italic = catalog
             .resolve(&FaceRequest {
-                families: &[FaceFamily::Named("IBM Plex Sans")],
+                families: &[FaceFamily::Named(IBM_PLEX_SEMIBOLD_ITALIC.family)],
                 weight: 600.0,
                 style: gpui::FontStyle::Italic,
                 character: None,
             })
             .unwrap();
-        assert_eq!(semibold_italic.data.as_ref(), IBM_PLEX_SEMIBOLD_ITALIC);
+        assert_eq!(semibold_italic.data.as_ref(), IBM_PLEX_SEMIBOLD_ITALIC.data);
 
         assert!(
             catalog
                 .resolve(&FaceRequest {
-                    families: &[FaceFamily::Named("IBM Plex Sans")],
+                    families: &[FaceFamily::Named(IBM_PLEX.family)],
                     weight: 400.0,
                     style: gpui::FontStyle::Normal,
                     character: Some('\u{1F9A5}'),
@@ -256,19 +251,24 @@ mod tests {
     #[test]
     fn font_registration_is_atomic() {
         let catalog = FontCatalog::new(SystemFonts::Skip);
-        catalog.register_fonts(vec![Cow::Borrowed(LILEX)]).unwrap();
+        catalog
+            .register_fonts(vec![Cow::Borrowed(LILEX.data)])
+            .unwrap();
         let families_before = catalog.family_names();
 
         assert!(
             catalog
-                .register_fonts(vec![Cow::Borrowed(IBM_PLEX), Cow::Borrowed(b"not a font")])
+                .register_fonts(vec![
+                    Cow::Borrowed(IBM_PLEX.data),
+                    Cow::Borrowed(b"not a font"),
+                ])
                 .is_err()
         );
         assert_eq!(catalog.family_names(), families_before);
         assert!(
             catalog
                 .resolve(&FaceRequest {
-                    families: &[FaceFamily::Named("IBM Plex Sans")],
+                    families: &[FaceFamily::Named(IBM_PLEX.family)],
                     weight: 400.0,
                     style: gpui::FontStyle::Normal,
                     character: None,
