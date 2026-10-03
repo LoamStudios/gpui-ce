@@ -701,17 +701,18 @@ impl PlatformWindow for WindowsWindow {
         // Windows exposes its emoji picker through Win+period. Temporarily
         // release the action's modifiers (e.g. Ctrl+Space) so they don't change
         // that shortcut, then restore them in the same input batch.
-        let held_modifiers = [
+        const MODIFIER_KEYS: [VIRTUAL_KEY; 6] = [
             VK_LCONTROL,
             VK_RCONTROL,
             VK_LSHIFT,
             VK_RSHIFT,
             VK_LMENU,
             VK_RMENU,
-        ]
-        .into_iter()
-        .filter(|key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0)
-        .collect::<Vec<_>>();
+        ];
+        let held_modifiers = MODIFIER_KEYS
+            .into_iter()
+            .filter(|key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0)
+            .collect::<Vec<_>>();
         let win_held = [VK_LWIN, VK_RWIN]
             .into_iter()
             .any(|key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0);
