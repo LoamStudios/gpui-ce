@@ -4,18 +4,31 @@ use smol::process::Command;
 type PaletteCommand<'a> = (&'a str, &'a [&'a str]);
 
 fn palette_commands(desktop: &str) -> [PaletteCommand<'static>; 5] {
-    let plasma = ("plasma-emojier", &[] as &[_]);
-    let legacy_plasma = ("ibus-ui-emojier-plasma", &[] as &[_]);
-    let ibus = ("ibus", &["emoji"] as &[_]);
-    let characters = ("gnome-characters", &[] as &[_]);
-    let kcharselect = ("kcharselect", &[] as &[_]);
+    macro_rules! palette_command {
+        ($name:ident, $program:literal $(, $argument:literal)*) => {
+            const $name: PaletteCommand<'static> = ($program, &[$($argument),*]);
+        };
+    }
+
+    // Upstream sources for the executable names:
+    // [plasma-emojier](https://github.com/KDE/plasma-desktop/blob/master/emojier/app/CMakeLists.txt#L1),
+    // [ibus-ui-emojier-plasma (legacy name)](https://github.com/KDE/plasma-desktop/blob/902cb77151e29e77b90c35bb7b9c2a265d2901aa/applets/kimpanel/backend/ibus/emojier/app/CMakeLists.txt#L1),
+    // [ibus emoji command](https://github.com/ibus/ibus/blob/main/tools/ibus.1.in#L118-L125),
+    // [gnome-characters symlink](https://github.com/GNOME/gnome-characters/blob/main/src/meson.build#L16-L20),
+    // [kcharselect](https://github.com/KDE/kcharselect/blob/master/CMakeLists.txt#L52-L54).
+    palette_command!(PLASMA, "plasma-emojier");
+    palette_command!(LEGACY_PLASMA, "ibus-ui-emojier-plasma");
+    palette_command!(IBUS, "ibus", "emoji");
+    palette_command!(GNOME_CHARACTERS, "gnome-characters");
+    palette_command!(KCHARSELECT, "kcharselect");
+
     if desktop
         .split(':')
         .any(|name| name.eq_ignore_ascii_case("KDE"))
     {
-        [plasma, legacy_plasma, ibus, characters, kcharselect]
+        [PLASMA, LEGACY_PLASMA, IBUS, GNOME_CHARACTERS, KCHARSELECT]
     } else {
-        [characters, ibus, plasma, legacy_plasma, kcharselect]
+        [GNOME_CHARACTERS, IBUS, PLASMA, LEGACY_PLASMA, KCHARSELECT]
     }
 }
 
