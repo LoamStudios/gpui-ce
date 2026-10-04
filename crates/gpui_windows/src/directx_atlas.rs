@@ -11,7 +11,7 @@ use windows::Win32::Graphics::{
 
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
-    GlyphAtlasEntry, PlatformAtlas, Point, RasterizedGlyph, RenderGlyphParams, Size,
+    GlyphAtlasEntry, PlatformAtlas, Point, RenderGlyphParams, Size, ValidatedRasterizedGlyph,
 };
 
 pub(crate) struct DirectXAtlas(Mutex<DirectXAtlasState>);
@@ -108,7 +108,7 @@ impl PlatformAtlas for DirectXAtlas {
     fn get_or_insert_glyph_with(
         &self,
         params: &RenderGlyphParams,
-        build: &mut dyn FnMut() -> anyhow::Result<RasterizedGlyph>,
+        build: &mut dyn FnMut() -> anyhow::Result<ValidatedRasterizedGlyph>,
     ) -> anyhow::Result<GlyphAtlasEntry> {
         let mut lock = self.0.lock();
         if let Some(entry) = lock.glyph_entries.get(params) {
@@ -116,7 +116,6 @@ impl PlatformAtlas for DirectXAtlas {
         }
 
         let glyph = build()?;
-        glyph.validate()?;
         let tile = if glyph.size == Size::default() {
             None
         } else {

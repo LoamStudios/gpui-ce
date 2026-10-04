@@ -3,7 +3,7 @@ use collections::FxHashMap;
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
-    GlyphAtlasEntry, PlatformAtlas, Point, RasterizedGlyph, RenderGlyphParams, Size,
+    GlyphAtlasEntry, PlatformAtlas, Point, RenderGlyphParams, Size, ValidatedRasterizedGlyph,
 };
 use parking_lot::Mutex;
 use std::{borrow::Cow, ops, sync::Arc};
@@ -150,7 +150,7 @@ impl PlatformAtlas for WgpuAtlas {
     fn get_or_insert_glyph_with(
         &self,
         params: &RenderGlyphParams,
-        build: &mut dyn FnMut() -> Result<RasterizedGlyph>,
+        build: &mut dyn FnMut() -> Result<ValidatedRasterizedGlyph>,
     ) -> Result<GlyphAtlasEntry> {
         let mut lock = self.0.lock();
         if let Some(entry) = lock.glyph_entries.get(params) {
@@ -158,7 +158,6 @@ impl PlatformAtlas for WgpuAtlas {
         }
 
         let glyph = build()?;
-        glyph.validate()?;
         let tile = if glyph.size == Size::default() {
             None
         } else {

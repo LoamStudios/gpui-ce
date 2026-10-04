@@ -4,7 +4,7 @@ use derive_more::{Deref, DerefMut};
 use etagere::BucketedAtlasAllocator;
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
-    GlyphAtlasEntry, PlatformAtlas, Point, RasterizedGlyph, RenderGlyphParams, Size,
+    GlyphAtlasEntry, PlatformAtlas, Point, RenderGlyphParams, Size, ValidatedRasterizedGlyph,
 };
 use metal::Device;
 use parking_lot::Mutex;
@@ -64,7 +64,7 @@ impl PlatformAtlas for MetalAtlas {
     fn get_or_insert_glyph_with(
         &self,
         params: &RenderGlyphParams,
-        build: &mut dyn FnMut() -> Result<RasterizedGlyph>,
+        build: &mut dyn FnMut() -> Result<ValidatedRasterizedGlyph>,
     ) -> Result<GlyphAtlasEntry> {
         let mut lock = self.0.lock();
         if let Some(entry) = lock.glyph_entries.get(params) {
@@ -72,7 +72,6 @@ impl PlatformAtlas for MetalAtlas {
         }
 
         let glyph = build()?;
-        glyph.validate()?;
         let tile = if glyph.size == Size::default() {
             None
         } else {

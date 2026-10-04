@@ -236,11 +236,10 @@ impl TextSystem {
     }
 
     /// Rasterizes a glyph and validates its placement and pixel buffer.
-    pub fn rasterize_glyph(&self, params: &RenderGlyphParams) -> Result<RasterizedGlyph> {
+    pub fn rasterize_glyph(&self, params: &RenderGlyphParams) -> Result<ValidatedRasterizedGlyph> {
         let glyph = self.platform_text_system.rasterize_glyph(params)?;
-        glyph.validate()?;
 
-        Ok(glyph)
+        ValidatedRasterizedGlyph::new(glyph)
     }
 
     /// Normalizes a requested scene color and render mode into the settings which affect the
@@ -784,7 +783,7 @@ pub enum RasterizedGlyphFormat {
     BgraColor,
 }
 
-/// A glyph raster ready for insertion into a renderer atlas.
+/// A glyph raster produced by a platform rasterizer.
 #[derive(Clone, Debug)]
 pub struct RasterizedGlyph {
     /// Placement relative to the glyph's baseline origin.
@@ -816,18 +815,21 @@ impl RasterizedGlyph {
             self.bounds.size,
             self.size
         );
+
         let width: usize = self
             .size
             .width
             .0
             .try_into()
             .map_err(|_| anyhow::anyhow!("glyph raster width is negative"))?;
+
         let height: usize = self
             .size
             .height
             .0
             .try_into()
             .map_err(|_| anyhow::anyhow!("glyph raster height is negative"))?;
+
         if width == 0 || height == 0 {
             anyhow::ensure!(
                 width == 0 && height == 0 && self.pixels.is_empty(),
@@ -835,6 +837,7 @@ impl RasterizedGlyph {
             );
             return Ok(());
         }
+
         let bytes_per_pixel = match self.format {
             RasterizedGlyphFormat::AlphaMask => 1,
             RasterizedGlyphFormat::BgraSubpixelMask | RasterizedGlyphFormat::BgraColor => 4,
@@ -843,6 +846,7 @@ impl RasterizedGlyph {
             .checked_mul(height)
             .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
             .ok_or_else(|| anyhow::anyhow!("glyph raster byte count overflow"))?;
+
         anyhow::ensure!(
             self.pixels.len() == expected_len,
             "glyph raster format {:?} requires {expected_len} bytes for {}x{}, got {}",
@@ -851,7 +855,21 @@ impl RasterizedGlyph {
             height,
             self.pixels.len()
         );
+
         Ok(())
+    }
+}
+
+/// A glyph raster whose placement and pixel buffer have passed validation.
+#[derive(Clone, Debug, Deref)]
+pub struct ValidatedRasterizedGlyph(RasterizedGlyph);
+
+impl ValidatedRasterizedGlyph {
+    /// Validates a glyph raster before it can be used by an atlas builder.
+    pub fn new(glyph: RasterizedGlyph) -> Result<Self> {
+        glyph.validate()?;
+
+        Ok(Self(glyph))
     }
 }
 
@@ -1393,7 +1411,7 @@ mod raster_contract_tests {
         let mut build = || {
             builds += 1;
 
-            Ok(RasterizedGlyph::empty(RasterizedGlyphFormat::AlphaMask))
+            ValidatedRasterizedGlyph::new(RasterizedGlyph::empty(RasterizedGlyphFormat::AlphaMask))
         };
 
         let first = atlas.get_or_insert_glyph_with(&params, &mut build).unwrap();
@@ -1401,6 +1419,36 @@ mod raster_contract_tests {
         assert_eq!(first, second);
         assert!(first.tile.is_none());
         assert_eq!(builds, 1);
+    }
+
+    #[test]
+    fn custom_glyph_builders_validate_before_caching() {
+        let atlas = TestAtlas::new();
+        let params = params(PreparedRasterStyle::independent(GlyphRenderMode::Grayscale));
+        let mut builds = 0;
+        let mut build = || {
+            builds += 1;
+            let size = size(DevicePixels(1), DevicePixels(1));
+            let pixels = if builds == 1 { Vec::new() } else { vec![255] };
+
+            ValidatedRasterizedGlyph::new(RasterizedGlyph {
+                bounds: Bounds {
+                    origin: Point::default(),
+                    size,
+                },
+                size,
+                format: RasterizedGlyphFormat::AlphaMask,
+                pixels,
+            })
+        };
+
+        assert!(atlas.get_or_insert_glyph_with(&params, &mut build).is_err());
+
+        let first = atlas.get_or_insert_glyph_with(&params, &mut build).unwrap();
+        let second = atlas.get_or_insert_glyph_with(&params, &mut build).unwrap();
+        assert_eq!(first, second);
+        assert!(first.tile.is_some());
+        assert_eq!(builds, 2);
     }
 
     #[derive(Default)]

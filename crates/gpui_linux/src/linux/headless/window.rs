@@ -18,8 +18,9 @@ use gpui::{
     AtlasKey, AtlasTextureId, AtlasTile, Bounds, Capslock, DevicePixels, DispatchEventResult,
     DisplayId, GlyphAtlasEntry, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RasterizedGlyph, RenderGlyphParams, RequestFrameOptions, Scene, Size, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, px,
+    RenderGlyphParams, RequestFrameOptions, Scene, Size, TileId, ValidatedRasterizedGlyph,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    px,
 };
 
 #[derive(Debug)]
@@ -299,14 +300,13 @@ impl PlatformAtlas for HeadlessAtlas {
     fn get_or_insert_glyph_with(
         &self,
         params: &RenderGlyphParams,
-        build: &mut dyn FnMut() -> anyhow::Result<RasterizedGlyph>,
+        build: &mut dyn FnMut() -> anyhow::Result<ValidatedRasterizedGlyph>,
     ) -> anyhow::Result<GlyphAtlasEntry> {
         if let Some(&entry) = self.0.lock().glyph_entries.get(params) {
             return Ok(entry);
         }
 
         let glyph = build()?;
-        glyph.validate()?;
 
         let mut state = self.0.lock();
         let tile = if glyph.size == Size::default() {

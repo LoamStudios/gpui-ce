@@ -2,9 +2,9 @@ use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
     DispatchEventResult, GlyphAtlasEntry, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RasterizedGlyph, RenderGlyphParams, RequestFrameOptions, Scene, Size,
-    TestPlatform, TextInputConfiguration, TextInputStateChange, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    PromptButton, RenderGlyphParams, RequestFrameOptions, Scene, Size, TestPlatform,
+    TextInputConfiguration, TextInputStateChange, TileId, ValidatedRasterizedGlyph,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use gpui_util::ResultExt as _;
@@ -571,14 +571,13 @@ impl PlatformAtlas for TestAtlas {
     fn get_or_insert_glyph_with(
         &self,
         params: &RenderGlyphParams,
-        build: &mut dyn FnMut() -> anyhow::Result<RasterizedGlyph>,
+        build: &mut dyn FnMut() -> anyhow::Result<ValidatedRasterizedGlyph>,
     ) -> anyhow::Result<GlyphAtlasEntry> {
         if let Some(&entry) = self.0.lock().glyph_entries.get(params) {
             return Ok(entry);
         }
 
         let glyph = build()?;
-        glyph.validate()?;
 
         let mut state = self.0.lock();
         let tile = if glyph.size == Size::default() {
