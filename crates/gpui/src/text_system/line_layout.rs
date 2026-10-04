@@ -156,13 +156,13 @@ pub fn align_inline_boxes(
         .collect::<FxHashMap<_, _>>();
     let mut boxes_by_line = vec![Vec::new(); lines.len()];
 
-    for (box_idx, inline_box) in boxes.iter().enumerate() {
+    for (box_index, inline_box) in boxes.iter().enumerate() {
         if let Some(line_boxes) = boxes_by_line.get_mut(inline_box.line_index) {
             let align = request_alignments
                 .get(&inline_box.id)
                 .copied()
                 .unwrap_or(VerticalAlign::Baseline);
-            line_boxes.push((box_idx, align));
+            line_boxes.push((box_index, align));
         }
     }
 
@@ -180,8 +180,8 @@ pub fn align_inline_boxes(
         let mut top_box_height = Pixels::ZERO;
         let mut bottom_box_height = Pixels::ZERO;
 
-        for &(box_idx, align) in &boxes_by_line[line_index] {
-            let inline_box = &boxes[box_idx];
+        for &(box_index, align) in &boxes_by_line[line_index] {
+            let inline_box = &boxes[box_index];
             expand_inline_line_for_box(
                 &mut top,
                 &mut bottom,
@@ -199,8 +199,8 @@ pub fn align_inline_boxes(
         line.size.height = bottom - top;
         line.baseline = -top;
 
-        for &(box_idx, align) in &boxes_by_line[line_index] {
-            let inline_box = &mut boxes[box_idx];
+        for &(box_index, align) in &boxes_by_line[line_index] {
+            let inline_box = &mut boxes[box_index];
             inline_box.bounds.origin.y =
                 line_y + aligned_inline_box_y(*line, metrics, inline_box.bounds.size.height, align);
         }
