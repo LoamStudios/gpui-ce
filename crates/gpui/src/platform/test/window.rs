@@ -503,6 +503,31 @@ pub(crate) struct TestAtlasState {
 
 pub(crate) struct TestAtlas(Mutex<TestAtlasState>);
 
+impl TestAtlasState {
+    fn insert_tile(&mut self, key: AtlasKey, size: Size<DevicePixels>) -> AtlasTile {
+        self.next_id += 1;
+        let texture_id = self.next_id;
+        self.next_id += 1;
+        let tile_id = self.next_id;
+        let tile = AtlasTile {
+            texture_id: AtlasTextureId {
+                index: texture_id,
+                kind: key.texture_kind(),
+            },
+            tile_id: TileId(tile_id),
+            padding: 0,
+            bounds: Bounds {
+                origin: Point::default(),
+                size,
+            },
+        };
+
+        self.tiles.insert(key, tile);
+
+        tile
+    }
+}
+
 impl TestAtlas {
     pub fn new() -> Self {
         TestAtlas(Mutex::new(TestAtlasState {
@@ -539,28 +564,8 @@ impl PlatformAtlas for TestAtlas {
         };
 
         let mut state = self.0.lock();
-        state.next_id += 1;
-        let texture_id = state.next_id;
-        state.next_id += 1;
-        let tile_id = state.next_id;
 
-        state.tiles.insert(
-            key.clone(),
-            crate::AtlasTile {
-                texture_id: AtlasTextureId {
-                    index: texture_id,
-                    kind: key.texture_kind(),
-                },
-                tile_id: TileId(tile_id),
-                padding: 0,
-                bounds: crate::Bounds {
-                    origin: Point::default(),
-                    size,
-                },
-            },
-        );
-
-        Ok(Some(state.tiles[key]))
+        Ok(Some(state.insert_tile(key.clone(), size)))
     }
 
     fn get_or_insert_glyph_with(
@@ -579,28 +584,11 @@ impl PlatformAtlas for TestAtlas {
         let tile = if glyph.size == Size::default() {
             None
         } else {
-            state.next_id += 1;
-            let texture_id = state.next_id;
-            state.next_id += 1;
-            let tile_id = state.next_id;
-            let tile = AtlasTile {
-                texture_id: AtlasTextureId {
-                    index: texture_id,
-                    kind: AtlasKey::from((params.clone(), glyph.format)).texture_kind(),
-                },
-                tile_id: TileId(tile_id),
-                padding: 0,
-                bounds: Bounds {
-                    origin: Point::default(),
-                    size: glyph.size,
-                },
-            };
-            state
-                .tiles
-                .insert((params.clone(), glyph.format).into(), tile);
+            let key = (params.clone(), glyph.format).into();
 
-            Some(tile)
+            Some(state.insert_tile(key, glyph.size))
         };
+
         let entry = GlyphAtlasEntry {
             tile,
             bounds: glyph.bounds,
