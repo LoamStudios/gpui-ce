@@ -1513,13 +1513,11 @@ mod tests {
 
         fn em_width(&self, font_size: Pixels) -> Pixels {
             let metrics = self.font_metrics(FontId(0));
+            let advance = self
+                .advance(FontId(0), self.glyph_for_char(FontId(0), 'm').unwrap())
+                .unwrap();
 
-            font_size
-                * self
-                    .advance(FontId(0), self.glyph_for_char(FontId(0), 'm').unwrap())
-                    .unwrap()
-                    .width
-                / metrics.units_per_em as f32
+            font_size * advance.width / metrics.units_per_em as f32
         }
     }
 
