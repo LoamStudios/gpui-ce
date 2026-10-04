@@ -154,21 +154,27 @@ pub fn align_inline_boxes(
         .iter()
         .map(|request| (request.id, request.vertical_align))
         .collect::<FxHashMap<_, _>>();
-    let mut boxes_by_line = vec![Vec::new(); lines.len()];
+    let mut boxes_by_line: FxHashMap<_, Vec<_>> = FxHashMap::default();
 
-    for (box_index, inline_box) in boxes.iter().enumerate() {
-        if let Some(line_boxes) = boxes_by_line.get_mut(inline_box.line_index) {
-            let align = request_alignments
-                .get(&inline_box.id)
-                .copied()
-                .unwrap_or(VerticalAlign::Baseline);
-            line_boxes.push((box_index, align));
-        }
+    for inline_box in boxes
+        .iter_mut()
+        .filter(|inline_box| inline_box.line_index < lines.len())
+    {
+        let align = request_alignments
+            .get(&inline_box.id)
+            .copied()
+            .unwrap_or(VerticalAlign::Baseline);
+
+        boxes_by_line
+            .entry(inline_box.line_index)
+            .or_default()
+            .push((inline_box, align));
     }
 
     let mut line_y = Pixels::ZERO;
 
     for (line_index, line) in lines.iter_mut().enumerate() {
+        let line_boxes = boxes_by_line.remove(&line_index).unwrap_or_default();
         let metrics = line_metrics
             .get(line_index)
             .copied()
@@ -180,8 +186,7 @@ pub fn align_inline_boxes(
         let mut top_box_height = Pixels::ZERO;
         let mut bottom_box_height = Pixels::ZERO;
 
-        for &(box_index, align) in &boxes_by_line[line_index] {
-            let inline_box = &boxes[box_index];
+        for (inline_box, align) in &line_boxes {
             expand_inline_line_for_box(
                 &mut top,
                 &mut bottom,
@@ -189,7 +194,7 @@ pub fn align_inline_boxes(
                 &mut bottom_box_height,
                 inline_box.bounds.size.height,
                 metrics,
-                align,
+                *align,
             );
         }
 
@@ -199,8 +204,7 @@ pub fn align_inline_boxes(
         line.size.height = bottom - top;
         line.baseline = -top;
 
-        for &(box_index, align) in &boxes_by_line[line_index] {
-            let inline_box = &mut boxes[box_index];
+        for (inline_box, align) in line_boxes {
             inline_box.bounds.origin.y =
                 line_y + aligned_inline_box_y(*line, metrics, inline_box.bounds.size.height, align);
         }
@@ -1428,6 +1432,7 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{point, px, size};
 
     #[test]
     fn caret_selection_endpoint_ordering_uses_byte_indices() {
@@ -1488,5 +1493,64 @@ mod tests {
                 "for_inserted_text({text:?})"
             );
         }
+    }
+
+    #[test]
+    fn inline_box_alignment_preserves_unsorted_boxes_and_empty_lines() {
+        let mut lines = [InlineVisualLine::default(); 3];
+        let mut boxes =
+            [(20, 2, 14.), (10, 0, 18.), (90, 3, 100.)].map(|(id, line_index, height)| {
+                PositionedInlineBox {
+                    id,
+                    line_index,
+                    bounds: Bounds::new(point(px(7.), px(99.)), size(px(5.), px(height))),
+                }
+            });
+        let mut layout_size = size(px(100.), px(999.));
+        let original_lines = lines;
+        let original_boxes = boxes;
+
+        let requests = [InlineBoxRequest {
+            id: 20,
+            index: 0,
+            size: boxes[0].bounds.size,
+            vertical_align: VerticalAlign::Top,
+        }];
+        let metrics = InlineTextMetrics {
+            ascent: px(8.),
+            descent: px(2.),
+            x_height: px(4.),
+        };
+
+        align_inline_boxes(
+            &mut lines,
+            &mut boxes,
+            &mut layout_size,
+            &requests,
+            &[metrics],
+            &[(px(-7.), px(3.)), (px(-11.), px(4.))],
+            metrics,
+            px(12.),
+        );
+
+        for ((line, mut expected_line), (origin_y, height, baseline)) in lines
+            .iter()
+            .zip(original_lines)
+            .zip([(0., 21., 18.), (21., 15., 11.), (36., 14., 9.)])
+        {
+            expected_line.origin.y = px(origin_y);
+            expected_line.size.height = px(height);
+            expected_line.baseline = px(baseline);
+            assert_eq!(*line, expected_line);
+        }
+
+        for ((inline_box, mut expected_box), origin_y) in
+            boxes.iter().zip(original_boxes).zip([36., 0., 99.])
+        {
+            expected_box.bounds.origin.y = px(origin_y);
+            assert_eq!(*inline_box, expected_box);
+        }
+
+        assert_eq!(layout_size, size(px(100.), px(50.)));
     }
 }
