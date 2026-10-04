@@ -10,26 +10,22 @@ use gpui::{
 };
 use std::borrow::Cow;
 
+#[allow(dead_code)]
+#[path = "../../gpui_ce_parley/src/font_fixtures.rs"]
+mod font_fixtures;
+
+use font_fixtures::{IBM_PLEX, NOTO_ARABIC, NOTO_COLOR_EMOJI, NOTO_HEBREW, SOURCE_SERIF};
+
 const BIDI_SAMPLE: &str =
     "שלום עולם\nمرحبا بالعالم\nabc אבג def\nx (مرحبا) y\nEnglish ثم عربي ثم English";
 
 fn fixture_fonts() -> Vec<Cow<'static, [u8]>> {
     vec![
-        Cow::Borrowed(include_bytes!(
-            "../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
-        )),
-        Cow::Borrowed(include_bytes!(
-            "../../../assets/fonts/noto-sans-arabic/NotoSansArabic-Regular.ttf"
-        )),
-        Cow::Borrowed(include_bytes!(
-            "../../../assets/fonts/noto-sans-hebrew/NotoSansHebrew-Regular.ttf"
-        )),
-        Cow::Borrowed(include_bytes!(
-            "../../../assets/fonts/noto-color-emoji/NotoColorEmoji.subset.ttf"
-        )),
-        Cow::Borrowed(include_bytes!(
-            "../../../assets/fonts/source-serif-4/SourceSerif4[opsz,wght].ttf"
-        )),
+        Cow::Borrowed(IBM_PLEX.data),
+        Cow::Borrowed(NOTO_ARABIC.data),
+        Cow::Borrowed(NOTO_HEBREW.data),
+        Cow::Borrowed(NOTO_COLOR_EMOJI.data),
+        Cow::Borrowed(SOURCE_SERIF.data),
     ]
 }
 

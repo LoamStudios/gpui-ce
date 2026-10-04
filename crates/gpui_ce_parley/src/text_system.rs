@@ -2005,7 +2005,8 @@ impl PlatformTextSystem for ParleyTextSystem {
 mod tests {
     use super::*;
     use crate::font_fixtures::{
-        IBM_PLEX, IBM_PLEX_SEMIBOLD, LILEX, NOTO_COLOR_EMOJI, SOURCE_SERIF,
+        IBM_PLEX, IBM_PLEX_SEMIBOLD, LILEX, NOTO_ARABIC, NOTO_COLOR_EMOJI, NOTO_HEBREW,
+        SOURCE_SERIF,
     };
     use crate::{FontSynthesis, FontVariation, RasterFace};
     use gpui::{
@@ -2025,11 +2026,6 @@ mod tests {
         },
     };
 
-    const NOTO_ARABIC: &[u8] =
-        include_bytes!("../../../assets/fonts/noto-sans-arabic/NotoSansArabic-Regular.ttf");
-    const NOTO_HEBREW: &[u8] =
-        include_bytes!("../../../assets/fonts/noto-sans-hebrew/NotoSansHebrew-Regular.ttf");
-
     #[test]
     fn caret_affinity_round_trips_through_parley() {
         for affinity in [CaretAffinity::Downstream, CaretAffinity::Upstream] {
@@ -2047,8 +2043,8 @@ mod tests {
                     LILEX.family,
                     SOURCE_SERIF.family,
                     NOTO_COLOR_EMOJI.family,
-                    "Noto Sans Arabic",
-                    "Noto Sans Hebrew",
+                    NOTO_ARABIC.family,
+                    NOTO_HEBREW.family,
                 ]),
         );
         system
@@ -2058,8 +2054,8 @@ mod tests {
                 Cow::Borrowed(LILEX.data),
                 Cow::Borrowed(SOURCE_SERIF.data),
                 Cow::Borrowed(NOTO_COLOR_EMOJI.data),
-                Cow::Borrowed(NOTO_ARABIC),
-                Cow::Borrowed(NOTO_HEBREW),
+                Cow::Borrowed(NOTO_ARABIC.data),
+                Cow::Borrowed(NOTO_HEBREW.data),
             ])
             .unwrap();
         system
