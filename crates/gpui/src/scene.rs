@@ -12,6 +12,7 @@ use smallvec::SmallVec;
 use std::{
     fmt::Debug,
     iter::Peekable,
+    mem,
     ops::{Add, Range, Sub},
     slice,
 };
@@ -76,6 +77,8 @@ pub struct Scene {
     pub filter_boundaries: Vec<FilterBoundary>,
     render_plan: ScenePlan,
     is_finished: bool,
+    /// Scratch space for [`Self::replay_run_at`], kept to reuse its allocation.
+    replay_run: Vec<ReplayOperation>,
 }
 
 #[expect(missing_docs)]
@@ -174,6 +177,16 @@ impl Scene {
                 .copied()
                 .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds))
         };
+        self.push_primitive(primitive, order, surface_opacity);
+    }
+
+    /// Stores `primitive` at `order`, which has been assigned already.
+    fn push_primitive(
+        &mut self,
+        mut primitive: Primitive,
+        order: DrawOrder,
+        surface_opacity: Option<f32>,
+    ) {
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -264,7 +277,11 @@ impl Scene {
         offset: Point<ScaledPixels>,
         content_mask: &ContentMask<ScaledPixels>,
     ) {
-        for operation in &prev_scene.paint_operations[range] {
+        let operations = &prev_scene.paint_operations[range];
+        if self.replay_run_at(operations, offset, content_mask) {
+            return;
+        }
+        for operation in operations {
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     let mut primitive = primitive.clone();
@@ -283,6 +300,92 @@ impl Scene {
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
+    }
+
+    /// Replays `operations` as [`Self::replay_at`] does, but orders them with
+    /// one search of the bounds tree instead of one per primitive: they keep
+    /// the orders they had among themselves, shifted together above whatever
+    /// they now overlap. A layer's primitives already carry the layer's order,
+    /// so layers are replayed as they are. Returns `false`, having done
+    /// nothing, when this cannot keep the stacking — inside a layer, whose
+    /// order every primitive must take, or for content-filter groups, which
+    /// are ordered above everything — so the caller replays one by one.
+    fn replay_run_at(
+        &mut self,
+        operations: &[PaintOperation],
+        offset: Point<ScaledPixels>,
+        content_mask: &ContentMask<ScaledPixels>,
+    ) -> bool {
+        if !self.layer_stack.is_empty()
+            || operations.iter().any(|operation| {
+                matches!(
+                    operation,
+                    PaintOperation::Primitive(Primitive::FilterBoundary(_))
+                )
+            })
+        {
+            return false;
+        }
+
+        let mut run = mem::take(&mut self.replay_run);
+        run.clear();
+        let mut bounds: Option<Bounds<ScaledPixels>> = None;
+        let mut cover = |clipped: Bounds<ScaledPixels>| {
+            bounds = Some(bounds.map_or(clipped, |bounds| bounds.union(&clipped)));
+        };
+        let (mut first, mut last) = (DrawOrder::MAX, DrawOrder::MIN);
+        for operation in operations {
+            let (mut primitive, surface_opacity) = match operation {
+                PaintOperation::Primitive(primitive) => (primitive.clone(), None),
+                PaintOperation::Surface { surface, opacity } => {
+                    (Primitive::Surface(surface.clone()), Some(*opacity))
+                }
+                PaintOperation::StartLayer(layer) => {
+                    let layer = *layer + offset;
+                    cover(layer.intersect(&content_mask.bounds));
+                    run.push(ReplayOperation::StartLayer(layer));
+                    continue;
+                }
+                PaintOperation::EndLayer => {
+                    run.push(ReplayOperation::EndLayer);
+                    continue;
+                }
+            };
+            primitive.translate(offset, content_mask);
+            let clipped = primitive
+                .bounds()
+                .intersect(&primitive.content_mask().bounds);
+            if clipped.is_empty() {
+                continue;
+            }
+            let order = primitive.order();
+            first = first.min(order);
+            last = last.max(order);
+            cover(clipped);
+            run.push(ReplayOperation::Primitive(primitive, surface_opacity));
+        }
+
+        self.is_finished = false;
+        let base = match bounds {
+            Some(bounds) if first <= last => self.primitive_bounds.insert_run(bounds, last - first),
+            _ => 0,
+        };
+        for operation in run.drain(..) {
+            match operation {
+                ReplayOperation::Primitive(primitive, surface_opacity) => {
+                    let order = base + (primitive.order() - first);
+                    self.push_primitive(primitive, order, surface_opacity);
+                }
+                // Recorded so that this frame can be replayed in turn; the
+                // orders inside were assigned above.
+                ReplayOperation::StartLayer(layer) => self
+                    .paint_operations
+                    .push(PaintOperation::StartLayer(layer)),
+                ReplayOperation::EndLayer => self.paint_operations.push(PaintOperation::EndLayer),
+            }
+        }
+        self.replay_run = run;
+        true
     }
 
     pub fn finish(&mut self) {
@@ -429,6 +532,13 @@ pub(crate) enum PrimitiveKind {
     FilterBoundaryEnd,
 }
 
+/// A paint operation being replayed as part of a run, moved and clipped.
+enum ReplayOperation {
+    Primitive(Primitive, Option<f32>),
+    StartLayer(Bounds<ScaledPixels>),
+    EndLayer,
+}
+
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     Surface { surface: PaintSurface, opacity: f32 },
@@ -480,6 +590,22 @@ impl Primitive {
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::BackdropFilter(filter) => &filter.content_mask,
             Primitive::FilterBoundary(boundary) => &boundary.content_mask,
+        }
+    }
+
+    /// The draw order the primitive was given when it was inserted.
+    pub(crate) fn order(&self) -> DrawOrder {
+        match self {
+            Primitive::Shadow(shadow) => shadow.order,
+            Primitive::Quad(quad) => quad.order,
+            Primitive::Path(path) => path.order,
+            Primitive::Underline(underline) => underline.order,
+            Primitive::MonochromeSprite(sprite) => sprite.order,
+            Primitive::SubpixelSprite(sprite) => sprite.order,
+            Primitive::PolychromeSprite(sprite) => sprite.order,
+            Primitive::Surface(surface) => surface.order,
+            Primitive::BackdropFilter(filter) => filter.order,
+            Primitive::FilterBoundary(boundary) => boundary.order,
         }
     }
 
@@ -1419,6 +1545,152 @@ impl PathVertex<Pixels> {
 mod tests {
     use super::*;
     use crate::{AtlasTextureKind, DevicePixels, Point, ShaderBool, Size, SurfaceSource, TileId};
+
+    /// Replaying a recording as one run, with one search of the bounds tree,
+    /// stacks it as replaying it primitive by primitive does: every pair of
+    /// overlapping primitives — within the recording, between it and what it
+    /// is replayed over, and with what is painted after it — keeps its order,
+    /// and primitives sharing a layer keep sharing an order.
+    #[test]
+    fn a_replayed_run_keeps_the_stacking_of_a_primitive_by_primitive_replay() {
+        use rand::{Rng as _, SeedableRng as _};
+
+        for seed in 0..300 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let mut random_quad = |rng: &mut rand::rngs::StdRng| Quad {
+                bounds: Bounds {
+                    origin: point(
+                        sp(rng.random_range(0.0..300.0)),
+                        sp(rng.random_range(0.0..300.0)),
+                    ),
+                    size: Size {
+                        width: sp(rng.random_range(1.0..80.0)),
+                        height: sp(rng.random_range(1.0..80.0)),
+                    },
+                },
+                content_mask: ContentMask {
+                    bounds: Bounds {
+                        origin: point(sp(0.0), sp(0.0)),
+                        size: Size {
+                            width: sp(400.0),
+                            height: sp(400.0),
+                        },
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (before, recorded, beneath, after): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) = (
+                (0..rng.random_range(0..20))
+                    .map(|_| random_quad(&mut rng))
+                    .collect(),
+                (0..rng.random_range(1..30))
+                    .map(|_| random_quad(&mut rng))
+                    .collect(),
+                (0..rng.random_range(0..20))
+                    .map(|_| random_quad(&mut rng))
+                    .collect(),
+                (0..rng.random_range(0..10))
+                    .map(|_| random_quad(&mut rng))
+                    .collect(),
+            );
+            let offset = point(
+                sp(rng.random_range(-40.0..40.0)),
+                sp(rng.random_range(-40.0..40.0)),
+            );
+            let clip = ContentMask {
+                bounds: Bounds {
+                    origin: point(sp(20.0), sp(20.0)),
+                    size: Size {
+                        width: sp(300.0),
+                        height: sp(300.0),
+                    },
+                },
+                ..Default::default()
+            };
+
+            // The recording, made over other content in an earlier frame.
+            let mut rendered = Scene::default();
+            for quad in &before {
+                rendered.insert_primitive(*quad);
+            }
+            // Some of the recording is painted in layers, as text is, each
+            // covering what is painted in it.
+            let start = rendered.len();
+            let mut ix = 0;
+            while ix < recorded.len() {
+                let len = if rng.random_bool(0.3) {
+                    rng.random_range(1..=4).min(recorded.len() - ix)
+                } else {
+                    0
+                };
+                if len == 0 {
+                    rendered.insert_primitive(recorded[ix]);
+                    ix += 1;
+                    continue;
+                }
+                let group = &recorded[ix..ix + len];
+                let layer = group
+                    .iter()
+                    .skip(1)
+                    .fold(group[0].bounds, |bounds, quad| bounds.union(&quad.bounds));
+                rendered.push_layer(layer);
+                for quad in group {
+                    rendered.insert_primitive(*quad);
+                }
+                rendered.pop_layer();
+                ix += len;
+            }
+            let range = start..rendered.len();
+
+            let replay = |as_run: bool| {
+                let mut scene = Scene::default();
+                for quad in &beneath {
+                    scene.insert_primitive(*quad);
+                }
+                if as_run {
+                    scene.replay_at(range.clone(), &rendered, offset, &clip);
+                } else {
+                    for operation in &rendered.paint_operations[range.clone()] {
+                        match operation {
+                            PaintOperation::Primitive(primitive) => {
+                                let mut primitive = primitive.clone();
+                                primitive.translate(offset, &clip);
+                                scene.insert_primitive(primitive);
+                            }
+                            PaintOperation::StartLayer(bounds) => {
+                                scene.push_layer((*bounds + offset).intersect(&clip.bounds))
+                            }
+                            PaintOperation::EndLayer => scene.pop_layer(),
+                            PaintOperation::Surface { .. } => unreachable!(),
+                        }
+                    }
+                }
+                for quad in &after {
+                    scene.insert_primitive(*quad);
+                }
+                scene.quads
+            };
+            let (run, one_by_one) = (replay(true), replay(false));
+            assert_eq!(run.len(), one_by_one.len(), "seed {seed}");
+            for (i, a) in one_by_one.iter().enumerate() {
+                assert_eq!(run[i].bounds, a.bounds, "seed {seed}");
+                for (j, b) in one_by_one.iter().enumerate().skip(i + 1) {
+                    let overlap = a
+                        .bounds
+                        .intersect(&a.content_mask.bounds)
+                        .intersects(&b.bounds.intersect(&b.content_mask.bounds));
+                    if overlap {
+                        assert_eq!(
+                            run[i].order.cmp(&run[j].order),
+                            a.order.cmp(&b.order),
+                            "seed {seed}: quads {i} and {j} overlap and changed places"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_moved_transformation_turns_about_the_moved_point() {

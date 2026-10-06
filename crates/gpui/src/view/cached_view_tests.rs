@@ -576,3 +576,122 @@ fn cached_view_is_rendered_again_after_its_list_rolls_a_prepaint_back(cx: &mut T
     assert_eq!(renders.get(), 2);
     assert_eq!(quads(cx, window), vec![(50., 10., 100., 50.)]);
 }
+
+/// A canvas item: a bordered, rounded card with a few swatches and a label,
+/// so that it paints a dozen or so primitives as a real one would.
+struct CanvasItem {
+    index: usize,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for CanvasItem {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        let hue = (self.index * 37 % 360) as f32 / 360.0;
+        div()
+            .id("item")
+            .size_full()
+            .p(px(2.))
+            .flex()
+            .flex_wrap()
+            .gap(px(2.))
+            .bg(hsla(hue, 0.55, 0.62, 1.))
+            .border_1()
+            .border_color(hsla(hue, 0.6, 0.32, 1.))
+            .rounded(px(4.))
+            .on_mouse_down(MouseButton::Left, |_, _, _| {})
+            .text_size(px(8.))
+            .child(format!("{}", self.index))
+            .children((0..8).map(|swatch| {
+                div()
+                    .size(px(5.))
+                    .bg(hsla((hue + swatch as f32 / 8.) % 1., 0.6, 0.5, 1.))
+            }))
+    }
+}
+
+const CANVAS_COLUMNS: usize = 40;
+/// Rows that fit the test display's 1080px height.
+const CANVAS_ROWS: usize = 26;
+const CANVAS_PITCH: f32 = 38.;
+
+/// A 40×26 grid of cached items over a full-window background, shifted right
+/// by `pan`, which stays small enough that no item is clipped.
+struct PannedCanvas {
+    items: Vec<Entity<CanvasItem>>,
+    pan: Rc<Cell<f32>>,
+}
+
+impl Render for PannedCanvas {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let pan = self.pan.get();
+        div()
+            .size(px(1600.))
+            .relative()
+            .overflow_hidden()
+            .bg(hsla(0.12, 0.1, 0.96, 1.))
+            .children(self.items.iter().enumerate().map(|(ix, item)| {
+                let column = (ix % CANVAS_COLUMNS) as f32;
+                let row = (ix / CANVAS_COLUMNS) as f32;
+                let mut style = StyleRefinement::default();
+                style.position = Some(crate::Position::Absolute);
+                style.inset.left = Some(px(20. + column * CANVAS_PITCH + pan).into());
+                style.inset.top = Some(px(20. + row * CANVAS_PITCH).into());
+                style.size.width = Some(px(34.).into());
+                style.size.height = Some(px(34.).into());
+                item.clone().cached(style)
+            }))
+    }
+}
+
+/// Frame cost of panning a canvas of cached items back and forth: every item
+/// is reused where it moves to, so a frame replays their records.
+///
+/// `cargo test -p gpui-ce --release --lib cached_view_tests::panning_canvas_frame_cost -- --ignored --nocapture`
+#[crate::test]
+#[ignore = "prints timings; run by hand"]
+fn panning_canvas_frame_cost(cx: &mut TestAppContext) {
+    let pan = Rc::new(Cell::new(0.));
+    let renders = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let (pan, renders) = (pan.clone(), renders.clone());
+        move |_, cx| PannedCanvas {
+            items: (0..CANVAS_COLUMNS * CANVAS_ROWS)
+                .map(|index| {
+                    let renders = renders.clone();
+                    cx.new(|_| CanvasItem { index, renders })
+                })
+                .collect(),
+            pan,
+        }
+    });
+    let window = AnyWindowHandle::from(window);
+    let mut frame = |cx: &mut TestAppContext| {
+        pan.set((pan.get() + 3.) % 12.);
+        cx.update_window(window, |root, window, cx| {
+            root.downcast::<PannedCanvas>()
+                .unwrap()
+                .update(cx, |_, cx| cx.notify());
+            let started = std::time::Instant::now();
+            window.draw(cx).clear(cx);
+            started.elapsed()
+        })
+        .unwrap()
+    };
+    for _ in 0..5 {
+        frame(cx);
+    }
+    renders.set(0);
+    let frames = std::env::var("FRAMES").map_or(100, |frames| frames.parse().unwrap());
+    let mut samples: Vec<_> = (0..frames).map(|_| frame(cx)).collect();
+    samples.sort();
+    let operations = cx
+        .update_window(window, |_, window, _| window.rendered_frame.scene.len())
+        .unwrap();
+    eprintln!(
+        "{} cached canvas items panned: median frame {:.2} ms, {operations} paint operations, {} item renders over {frames} frames",
+        CANVAS_COLUMNS * CANVAS_ROWS,
+        samples[samples.len() / 2].as_secs_f64() * 1e3,
+        renders.get(),
+    );
+}

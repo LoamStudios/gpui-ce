@@ -163,6 +163,49 @@ where
         ordering
     }
 
+    /// Reserves `span + 1` consecutive orderings for content that lies within
+    /// `bounds` and whose orderings among itself are already known, and
+    /// returns the first: one greater than the maximum ordering of any
+    /// existing bounds that intersect `bounds`. The bounds are recorded at the
+    /// last ordering of the run, so later inserts that intersect them step
+    /// above all of it.
+    ///
+    /// This is how a replayed recording keeps its own stacking with a single
+    /// search, rather than one per primitive.
+    pub fn insert_run(&mut self, bounds: Bounds<U>, span: u32) -> u32 {
+        let first = (self.find_max_ordering(&bounds) + 1).max(self.order_floor);
+        let last = first + span;
+        let new_leaf_idx = self.insert_leaf(bounds, last);
+        self.max_leaf = match self.max_leaf {
+            None => Some(new_leaf_idx),
+            Some(old_idx) if self.nodes[old_idx].max_order < last => Some(new_leaf_idx),
+            some => some,
+        };
+        first
+    }
+
+    /// The number of nodes on the longest path from the root to a leaf.
+    #[cfg(test)]
+    fn height(&self) -> usize {
+        fn height_of<U: Clone + Debug + Default + PartialEq>(
+            nodes: &[Node<U>],
+            index: usize,
+        ) -> usize {
+            match &nodes[index].kind {
+                NodeKind::Leaf { .. } => 1,
+                NodeKind::Internal { children } => {
+                    1 + children
+                        .as_slice()
+                        .iter()
+                        .map(|&child| height_of(nodes, child))
+                        .max()
+                        .unwrap_or(0)
+                }
+            }
+        }
+        self.root.map_or(0, |root| height_of(&self.nodes, root))
+    }
+
     /// Finds the maximum ordering among all bounds that intersect with the query.
     fn find_max_ordering(&mut self, query: &Bounds<U>) -> u32 {
         let Some(root_idx) = self.root else {
@@ -461,6 +504,74 @@ mod tests {
         assert_eq!(tree.insert(bounds4), 1); // bounds4 does not overlap with bounds1, bounds2, or bounds3
         assert_eq!(tree.insert(bounds5), 1); // bounds5 does not overlap with any other bounds
         assert_eq!(tree.insert(bounds6), 2); // bounds6 overlaps with bounds4, so it should have a different order
+    }
+
+    #[test]
+    fn a_run_is_ordered_above_what_it_overlaps_and_below_what_follows() {
+        let square = |x: f32, y: f32| Bounds {
+            origin: Point { x, y },
+            size: Size {
+                width: 10.0,
+                height: 10.0,
+            },
+        };
+        let mut tree = BoundsTree::<f32>::default();
+        assert_eq!(tree.insert(square(0.0, 0.0)), 1);
+        assert_eq!(tree.insert(square(5.0, 5.0)), 2);
+
+        // A run of four orderings over both squares starts above them, and
+        // its bounds are held at the last ordering of the run.
+        assert_eq!(tree.insert_run(square(4.0, 4.0), 3), 3);
+        assert_eq!(tree.insert(square(8.0, 8.0)), 7);
+        assert_eq!(tree.max_order(), 7);
+
+        // Bounds the run does not overlap are not pushed above it.
+        assert_eq!(tree.insert(square(50.0, 50.0)), 1);
+    }
+
+    /// Time to insert a background and then a grid of separate squares, as
+    /// a canvas does each frame, at growing sizes: the cost per insert should
+    /// stay flat.
+    ///
+    /// `cargo test -p gpui-ce --release --lib bounds_tree::tests::grid_insert_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prints timings; run by hand"]
+    fn grid_insert_cost() {
+        for side in [16usize, 32, 64, 128] {
+            let mut tree = BoundsTree::<f32>::default();
+            let started = std::time::Instant::now();
+            let rounds = 20;
+            let mut height = 0;
+            for _ in 0..rounds {
+                tree.clear();
+                tree.insert(Bounds {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: side as f32 * 40.0,
+                        height: side as f32 * 40.0,
+                    },
+                });
+                for ix in 0..side * side {
+                    tree.insert(Bounds {
+                        origin: Point {
+                            x: (ix % side) as f32 * 40.0,
+                            y: (ix / side) as f32 * 40.0,
+                        },
+                        size: Size {
+                            width: 34.0,
+                            height: 34.0,
+                        },
+                    });
+                }
+                height = tree.height();
+            }
+            let per_insert = started.elapsed().as_secs_f64() / (rounds * side * side) as f64;
+            eprintln!(
+                "{:>6} squares: {:.3} µs per insert, tree height {height}",
+                side * side,
+                per_insert * 1e6
+            );
+        }
     }
 
     #[test]
