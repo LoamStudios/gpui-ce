@@ -12,8 +12,8 @@ pub mod quad {
         pub border_dashed_gap: f32,
         pub bounds: Bounds,
         pub content_mask: ContentMask,
-        pub background: Background,
-        pub border_color: Background,
+        pub background: PaintRef,
+        pub border_color: PaintRef,
         pub corner_radii: Corners,
         pub border_widths: Edges,
         pub corner_smoothing: f32,
@@ -532,10 +532,10 @@ pub mod quad {
     #[derive(Clone, Copy, Wgsl)]
     pub struct QuadVertexData {
         pub position: Vec4f,
-        pub border: PreparedPaint,
+        pub border: Vec4f,
         pub quad_id: u32,
         pub clip_distances: Vec4f,
-        pub fill: PreparedPaint,
+        pub fill: Vec4f,
     }
 
     pub fn prepare_quad_vertex(vertex_id: u32, instance_id: u32, quad: Quad) -> QuadVertexData {
@@ -546,10 +546,10 @@ pub mod quad {
         );
         QuadVertexData {
             position: vertex.clip_position,
-            border: prepare_paint(Paint::new(quad.border_color, quad.bounds)),
+            border: prepare_paint(quad.border_color),
             quad_id: instance_id,
             clip_distances: clip_distances(vertex.viewport_position, quad.content_mask.bounds),
-            fill: prepare_paint(Paint::new(quad.background, quad.bounds)),
+            fill: prepare_paint(quad.background),
         }
     }
 
@@ -568,18 +568,6 @@ pub mod quad {
         #[location(3)]
         #[interpolate(flat)]
         pub fill_solid: Vec4f,
-        #[location(4)]
-        #[interpolate(flat)]
-        pub fill_color0: Vec4f,
-        #[location(5)]
-        #[interpolate(flat)]
-        pub fill_color1: Vec4f,
-        #[location(6)]
-        #[interpolate(flat)]
-        pub border_color0: Vec4f,
-        #[location(7)]
-        #[interpolate(flat)]
-        pub border_color1: Vec4f,
     }
 
     #[vertex]
@@ -591,14 +579,10 @@ pub mod quad {
         let vertex = prepare_quad_vertex(vertex_id, instance_id, quad);
         QuadVarying {
             position: vertex.position,
-            border_solid: vertex.border.solid,
+            border_solid: vertex.border,
             quad_id: vertex.quad_id,
             clip_distances: vertex.clip_distances,
-            fill_solid: vertex.fill.solid,
-            fill_color0: vertex.fill.color0,
-            fill_color1: vertex.fill.color1,
-            border_color0: vertex.border.color0,
-            border_color1: vertex.border.color1,
+            fill_solid: vertex.fill,
         }
     }
 
@@ -612,10 +596,9 @@ pub mod quad {
         let fade = ContentMask::alpha(quad.content_mask, scene_position(input.position.xy()))
             * clip_coverage(quad.clip, scene_position(input.position.xy()));
         let fill_color = paint_color(
-            Paint::new(quad.background, quad.bounds),
-            point,
+            quad.background,
             scene_position(input.position.xy()),
-            PreparedPaint::new(input.fill_solid, input.fill_color0, input.fill_color1),
+            input.fill_solid,
         );
         if Edges::is_zero(quad.border_widths) && Corners::is_zero(quad.corner_radii) {
             return blend_color(fill_color, fade);
@@ -630,10 +613,9 @@ pub mod quad {
         let mut color = fill_color;
         if max(distances.inner, distances.outer) < PIXEL_ANTIALIAS_RADIUS {
             let mut border_color = paint_color(
-                Paint::new(quad.border_color, quad.bounds),
-                point,
+                quad.border_color,
                 scene_position(input.position.xy()),
-                PreparedPaint::new(input.border_solid, input.border_color0, input.border_color1),
+                input.border_solid,
             );
             if quad.border_style == BorderStyle::Dashed {
                 border_color.w *= dashed_border_alpha(quad, geometry);
@@ -664,12 +646,6 @@ pub mod quad {
         #[location(3)]
         #[interpolate(flat)]
         pub fill_solid: Vec4f,
-        #[location(4)]
-        #[interpolate(flat)]
-        pub fill_color0: Vec4f,
-        #[location(5)]
-        #[interpolate(flat)]
-        pub fill_color1: Vec4f,
         #[location(6)]
         #[interpolate(flat)]
         pub horizontal_corner_reaches: Vec4f,
@@ -685,12 +661,6 @@ pub mod quad {
         #[location(10)]
         #[interpolate(flat)]
         pub superellipse_power: f32,
-        #[location(11)]
-        #[interpolate(flat)]
-        pub border_color0: Vec4f,
-        #[location(12)]
-        #[interpolate(flat)]
-        pub border_color1: Vec4f,
     }
 
     #[vertex]
@@ -709,19 +679,15 @@ pub mod quad {
 
         SmoothedQuadVarying {
             position: vertex.position,
-            border_solid: vertex.border.solid,
+            border_solid: vertex.border,
             quad_id: vertex.quad_id,
             clip_distances: vertex.clip_distances,
-            fill_solid: vertex.fill.solid,
-            fill_color0: vertex.fill.color0,
-            fill_color1: vertex.fill.color1,
+            fill_solid: vertex.fill,
             horizontal_corner_reaches: prepared.horizontal_reaches,
             vertical_corner_reaches: prepared.vertical_reaches,
             corner_lengths: smoothed_corner_lengths(quad, prepared),
             smoothing_factors: prepared.smoothing_factors,
             superellipse_power: prepared.superellipse_power,
-            border_color0: vertex.border.color0,
-            border_color1: vertex.border.color1,
         }
     }
 
@@ -735,10 +701,9 @@ pub mod quad {
         let fade = ContentMask::alpha(quad.content_mask, scene_position(input.position.xy()))
             * clip_coverage(quad.clip, scene_position(input.position.xy()));
         let fill_color = paint_color(
-            Paint::new(quad.background, quad.bounds),
-            point,
+            quad.background,
             scene_position(input.position.xy()),
-            PreparedPaint::new(input.fill_solid, input.fill_color0, input.fill_color1),
+            input.fill_solid,
         );
         let prepared = PreparedCorners {
             horizontal_reaches: input.horizontal_corner_reaches,
@@ -836,10 +801,9 @@ pub mod quad {
 
         if max(inner, outer) < PIXEL_ANTIALIAS_RADIUS {
             let mut border_color = paint_color(
-                Paint::new(quad.border_color, quad.bounds),
-                point,
+                quad.border_color,
                 scene_position(input.position.xy()),
-                PreparedPaint::new(input.border_solid, input.border_color0, input.border_color1),
+                input.border_solid,
             );
             if quad.border_style == BorderStyle::Dashed {
                 border_color.w *= smoothed_dashed_border_alpha(

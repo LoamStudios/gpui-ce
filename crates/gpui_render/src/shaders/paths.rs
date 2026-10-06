@@ -7,7 +7,8 @@ pub mod path_rasterization {
     pub struct PathRasterizationVertex {
         pub xy_position: Vec2f,
         pub curve_position: Vec2f,
-        pub color: Background,
+        pub color: PaintRef,
+        pub padding: u32,
         pub bounds: Bounds,
     }
     storage!(group(1), binding(0), PATH_VERTICES: RuntimeArray<PathRasterizationVertex>);
@@ -59,12 +60,10 @@ pub mod path_rasterization {
             return transparent();
         }
         let vertex = get!(PATH_VERTICES)[input.vertex_id as usize];
-        let paint = Paint::new(vertex.color, vertex.bounds);
         let color = paint_color(
-            paint,
+            vertex.color,
             scene_position(input.position.xy()),
-            scene_position(input.position.xy()),
-            prepare_paint(paint),
+            prepare_paint(vertex.color),
         );
         premultiply(color, coverage)
     }

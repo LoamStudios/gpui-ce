@@ -159,26 +159,6 @@ mod tests {
             .unwrap_or_else(|| panic!("generated {name} function must exist"))
     }
 
-    #[test]
-    fn downlevel_background_array_uses_host_element_stride() {
-        let decoder = generated_function(BASE_DOWNLEVEL_WGSL, "dl_load_Background_impl");
-        let element_stride = std::mem::size_of::<gpui::LinearColorStop>() / 4;
-        let second_element_offset = 7 + element_stride;
-
-        assert!(
-            decoder.contains("base + 7u"),
-            "Background decoder must load its first color stop at word 7"
-        );
-        assert!(
-            decoder.contains(&format!("base + {second_element_offset}u")),
-            "Background decoder must use the host LinearColorStop stride"
-        );
-        assert!(
-            !decoder.contains("base + 17u)), dl_scene_word"),
-            "Background decoder must not read padding as the second color stop"
-        );
-    }
-
     /// Group-0 tables are whole-frame data textures read from texel zero, unlike instances,
     /// which each draw reads from its `DATA_RANGE` base.
     #[test]

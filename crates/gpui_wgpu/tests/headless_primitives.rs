@@ -25,7 +25,7 @@ fn filled_path_resolves_without_invalidating_the_frame() {
     scene.insert_primitive(Quad {
         bounds: bounds(0.0, 0.0, 200.0, 100.0),
         content_mask: full_mask(),
-        background: solid_background(gpui::black()),
+        background: gpui::black().into(),
         ..Default::default()
     });
     let mut builder = gpui::PathBuilder::fill();
@@ -127,7 +127,7 @@ fn every_primitive_kind_renders() {
         order: 0,
         bounds: quad_bounds,
         content_mask: full_mask(),
-        background: solid_background(green),
+        background: green.into(),
         ..Default::default()
     });
     // 2. Bordered quad (white border, transparent fill).
@@ -151,6 +151,7 @@ fn every_primitive_kind_renders() {
         corner_radii: Default::default(),
         content_mask: full_mask(),
         color: blue.into(),
+        padding: 0,
         element_bounds: shadow_bounds,
         element_corner_radii: Default::default(),
         inset: ShaderBool::Disabled,
@@ -204,7 +205,7 @@ fn every_primitive_kind_renders() {
         order: 0,
         bounds: late_quad,
         content_mask: full_mask(),
-        background: solid_background(blue),
+        background: blue.into(),
         ..Default::default()
     });
     // 8–9. Gradient drop and inset shadows. The inset gradient stays in the element's paint
@@ -216,6 +217,9 @@ fn every_primitive_kind_renders() {
     )
     .color_space(ColorSpace::Srgb);
     let gradient_drop_bounds = bounds(210.0, 10.0, 40.0, 40.0);
+    let gradient_drop = scene.paint_ref(&gradient, gradient_drop_bounds, 0);
+    let inset_element_bounds = bounds(260.0, 10.0, 40.0, 40.0);
+    let gradient_inset = scene.paint_ref(&gradient, inset_element_bounds, 0);
     scene.insert_primitive(Shadow {
         transform: 0,
         clip: 0,
@@ -224,7 +228,8 @@ fn every_primitive_kind_renders() {
         bounds: gradient_drop_bounds,
         corner_radii: Default::default(),
         content_mask: full_mask(),
-        color: gradient,
+        color: gradient_drop,
+        padding: 0,
         element_bounds: gradient_drop_bounds,
         element_corner_radii: Default::default(),
         inset: ShaderBool::Disabled,
@@ -238,8 +243,9 @@ fn every_primitive_kind_renders() {
         bounds: bounds(266.0, 16.0, 28.0, 28.0),
         corner_radii: Default::default(),
         content_mask: full_mask(),
-        color: gradient,
-        element_bounds: bounds(260.0, 10.0, 40.0, 40.0),
+        color: gradient_inset,
+        padding: 0,
+        element_bounds: inset_element_bounds,
         element_corner_radii: Default::default(),
         inset: ShaderBool::Enabled,
         corner_smoothing: 0.0,
@@ -345,7 +351,7 @@ fn smoothed_primitives_share_one_contour() {
     scene.insert_primitive(Quad {
         bounds: fill_bounds,
         content_mask,
-        background: solid_background(green),
+        background: green.into(),
         corner_radii: radii,
         corner_smoothing: 1.0,
         ..Default::default()
@@ -408,6 +414,7 @@ fn smoothed_primitives_share_one_contour() {
         corner_radii: Corners::all(ScaledPixels(15.0)),
         content_mask,
         color: blue.into(),
+        padding: 0,
         element_bounds: drop_element,
         element_corner_radii: Corners::all(ScaledPixels(15.0)),
         inset: ShaderBool::Disabled,
@@ -416,7 +423,7 @@ fn smoothed_primitives_share_one_contour() {
     scene.insert_primitive(Quad {
         bounds: drop_element,
         content_mask,
-        background: solid_background(green),
+        background: green.into(),
         corner_radii: Corners::all(ScaledPixels(15.0)),
         corner_smoothing: 0.6,
         ..Default::default()
@@ -426,7 +433,7 @@ fn smoothed_primitives_share_one_contour() {
     scene.insert_primitive(Quad {
         bounds: inset_bounds,
         content_mask,
-        background: solid_background(green),
+        background: green.into(),
         corner_radii: Corners::all(ScaledPixels(16.0)),
         corner_smoothing: 1.0,
         ..Default::default()
@@ -440,6 +447,7 @@ fn smoothed_primitives_share_one_contour() {
         corner_radii: Corners::all(ScaledPixels(12.0)),
         content_mask,
         color: black.into(),
+        padding: 0,
         element_bounds: inset_bounds,
         element_corner_radii: Corners::all(ScaledPixels(16.0)),
         inset: ShaderBool::Enabled,
@@ -447,10 +455,11 @@ fn smoothed_primitives_share_one_contour() {
     });
 
     let filter_bounds = bounds(190.0, 92.0, 70.0, 52.0);
+    let checker = scene.paint_ref(&checkerboard(white, 2.0), filter_bounds, 0);
     scene.insert_primitive(Quad {
         bounds: filter_bounds,
         content_mask,
-        background: checkerboard(white, 2.0),
+        background: checker,
         ..Default::default()
     });
     scene.insert_primitive(BackdropFilter {
@@ -468,10 +477,11 @@ fn smoothed_primitives_share_one_contour() {
         .render_scene_to_image(&scene, target)
         .expect("render must succeed");
     let mut unfiltered_scene = Scene::default();
+    let checker = unfiltered_scene.paint_ref(&checkerboard(white, 2.0), filter_bounds, 0);
     unfiltered_scene.insert_primitive(Quad {
         bounds: filter_bounds,
         content_mask,
-        background: checkerboard(white, 2.0),
+        background: checker,
         ..Default::default()
     });
     unfiltered_scene.finish();
@@ -574,7 +584,7 @@ fn content_mask_fades_quad_edges() {
                 left: ScaledPixels(20.0),
             },
         },
-        background: solid_background(red),
+        background: red.into(),
         ..Default::default()
     });
     scene.finish();

@@ -6,7 +6,7 @@
 
 use gpui::{
     Bounds, ContentMask, Corners, DevicePixels, Hsla, PlatformHeadlessRenderer, Point, Quad,
-    ScaledPixels, Scene, SceneClip, SceneTransform, Size, TransformationMatrix, solid_background,
+    ScaledPixels, Scene, SceneClip, SceneTransform, Size, TransformationMatrix,
 };
 use gpui_ce_wgpu::WgpuHeadlessRenderer;
 
@@ -61,7 +61,7 @@ fn turned_bar(scene: &mut Scene, transform: u32) {
         transform,
         bounds: bounds(10.0, 40.0, 30.0, 20.0),
         content_mask: viewport_mask(),
-        background: solid_background(green()),
+        background: green().into(),
         ..Default::default()
     });
 }
@@ -97,7 +97,7 @@ fn clipped_fill(scene: &mut Scene) {
         clip,
         bounds: bounds(0.0, 0.0, 100.0, 100.0),
         content_mask: viewport_mask(),
-        background: solid_background(green()),
+        background: green().into(),
         ..Default::default()
     });
 }
@@ -136,7 +136,7 @@ fn warmed_downlevel_renderer() -> WgpuHeadlessRenderer {
     warmup.insert_primitive(Quad {
         bounds: bounds(0.0, 0.0, 1.0, 1.0),
         content_mask: viewport_mask(),
-        background: solid_background(green()),
+        background: green().into(),
         ..Default::default()
     });
     render(&mut renderer, warmup);

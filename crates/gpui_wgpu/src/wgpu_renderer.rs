@@ -336,7 +336,7 @@ mod tests {
                     bounds: full_bounds,
                     ..Default::default()
                 },
-                background: gpui::solid_background(gpui::hsla(0.05, 0.8, 0.45, 1.0)),
+                background: gpui::hsla(0.05, 0.8, 0.45, 1.0).into(),
                 border_style: gpui::BorderStyle::Dashed,
                 border_dashed_length: dash_length,
                 border_dashed_gap: dash_gap,
@@ -576,6 +576,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
+            let background = scene.paint_ref(&background, bounds, 0);
             scene.insert_primitive(Quad {
                 order: order as u32,
                 bounds,
@@ -630,13 +631,37 @@ mod tests {
                 height: ScaledPixels(12.0),
             },
         };
-        let render = |quad| -> anyhow::Result<image::RgbaImage> {
-            let mut scene = Scene::default();
-            scene.insert_primitive(quad);
-            scene.finish();
-            let mut renderer = WgpuRenderer::new_headless(&context, size)?;
-            renderer.render_to_image(&scene)
-        };
+        let render =
+            |background: &gpui::Background, border: bool| -> anyhow::Result<image::RgbaImage> {
+                let mut scene = Scene::default();
+                let paint = scene.paint_ref(background, bounds, 0);
+                let quad = if border {
+                    Quad {
+                        bounds,
+                        content_mask: gpui::ContentMask {
+                            bounds,
+                            ..Default::default()
+                        },
+                        border_color: paint,
+                        border_widths: gpui::Edges::all(ScaledPixels(4.0)),
+                        ..Default::default()
+                    }
+                } else {
+                    Quad {
+                        bounds,
+                        content_mask: gpui::ContentMask {
+                            bounds,
+                            ..Default::default()
+                        },
+                        background: paint,
+                        ..Default::default()
+                    }
+                };
+                scene.insert_primitive(quad);
+                scene.finish();
+                let mut renderer = WgpuRenderer::new_headless(&context, size)?;
+                renderer.render_to_image(&scene)
+            };
         let backgrounds = [
             gpui::solid_background(gpui::hsla(0.0, 1.0, 0.5, 1.0)),
             gpui::checkerboard(gpui::hsla(0.6, 0.7, 0.5, 1.0), 2.0),
@@ -659,25 +684,8 @@ mod tests {
         ];
 
         for background in backgrounds {
-            let filled = render(Quad {
-                bounds,
-                content_mask: gpui::ContentMask {
-                    bounds,
-                    ..Default::default()
-                },
-                background,
-                ..Default::default()
-            })?;
-            let bordered = render(Quad {
-                bounds,
-                content_mask: gpui::ContentMask {
-                    bounds,
-                    ..Default::default()
-                },
-                border_color: background,
-                border_widths: gpui::Edges::all(ScaledPixels(4.0)),
-                ..Default::default()
-            })?;
+            let filled = render(&background, false)?;
+            let bordered = render(&background, true)?;
 
             for (x, y) in border_samples {
                 let border_pixel = bordered.get_pixel(x, y).0;
@@ -774,7 +782,7 @@ mod tests {
                 bounds: full_bounds,
                 ..Default::default()
             },
-            background: gpui::solid_background(gpui::hsla(0.0, 0.0, 0.0, 1.0)),
+            background: gpui::hsla(0.0, 0.0, 0.0, 1.0).into(),
             ..Default::default()
         });
         scene.insert_primitive(Quad {
@@ -784,7 +792,7 @@ mod tests {
                 bounds: center_bounds,
                 ..Default::default()
             },
-            background: gpui::solid_background(gpui::hsla(0.0, 0.0, 1.0, 1.0)),
+            background: gpui::hsla(0.0, 0.0, 1.0, 1.0).into(),
             ..Default::default()
         });
         scene.insert_primitive(BackdropFilter {
@@ -853,7 +861,7 @@ mod tests {
                     bounds,
                     ..Default::default()
                 },
-                background: gpui::solid_background(gpui::hsla(0.0, 0.0, 0.0, 1.0)),
+                background: gpui::hsla(0.0, 0.0, 0.0, 1.0).into(),
                 ..Default::default()
             });
             scene.insert_primitive(Underline {

@@ -5088,16 +5088,23 @@ impl Window {
             if shadow.inset {
                 continue;
             }
-            let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
+            let shadow_bounds =
+                self.cover_bounds((bounds + shadow.offset).dilate(shadow.spread_radius));
+            let color = self.next_frame.scene.paint_ref(
+                &shadow.color.opacity(opacity),
+                shadow_bounds,
+                transform,
+            );
             self.next_frame.scene.insert_primitive(Shadow {
                 transform,
                 clip,
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
-                bounds: self.cover_bounds(shadow_bounds),
+                bounds: shadow_bounds,
                 content_mask,
                 corner_radii: corner_radii.scale(scale_factor),
-                color: shadow.color.opacity(opacity),
+                color,
+                padding: 0,
                 element_bounds,
                 element_corner_radii,
                 inset: false.into(),
@@ -5151,6 +5158,12 @@ impl Window {
                 bottom_right: (corner_radii.bottom_right - shadow.spread_radius).max(zero),
                 bottom_left: (corner_radii.bottom_left - shadow.spread_radius).max(zero),
             };
+            // An inset shadow's paint spans the element, as it always has.
+            let color = self.next_frame.scene.paint_ref(
+                &shadow.color.opacity(opacity),
+                element_bounds,
+                transform,
+            );
             self.next_frame.scene.insert_primitive(Shadow {
                 transform,
                 clip,
@@ -5159,7 +5172,8 @@ impl Window {
                 bounds: self.cover_bounds(hole),
                 content_mask,
                 corner_radii: hole_corner_radii.scale(scale_factor),
-                color: shadow.color.opacity(opacity),
+                color,
+                padding: 0,
                 element_bounds,
                 element_corner_radii,
                 inset: true.into(),
@@ -5508,8 +5522,16 @@ impl Window {
             order: 0,
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
-            background: quad.background.opacity(opacity),
-            border_color: quad.border_color.opacity(opacity),
+            background: self.next_frame.scene.paint_ref(
+                &quad.background.opacity(opacity),
+                snapped_bounds,
+                transform,
+            ),
+            border_color: self.next_frame.scene.paint_ref(
+                &quad.border_color.opacity(opacity),
+                snapped_bounds,
+                transform,
+            ),
             corner_radii: quad.corner_radii.scale(self.paint_scale()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
@@ -5620,10 +5642,21 @@ impl Window {
         let opacity = self.element_opacity();
         path.content_mask = content_mask;
         let color: Background = color.into();
+        let mut path = path.scale(scale_factor);
         path.color = color.opacity(opacity);
-        self.next_frame
-            .scene
-            .insert_primitive(path.scale(scale_factor));
+        if !matches!(
+            path.color.tag,
+            crate::BackgroundTag::Solid | crate::BackgroundTag::Paint
+        ) {
+            // Gradients and patterns are drawn from the paint table, spanning
+            // the path where it shows. Paths are in the viewport.
+            let paint = self
+                .next_frame
+                .scene
+                .paint_ref(&path.color, path.clipped_bounds(), 0);
+            path.color = Background::paint(paint.paint).opacity(paint.color.a);
+        }
+        self.next_frame.scene.insert_primitive(path);
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.
@@ -9427,31 +9460,41 @@ mod tests {
     #[gpui::test]
     fn shadow_backgrounds_survive_painting_with_geometry_and_opacity(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| ShadowBackgroundView);
-        let shadows = window
+        let (shadows, paints, stops) = window
             .update(cx, |_, window, _| {
-                window.rendered_frame.scene.shadows.clone()
+                let scene = &window.rendered_frame.scene;
+                (
+                    scene.shadows.clone(),
+                    scene.paints().to_vec(),
+                    scene.color_stops().to_vec(),
+                )
             })
             .unwrap();
 
         assert_eq!(shadows.len(), 3);
-        let gradient = shadow_gradient().opacity(0.5);
         let drop_gradient = shadows
             .iter()
-            .find(|shadow| shadow.inset == ShaderBool::Disabled && shadow.color == gradient)
+            .find(|shadow| shadow.inset == ShaderBool::Disabled && shadow.color.paint != 0)
             .expect("gradient drop shadow should be painted");
         let inset_gradient = shadows
             .iter()
-            .find(|shadow| shadow.inset == ShaderBool::Enabled && shadow.color == gradient)
+            .find(|shadow| shadow.inset == ShaderBool::Enabled && shadow.color.paint != 0)
             .expect("gradient inset shadow should be painted");
         let solid = shadows
             .iter()
-            .find(|shadow| shadow.color.as_solid().is_some())
+            .find(|shadow| shadow.color.paint == 0)
             .expect("solid shadows should remain supported");
 
         assert_eq!(
-            solid.color.as_solid(),
-            Some(hsla(0.3, 0.7, 0.4, 0.2)),
+            solid.color.color,
+            hsla(0.3, 0.7, 0.4, 0.2).into(),
             "element opacity should apply to solid shadow paint"
+        );
+        let first_stop_alpha =
+            |paint: u32| stops[paints[paint as usize].first_stop as usize].color[3];
+        assert!(
+            (first_stop_alpha(drop_gradient.color.paint) - 0.4).abs() < 1e-6,
+            "element opacity should apply to gradient shadow paint"
         );
         assert_eq!(drop_gradient.element_bounds, inset_gradient.element_bounds);
         assert!(drop_gradient.bounds.size.width > drop_gradient.element_bounds.size.width);

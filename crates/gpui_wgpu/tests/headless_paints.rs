@@ -5,7 +5,7 @@
 
 use gpui::{
     Bounds, ContentMask, DevicePixels, PlatformHeadlessRenderer, Point, Quad, ScaledPixels, Scene,
-    Size, TransformationMatrix, paint_background, peniko,
+    Size, TransformationMatrix, peniko,
 };
 use gpui_ce_wgpu::WgpuHeadlessRenderer;
 
@@ -46,7 +46,10 @@ fn paint_quad(scene: &mut Scene, index: u32) {
             bounds: target,
             ..Default::default()
         },
-        background: paint_background(index),
+        background: gpui::ScenePaintRef {
+            color: gpui::white().into(),
+            paint: index,
+        },
         ..Default::default()
     });
 }

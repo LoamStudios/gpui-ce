@@ -307,30 +307,43 @@ impl Scene {
         adopted: &mut AdoptedEntries,
         placement: &TransformationMatrix,
     ) {
-        for background in primitive.backgrounds_mut() {
-            if !background.is_paint() {
-                continue;
-            }
-            let paint = background.paint_index();
-            let index = match adopted.paints.get(&paint) {
-                Some(&index) => index,
-                None => {
-                    let mut entry = prev_scene.paints()[paint as usize];
-                    let stops =
-                        entry.first_stop as usize..(entry.first_stop + entry.stop_count) as usize;
-                    entry.first_stop = self.color_stops.len() as u32;
-                    self.color_stops
-                        .extend_from_slice(&prev_scene.color_stops()[stops]);
-                    entry.transformation = entry
-                        .transformation
-                        .compose(placement.inverse().unwrap_or(TransformationMatrix::UNIT));
-                    let index = self.push_paint(entry);
-                    adopted.paints.insert(paint, index);
-                    index
-                }
-            };
-            background.set_paint_index(index);
+        if let Primitive::Path(path) = primitive
+            && path.color.is_paint()
+        {
+            let index = self.adopt_paint(path.color.paint_index(), prev_scene, adopted, placement);
+            path.color.set_paint_index(index);
         }
+        for paint_ref in primitive.paint_refs_mut() {
+            paint_ref.paint = self.adopt_paint(paint_ref.paint, prev_scene, adopted, placement);
+        }
+    }
+
+    /// Entry `paint` of `prev_scene`'s paint table as an entry of this
+    /// scene's, placed by `placement`, with its stops: 0 for 0.
+    fn adopt_paint(
+        &mut self,
+        paint: u32,
+        prev_scene: &Scene,
+        adopted: &mut AdoptedEntries,
+        placement: &TransformationMatrix,
+    ) -> u32 {
+        if paint == 0 {
+            return 0;
+        }
+        if let Some(&index) = adopted.paints.get(&paint) {
+            return index;
+        }
+        let mut entry = prev_scene.paints()[paint as usize];
+        let stops = entry.first_stop as usize..(entry.first_stop + entry.stop_count) as usize;
+        entry.first_stop = self.color_stops.len() as u32;
+        self.color_stops
+            .extend_from_slice(&prev_scene.color_stops()[stops]);
+        entry.transformation = entry
+            .transformation
+            .compose(placement.inverse().unwrap_or(TransformationMatrix::UNIT));
+        let index = self.push_paint(entry);
+        adopted.paints.insert(paint, index);
+        index
     }
 
     /// Rewrites `primitive`'s table entries, which index `prev_scene`'s
@@ -635,6 +648,34 @@ impl Scene {
     ) -> Option<u32> {
         let paint = ScenePaint::gradient(gradient, to_gradient, &mut self.color_stops)?;
         Some(self.push_paint(paint))
+    }
+
+    /// What a primitive with `bounds`, in the space of transform-table entry
+    /// `transform`, paints `background` with: a colour, or an entry of the
+    /// paint table, made for it if it is a gradient or pattern.
+    pub fn paint_ref(
+        &mut self,
+        background: &Background,
+        bounds: Bounds<ScaledPixels>,
+        transform: u32,
+    ) -> ScenePaintRef {
+        if background.is_paint() {
+            return ScenePaintRef {
+                color: background.solid,
+                paint: background.paint_index(),
+            };
+        }
+        let to_viewport = self.transforms()[transform as usize].transformation;
+        match ScenePaint::background(background, bounds, to_viewport, &mut self.color_stops) {
+            Some(paint) => ScenePaintRef {
+                color: crate::white().into(),
+                paint: self.push_paint(paint),
+            },
+            None => ScenePaintRef {
+                color: background.solid,
+                paint: 0,
+            },
+        }
     }
 
     fn push_paint(&mut self, paint: ScenePaint) -> u32 {
@@ -1598,20 +1639,19 @@ impl Primitive {
         }
     }
 
-    /// The primitive's transform- and clip-table entries, to rewrite when it
-    /// is replayed into another scene.
-    /// The backgrounds the primitive paints with.
-    fn backgrounds_mut(&mut self) -> SmallVec<[&mut Background; 2]> {
+    /// The paint references the primitive paints with.
+    fn paint_refs_mut(&mut self) -> SmallVec<[&mut ScenePaintRef; 2]> {
         match self {
             Primitive::Shadow(shadow) => smallvec::smallvec![&mut shadow.color],
             Primitive::Quad(quad) => {
                 smallvec::smallvec![&mut quad.background, &mut quad.border_color]
             }
-            Primitive::Path(path) => smallvec::smallvec![&mut path.color],
             _ => SmallVec::new(),
         }
     }
 
+    /// The primitive's transform- and clip-table entries, to rewrite when it
+    /// is replayed into another scene.
     fn table_entries(&mut self) -> Option<(&mut u32, &mut u32)> {
         match self {
             Primitive::Shadow(shadow) => Some((&mut shadow.transform, &mut shadow.clip)),
@@ -2061,8 +2101,8 @@ pub struct Quad {
     pub border_dashed_gap: f32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    pub background: Background,
-    pub border_color: Background,
+    pub background: ScenePaintRef,
+    pub border_color: ScenePaintRef,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
     pub corner_smoothing: f32,
@@ -2136,7 +2176,9 @@ pub struct Shadow {
     pub bounds: Bounds<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    pub color: Background,
+    pub color: ScenePaintRef,
+    /// Aligns `element_bounds` as the shaders do.
+    pub padding: u32,
     pub element_bounds: Bounds<ScaledPixels>,
     pub element_corner_radii: Corners<ScaledPixels>,
     /// Whether this shadow is rendered inside the element instead of outside it.
@@ -2383,6 +2425,41 @@ impl SceneTransform {
         transformation: TransformationMatrix::UNIT,
         inverse: TransformationMatrix::UNIT,
     };
+}
+
+/// What a primitive paints with: `color`, or, where `paint` is not 0, that
+/// entry of the scene's paint table faded by `color`'s alpha.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct ScenePaintRef {
+    /// The colour, or the paint's opacity in its alpha.
+    pub color: SceneHsla,
+    /// The paint-table entry: 0 for none.
+    pub paint: u32,
+}
+
+impl ScenePaintRef {
+    /// The same paint with its alpha multiplied by `factor`.
+    pub fn opacity(self, factor: f32) -> Self {
+        Self {
+            color: self.color.opacity(factor),
+            ..self
+        }
+    }
+
+    /// Whether it paints nothing.
+    pub fn is_transparent(&self) -> bool {
+        self.color.a == 0.
+    }
+}
+
+impl From<crate::Hsla> for ScenePaintRef {
+    fn from(color: crate::Hsla) -> Self {
+        Self {
+            color: color.into(),
+            paint: 0,
+        }
+    }
 }
 
 /// An entry of a scene's clip table: a rounded rectangle in the space of a
@@ -3157,6 +3234,7 @@ mod tests {
             corner_radii: Corners::default(),
             content_mask: mask(),
             color: Default::default(),
+            padding: 0,
             element_bounds: full_bounds(),
             element_corner_radii: Corners::default(),
             inset: ShaderBool::Disabled,
@@ -3736,7 +3814,7 @@ mod tests {
             scene
                 .quads
                 .iter()
-                .map(|quad| quad.background.solid.a)
+                .map(|quad| quad.background.color.a)
                 .collect::<Vec<_>>()
         };
         assert_eq!(alphas(&scene), vec![0.5, 0.5]);

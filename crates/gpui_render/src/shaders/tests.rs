@@ -266,41 +266,74 @@ fn shader_discriminants_match_scene_types() {
 }
 
 #[test]
-fn linear_gradients_preserve_native_dithering() {
+fn gradients_are_dithered() {
     use common::*;
     use wgsl_rs::std::*;
 
-    let color = Hsla {
-        h: 0.0,
-        s: 0.0,
-        l: 0.5,
-        a: 0.5,
-    };
-    let background = Background {
-        tag: BackgroundTag::LinearGradient,
-        color_space: ColorSpace::Srgb,
-        solid: color,
-        gradient_angle_or_pattern_height: 90.0,
-        colors: [
-            LinearColorStop {
-                color,
-                percentage: 0.0,
-            },
-            LinearColorStop {
-                color,
-                percentage: 1.0,
-            },
-        ],
-        padding: 0,
-    };
-    let bounds = Bounds {
-        origin: vec2f(0.0, 0.0),
-        size: vec2f(100.0, 100.0),
-    };
-    let paint = Paint::new(background, bounds);
-    let prepared = prepare_paint(paint);
-    let first = paint_color(paint, vec2f(10.0, 10.0), vec2f(10.0, 10.0), prepared);
-    let second = paint_color(paint, vec2f(11.0, 10.0), vec2f(11.0, 10.0), prepared);
+    assert_ne!(
+        gradient_dither(vec2f(10.0, 10.0)).w,
+        gradient_dither(vec2f(11.0, 10.0)).w
+    );
+}
 
-    assert_ne!(first.w, second.w);
+/// A paint-table gradient of `kind` with `geometry` and `radii`.
+fn gradient(kind: common::PaintKind, geometry: [f32; 4], radii: [f32; 2]) -> common::ScenePaint {
+    use common::*;
+    use wgsl_rs::std::*;
+
+    ScenePaint {
+        transformation: TransformationMatrix {
+            rotation_scale: mat2x2f(vec2f(1.0, 0.0), vec2f(0.0, 1.0)),
+            translation: vec2f(0.0, 0.0),
+        },
+        kind,
+        extend: PaintExtend::Pad,
+        color_space: PaintColorSpace::Srgb,
+        first_stop: 0,
+        stop_count: 0,
+        padding: 0,
+        geometry: vec4f(geometry[0], geometry[1], geometry[2], geometry[3]),
+        radii: vec4f(radii[0], radii[1], 0.0, 0.0),
+    }
+}
+
+#[test]
+fn gradient_offsets_follow_their_geometry() {
+    use common::*;
+    use wgsl_rs::std::*;
+
+    let close = |actual: Vec2f, offset: f32| {
+        assert_eq!(actual.y, 1.0, "defined");
+        assert!((actual.x - offset).abs() < 1e-4, "{} vs {offset}", actual.x);
+    };
+    let linear = gradient(PaintKind::Linear, [10.0, 0.0, 110.0, 0.0], [0.0, 0.0]);
+    close(gradient_offset(linear, vec2f(10.0, 50.0)), 0.0);
+    close(gradient_offset(linear, vec2f(60.0, -5.0)), 0.5);
+    close(gradient_offset(linear, vec2f(210.0, 0.0)), 2.0);
+
+    let radial = gradient(PaintKind::Radial, [0.0, 0.0, 0.0, 0.0], [0.0, 100.0]);
+    close(gradient_offset(radial, vec2f(30.0, 40.0)), 0.5);
+    close(gradient_offset(radial, vec2f(0.0, 200.0)), 2.0);
+
+    // A cone from a point to a circle beside it is undefined behind the point.
+    let cone = gradient(PaintKind::Radial, [0.0, 0.0, 100.0, 0.0], [0.0, 10.0]);
+    assert_eq!(gradient_offset(cone, vec2f(-50.0, 0.0)).y, 0.0);
+    // Of the two circles through a point, the later one paints it.
+    close(gradient_offset(cone, vec2f(100.0, 10.0)), 20200.0 / 19800.0);
+
+    let sweep = gradient(PaintKind::Sweep, [0.0, 0.0, 0.0, 2.0 * PI], [0.0, 0.0]);
+    close(gradient_offset(sweep, vec2f(0.0, 10.0)), 0.25);
+    close(gradient_offset(sweep, vec2f(-10.0, 0.0)), 0.5);
+}
+
+#[test]
+fn gradients_extend_past_their_ends() {
+    use common::*;
+
+    assert_eq!(extend_offset(PaintExtend::Pad, 1.5), 1.0);
+    assert_eq!(extend_offset(PaintExtend::Pad, -0.5), 0.0);
+    assert!((extend_offset(PaintExtend::Repeat, 1.25) - 0.25).abs() < 1e-6);
+    assert!((extend_offset(PaintExtend::Repeat, -0.25) - 0.75).abs() < 1e-6);
+    assert!((extend_offset(PaintExtend::Reflect, 1.25) - 0.75).abs() < 1e-6);
+    assert!((extend_offset(PaintExtend::Reflect, -0.25) - 0.25).abs() < 1e-6);
 }

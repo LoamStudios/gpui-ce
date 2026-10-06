@@ -2579,6 +2579,7 @@ mod tests {
                 ),
             ),
         ] {
+            let background = quads.paint_ref(&background, bounds, 0);
             quads.insert_primitive(Quad {
                 bounds,
                 content_mask: ContentMask {
@@ -2697,7 +2698,7 @@ mod tests {
                 bounds: underline_frame,
                 ..Default::default()
             },
-            background: solid_background(hsla(0.0, 0.0, 0.1, 1.0)),
+            background: hsla(0.0, 0.0, 0.1, 1.0).into(),
             ..Default::default()
         });
         underline.insert_primitive(Underline {
@@ -2804,7 +2805,7 @@ mod tests {
                 bounds: full,
                 ..Default::default()
             },
-            background: solid_background(hsla(0.05, 0.8, 0.45, 1.0)),
+            background: hsla(0.05, 0.8, 0.45, 1.0).into(),
             border_style: BorderStyle::Dashed,
             border_color: hsla(0.6, 0.9, 0.7, 1.0).into(),
             corner_radii: Corners::all(ScaledPixels(2.0)),
@@ -2851,7 +2852,7 @@ mod tests {
                 bounds: full,
                 ..Default::default()
             },
-            background: solid_background(hsla(0.05, 0.8, 0.45, 1.0)),
+            background: hsla(0.05, 0.8, 0.45, 1.0).into(),
             border_style: BorderStyle::Dashed,
             border_dashed_length: 4.0,
             border_dashed_gap: 0.5,
@@ -2910,6 +2911,7 @@ mod tests {
             },
             corner_radii: Corners::all(ScaledPixels(2.0)),
             color: hsla(0.7, 0.8, 0.3, 0.7).into(),
+            padding: 0,
             element_bounds: box_bounds,
             element_corner_radii: Corners::all(ScaledPixels(2.0)),
             inset: gpui::ShaderBool::Disabled,
@@ -2963,13 +2965,14 @@ mod tests {
             },
         };
         let mut filter = Scene::default();
+        let checkers = filter.paint_ref(&checkerboard(hsla(0.2, 0.7, 0.5, 1.0), 2.0), full, 0);
         filter.insert_primitive(Quad {
             bounds: full,
             content_mask: ContentMask {
                 bounds: full,
                 ..Default::default()
             },
-            background: checkerboard(hsla(0.2, 0.7, 0.5, 1.0), 2.0),
+            background: checkers,
             ..Default::default()
         });
         filter.insert_primitive(BackdropFilter {
@@ -3212,8 +3215,8 @@ mod tests {
             }
         }
 
-        fn green_background() -> gpui::Background {
-            solid_background(gpui::rgb_to_hsla(gpui::rgb(0x00ff00)))
+        fn green_background() -> gpui::ScenePaintRef {
+            gpui::rgb_to_hsla(gpui::rgb(0x00ff00)).into()
         }
 
         /// A quarter turn clockwise about the viewport's centre, (50, 50): a point at

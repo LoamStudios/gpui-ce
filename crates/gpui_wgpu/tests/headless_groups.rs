@@ -8,7 +8,6 @@
 use gpui::{
     BackdropFilter, BlendMode, Bounds, ContentMask, DevicePixels, GroupBoundary, MaskMode,
     PlatformHeadlessRenderer, Point, Quad, ScaledFilter, ScaledPixels, Scene, Size,
-    solid_background,
 };
 use gpui_ce_wgpu::WgpuHeadlessRenderer;
 
@@ -44,7 +43,7 @@ fn quad(scene: &mut Scene, bounds: Bounds<ScaledPixels>, color: u32) {
     scene.insert_primitive(Quad {
         bounds,
         content_mask: viewport_mask(),
-        background: solid_background(gpui::rgb_to_hsla(gpui::rgb(color))),
+        background: gpui::rgb_to_hsla(gpui::rgb(color)).into(),
         ..Default::default()
     });
 }

@@ -1168,7 +1168,8 @@ impl DirectXRenderer {
                 .extend(path.vertices.iter().map(|vertex| PathRasterizationVertex {
                     xy_position: vertex.xy_position,
                     curve_position: vertex.st_position,
-                    color: path.color,
+                    color: path.color.paint_ref(),
+                    padding: 0,
                     bounds: path.clipped_bounds(),
                 }));
         }

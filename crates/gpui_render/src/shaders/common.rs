@@ -85,6 +85,8 @@ mod source {
         Linear = 0,
         Radial = 1,
         Sweep = 2,
+        Stripes = 3,
+        Checkerboard = 4,
     }
 
     /// How a paint-table gradient continues past its ends.
@@ -104,6 +106,8 @@ mod source {
         LinearSrgb = 1,
         Oklab = 2,
         Oklch = 3,
+        LegacySrgb = 4,
+        LegacyOklab = 5,
     }
 
     #[repr(u32)]
@@ -291,20 +295,6 @@ mod source {
         pub a: f32,
     }
     #[derive(Clone, Copy, Wgsl)]
-    pub struct LinearColorStop {
-        pub color: Hsla,
-        pub percentage: f32,
-    }
-    #[derive(Clone, Copy, Wgsl)]
-    pub struct Background {
-        pub tag: BackgroundTag,
-        pub color_space: ColorSpace,
-        pub solid: Hsla,
-        pub gradient_angle_or_pattern_height: f32,
-        pub colors: [LinearColorStop; 2],
-        pub padding: u32,
-    }
-    #[derive(Clone, Copy, Wgsl)]
     pub struct AtlasTextureId {
         pub index: u32,
         pub kind: u32,
@@ -461,6 +451,20 @@ mod source {
         saturate(offset)
     }
 
+    /// The coverage of diagonal stripes `width` wide and `interval` apart at
+    /// `point`, measured from where they start.
+    pub fn stripes_coverage(point: Vec2f, width: f32, interval: f32) -> f32 {
+        let height = width + interval;
+        let period = height * sin(DIAGONAL_STRIPE_ANGLE);
+        let rotation = mat2x2f(
+            vec2f(cos(DIAGONAL_STRIPE_ANGLE), -sin(DIAGONAL_STRIPE_ANGLE)),
+            vec2f(sin(DIAGONAL_STRIPE_ANGLE), cos(DIAGONAL_STRIPE_ANGLE)),
+        );
+        let pattern = (rotation * point).x % period;
+        let distance = min(pattern, period - pattern) - period * (width / height) / 2.0;
+        antialiased_coverage(distance)
+    }
+
     /// The colour of a paint's stops at `offset`, interpolated in its space.
     pub fn stops_color(paint: ScenePaint, offset: f32) -> Vec4f {
         let first = get!(COLOR_STOPS)[paint.first_stop as usize];
@@ -489,6 +493,13 @@ mod source {
     /// A colour in `space`, premultiplied except for hue, as unpremultiplied
     /// sRGB-encoded RGBA, as paints are drawn.
     pub fn paint_space_to_srgba(space: PaintColorSpace, color: Vec4f) -> Vec4f {
+        // Legacy gradients interpolate unpremultiplied, as they always have.
+        if space == PaintColorSpace::LegacySrgb {
+            return srgba_to_linear(color);
+        }
+        if space == PaintColorSpace::LegacyOklab {
+            return oklab_to_linear_srgb(color);
+        }
         let alpha = color.w;
         if alpha <= 0.0 {
             return transparent();
@@ -519,6 +530,19 @@ mod source {
         let paint = get!(PAINTS)[index as usize];
         let point =
             TransformationMatrix::transform_position(paint.transformation, viewport_position);
+        if paint.kind == PaintKind::Stripes || paint.kind == PaintKind::Checkerboard {
+            let mut color = paint_space_to_srgba(
+                PaintColorSpace::Srgb,
+                get!(COLOR_STOPS)[paint.first_stop as usize].color,
+            );
+            if paint.kind == PaintKind::Stripes {
+                color.w *= stripes_coverage(point, paint.geometry.x, paint.geometry.y);
+            } else {
+                let square = paint.geometry.x;
+                color.w *= saturate((floor(point.x / square) + floor(point.y / square)) % 2.0);
+            }
+            return color;
+        }
         let offset = gradient_offset(paint, point);
         if offset.y == 0.0 {
             return transparent();
@@ -925,78 +949,18 @@ mod source {
         )
     }
 
+    /// What a primitive paints with: a colour, or, where `paint` is not 0,
+    /// that entry of the scene's paint table faded by the colour's alpha.
     #[derive(Clone, Copy, Wgsl)]
-    pub struct Paint {
-        pub background: Background,
-        pub bounds: Bounds,
+    pub struct PaintRef {
+        pub color: Hsla,
+        pub paint: u32,
     }
 
-    impl Paint {
-        pub fn new(background: Background, bounds: Bounds) -> Paint {
-            Paint { background, bounds }
-        }
-    }
-
-    #[derive(Clone, Copy, Wgsl)]
-    pub struct PreparedPaint {
-        pub solid: Vec4f,
-        pub color0: Vec4f,
-        pub color1: Vec4f,
-    }
-
-    impl PreparedPaint {
-        pub fn new(solid: Vec4f, color0: Vec4f, color1: Vec4f) -> PreparedPaint {
-            PreparedPaint {
-                solid,
-                color0,
-                color1,
-            }
-        }
-    }
-
-    pub fn prepare_paint(paint: Paint) -> PreparedPaint {
-        let mut prepared = PreparedPaint::new(transparent(), transparent(), transparent());
-
-        if paint.background.tag == BackgroundTag::LinearGradient {
-            prepared.color0 = hsla_to_rgba(paint.background.colors[0usize].color);
-            prepared.color1 = hsla_to_rgba(paint.background.colors[1usize].color);
-            if paint.background.color_space == ColorSpace::Srgb {
-                prepared.color0 = linear_to_srgba(prepared.color0);
-                prepared.color1 = linear_to_srgba(prepared.color1);
-            } else {
-                prepared.color0 = linear_srgb_to_oklab(prepared.color0);
-                prepared.color1 = linear_srgb_to_oklab(prepared.color1);
-            }
-        } else {
-            prepared.solid = hsla_to_rgba(paint.background.solid);
-        }
-
-        prepared
-    }
-
-    pub fn linear_gradient_ratio(paint: Paint, position: Vec2f) -> f32 {
-        let radians = (paint.background.gradient_angle_or_pattern_height % FULL_TURN_DEGREES
-            - CSS_GRADIENT_OFFSET_DEGREES)
-            * PI
-            / HALF_TURN_DEGREES;
-        let mut direction = vec2f(cos(radians), sin(radians));
-        if paint.bounds.size.x > paint.bounds.size.y {
-            direction.y *= paint.bounds.size.y / paint.bounds.size.x;
-        } else {
-            direction.x *= paint.bounds.size.x / paint.bounds.size.y;
-        }
-
-        let half_size = Bounds::half_size(paint.bounds);
-        let mut ratio = dot(position - Bounds::center(paint.bounds), direction) / length(direction);
-        if abs(direction.x) > abs(direction.y) {
-            ratio = (ratio + half_size.x) / paint.bounds.size.x;
-        } else {
-            ratio = (ratio + half_size.y) / paint.bounds.size.y;
-        }
-
-        let first_stop = paint.background.colors[0usize].percentage;
-        let last_stop = paint.background.colors[1usize].percentage;
-        saturate((ratio - first_stop) / (last_stop - first_stop))
+    /// The colour a paint reference carries, as the vertex stage passes it
+    /// on.
+    pub fn prepare_paint(paint: PaintRef) -> Vec4f {
+        hsla_to_rgba(paint.color)
     }
 
     pub fn gradient_dither(position: Vec2f) -> Vec4f {
@@ -1012,79 +976,14 @@ mod source {
         )
     }
 
-    pub fn linear_gradient_color(paint: Paint, position: Vec2f, prepared: PreparedPaint) -> Vec4f {
-        let ratio = linear_gradient_ratio(paint, position);
-        let ratio4 = vec4f(ratio, ratio, ratio, ratio);
-        let interpolated = mix(prepared.color0, prepared.color1, ratio4);
-        let mut color = transparent();
-        if paint.background.color_space == ColorSpace::Oklab {
-            color = oklab_to_linear_srgb(interpolated);
-        } else {
-            color = srgba_to_linear(interpolated);
+    /// The colour `paint` draws at `viewport_position`, given `solid`, its
+    /// prepared colour.
+    pub fn paint_color(paint: PaintRef, viewport_position: Vec2f, solid: Vec4f) -> Vec4f {
+        if paint.paint == 0u32 {
+            return solid;
         }
-        color + gradient_dither(position)
-    }
-
-    pub fn slash_pattern_color(paint: Paint, position: Vec2f, solid: Vec4f) -> Vec4f {
-        let encoded = paint.background.gradient_angle_or_pattern_height;
-        let pattern_width = (encoded / PATTERN_PACKING_RADIX) / PATTERN_COMPONENT_SCALE;
-        let pattern_interval = (encoded % PATTERN_PACKING_RADIX) / PATTERN_COMPONENT_SCALE;
-        let pattern_height = pattern_width + pattern_interval;
-        let period = pattern_height * sin(DIAGONAL_STRIPE_ANGLE);
-        let rotation = mat2x2f(
-            vec2f(cos(DIAGONAL_STRIPE_ANGLE), -sin(DIAGONAL_STRIPE_ANGLE)),
-            vec2f(sin(DIAGONAL_STRIPE_ANGLE), cos(DIAGONAL_STRIPE_ANGLE)),
-        );
-        let pattern = (rotation * (position - paint.bounds.origin)).x % period;
-        let distance =
-            min(pattern, period - pattern) - period * (pattern_width / pattern_height) / 2.0;
-        let mut color = solid;
-        color.w *= antialiased_coverage(distance);
-        color
-    }
-
-    pub fn checkerboard_color(paint: Paint, position: Vec2f, solid: Vec4f) -> Vec4f {
-        let relative = position - paint.bounds.origin;
-        let square_size = paint.background.gradient_angle_or_pattern_height;
-        let colored = (floor(relative.x / square_size) + floor(relative.y / square_size)) % 2.0;
-        let mut color = solid;
-        color.w *= saturate(colored);
-        color
-    }
-
-    /// The colour `paint` draws at `position`, in the primitive's own space,
-    /// and at `viewport_position`, where paint-table entries are placed.
-    pub fn paint_color(
-        paint: Paint,
-        position: Vec2f,
-        viewport_position: Vec2f,
-        prepared: PreparedPaint,
-    ) -> Vec4f {
-        let mut color = prepared.solid;
-        #[wgsl_allow(non_literal_match_statement_patterns)]
-        match paint.background.tag {
-            BackgroundTag::Solid => {
-                color = prepared.solid;
-            }
-            BackgroundTag::LinearGradient => {
-                color = linear_gradient_color(paint, position, prepared);
-            }
-            BackgroundTag::PatternSlash => {
-                color = slash_pattern_color(paint, position, prepared.solid);
-            }
-            BackgroundTag::Checkerboard => {
-                color = checkerboard_color(paint, position, prepared.solid);
-            }
-            BackgroundTag::Paint => {
-                // The index is kept as a float, exactly, and the solid
-                // colour's alpha fades the paint.
-                color = table_paint_color(
-                    u32(paint.background.gradient_angle_or_pattern_height),
-                    viewport_position,
-                );
-                color.w *= prepared.solid.w;
-            }
-        }
+        let mut color = table_paint_color(paint.paint, viewport_position);
+        color.w *= solid.w;
         color
     }
     pub fn corner_dash_velocity(first: f32, second: f32) -> f32 {

@@ -11,7 +11,8 @@ pub mod shadow {
         pub bounds: Bounds,
         pub corner_radii: Corners,
         pub content_mask: ContentMask,
-        pub color: Background,
+        pub color: PaintRef,
+        pub padding: u32,
         pub element_bounds: Bounds,
         pub element_corner_radii: Corners,
         pub inset: ShaderBool,
@@ -35,15 +36,6 @@ pub mod shadow {
             origin: shadow.bounds.origin - vec2f(margin, margin),
             size: shadow.bounds.size + vec2f(2.0 * margin, 2.0 * margin),
         }
-    }
-
-    pub fn shadow_paint(shadow: Shadow) -> Paint {
-        let mut bounds = shadow.bounds;
-        if is_enabled(shadow.inset) {
-            bounds = shadow.element_bounds;
-        }
-
-        Paint::new(shadow.color, bounds)
     }
 
     pub fn blurred_shadow_coverage(shadow: Shadow, position: Vec2f) -> f32 {
@@ -169,7 +161,7 @@ pub mod shadow {
     #[derive(Clone, Copy, Wgsl)]
     pub struct ShadowVertexData {
         pub position: Vec4f,
-        pub paint: PreparedPaint,
+        pub paint: Vec4f,
         pub shadow_id: u32,
         pub clip_distances: Vec4f,
     }
@@ -186,7 +178,7 @@ pub mod shadow {
         );
         ShadowVertexData {
             position: vertex.clip_position,
-            paint: prepare_paint(shadow_paint(shadow)),
+            paint: prepare_paint(shadow.color),
             shadow_id: instance_id,
             clip_distances: clip_distances(vertex.viewport_position, shadow.content_mask.bounds),
         }
@@ -199,12 +191,6 @@ pub mod shadow {
         #[location(0)]
         #[interpolate(flat)]
         pub paint_solid: Vec4f,
-        #[location(1)]
-        #[interpolate(flat)]
-        pub paint_color0: Vec4f,
-        #[location(2)]
-        #[interpolate(flat)]
-        pub paint_color1: Vec4f,
         #[location(3)]
         #[interpolate(flat)]
         pub shadow_id: u32,
@@ -221,9 +207,7 @@ pub mod shadow {
         let vertex = prepare_shadow_vertex(vertex_id, instance_id, shadow);
         ShadowVarying {
             position: vertex.position,
-            paint_solid: vertex.paint.solid,
-            paint_color0: vertex.paint.color0,
-            paint_color1: vertex.paint.color1,
+            paint_solid: vertex.paint,
             shadow_id: vertex.shadow_id,
             clip_distances: vertex.clip_distances,
         }
@@ -237,10 +221,9 @@ pub mod shadow {
         let shadow = get!(SHADOWS)[input.shadow_id as usize];
         let point = local_position(shadow.transform, scene_position(input.position.xy()));
         let color = paint_color(
-            shadow_paint(shadow),
-            point,
+            shadow.color,
             scene_position(input.position.xy()),
-            PreparedPaint::new(input.paint_solid, input.paint_color0, input.paint_color1),
+            input.paint_solid,
         );
         blend_color(
             color,
@@ -257,12 +240,6 @@ pub mod shadow {
         #[location(0)]
         #[interpolate(flat)]
         pub paint_solid: Vec4f,
-        #[location(1)]
-        #[interpolate(flat)]
-        pub paint_color0: Vec4f,
-        #[location(2)]
-        #[interpolate(flat)]
-        pub paint_color1: Vec4f,
         #[location(3)]
         #[interpolate(flat)]
         pub shadow_id: u32,
@@ -307,9 +284,7 @@ pub mod shadow {
 
         SmoothedShadowVarying {
             position: vertex.position,
-            paint_solid: vertex.paint.solid,
-            paint_color0: vertex.paint.color0,
-            paint_color1: vertex.paint.color1,
+            paint_solid: vertex.paint,
             shadow_id: vertex.shadow_id,
             clip_distances: vertex.clip_distances,
             horizontal_corner_reaches: prepared.horizontal_reaches,
@@ -344,10 +319,9 @@ pub mod shadow {
             },
         );
         let color = paint_color(
-            shadow_paint(shadow),
-            point,
+            shadow.color,
             scene_position(input.position.xy()),
-            PreparedPaint::new(input.paint_solid, input.paint_color0, input.paint_color1),
+            input.paint_solid,
         );
         blend_color(
             color,

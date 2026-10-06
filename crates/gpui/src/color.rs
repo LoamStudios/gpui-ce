@@ -571,8 +571,21 @@ impl Background {
         self.tag == BackgroundTag::Paint
     }
 
-    /// Points this background at entry `index` of the paint table, if it
-    /// draws one.
+    /// What a path painted with this background, already a solid colour or
+    /// a paint-table entry, paints with.
+    #[doc(hidden)]
+    pub fn paint_ref(&self) -> crate::ScenePaintRef {
+        crate::ScenePaintRef {
+            color: self.solid,
+            paint: if self.is_paint() {
+                self.paint_index()
+            } else {
+                0
+            },
+        }
+    }
+
+    /// Points a [`BackgroundTag::Paint`] background at entry `index`.
     pub(crate) fn set_paint_index(&mut self, index: u32) {
         self.gradient_angle_or_pattern_height = index as f32;
     }
