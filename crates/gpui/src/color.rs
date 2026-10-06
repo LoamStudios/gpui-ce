@@ -364,6 +364,14 @@ pub fn checkerboard(color: impl IntoColor<Hsla>, size: f32) -> Background {
     }
 }
 
+/// A background that draws entry `index` of a scene's paint table, as returned by
+/// [`Scene::push_gradient`](crate::Scene::push_gradient). For renderer tests, which build
+/// scenes directly; elements use [`Window::gradient`](crate::Window::gradient).
+#[doc(hidden)]
+pub fn paint_background(index: u32) -> Background {
+    Background::paint(index)
+}
+
 /// Creates a solid background color.
 pub fn solid_background(color: impl IntoColor<Hsla>) -> Background {
     Background {
