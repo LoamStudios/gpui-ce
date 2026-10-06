@@ -1204,6 +1204,22 @@ pub(crate) struct ViewChunk {
     placement: TransformationMatrix,
     /// Where it was drawn the frame before, to tell when it has settled.
     previous_placement: Option<TransformationMatrix>,
+    /// How far its operations have moved, in device pixels, from where the
+    /// view recorded them when it last rendered: what a cached view inside
+    /// it, reusing its operations from the chunk, moves back.
+    operations_moved: TransformationMatrix,
+}
+
+impl ViewChunk {
+    /// Where the view's scene operations are, for the cached views inside
+    /// it: in this chunk, moved by as much as they have moved since the view
+    /// rendered.
+    pub(crate) fn scene_records(&self) -> SceneRecords {
+        SceneRecords {
+            chunk: Some(self.chunk.clone()),
+            moved: self.operations_moved,
+        }
+    }
 }
 
 /// How far a chunk's scale may drift from the one it was prepared at while
@@ -1440,7 +1456,7 @@ pub(crate) struct Frame {
     pub(crate) tab_stops: TabStopMap,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub(crate) struct PrepaintStateIndex {
     hitboxes_index: ListIndex,
     tooltips_index: usize,
@@ -1449,7 +1465,7 @@ pub(crate) struct PrepaintStateIndex {
     line_layout_index: LineLayoutIndex,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub(crate) struct PaintIndex {
     scene_index: usize,
     mouse_listeners_index: usize,
@@ -1457,6 +1473,98 @@ pub(crate) struct PaintIndex {
     cursor_styles_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
+}
+
+impl PrepaintStateIndex {
+    /// This index, which lies after `from` in some records, moved with them
+    /// to start at `to`. Hitboxes are kept in subframes, found by id.
+    pub(crate) fn relocated(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            hitboxes_index: ListIndex::default(),
+            tooltips_index: to.tooltips_index + (self.tooltips_index - from.tooltips_index),
+            deferred_draws_index: to.deferred_draws_index
+                + (self.deferred_draws_index - from.deferred_draws_index),
+            dispatch_tree_index: to.dispatch_tree_index
+                + (self.dispatch_tree_index - from.dispatch_tree_index),
+            line_layout_index: self
+                .line_layout_index
+                .relocated(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
+
+    /// Whether `range` records no deferred draws, whose positions move with
+    /// the records of the view that holds them.
+    pub(crate) fn defers_nothing(range: &Range<Self>) -> bool {
+        range.start.deferred_draws_index == range.end.deferred_draws_index
+    }
+}
+
+impl PaintIndex {
+    /// This index, which lies after `from` in some records, moved with them
+    /// to start at `to`.
+    pub(crate) fn relocated(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            scene_index: to.scene_index + (self.scene_index - from.scene_index),
+            mouse_listeners_index: to.mouse_listeners_index
+                + (self.mouse_listeners_index - from.mouse_listeners_index),
+            input_handlers_index: to.input_handlers_index
+                + (self.input_handlers_index - from.input_handlers_index),
+            cursor_styles_index: to.cursor_styles_index
+                + (self.cursor_styles_index - from.cursor_styles_index),
+            tab_handle_index: to.tab_handle_index + (self.tab_handle_index - from.tab_handle_index),
+            line_layout_index: self
+                .line_layout_index
+                .relocated(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
+
+    pub(crate) fn scene_index(&self) -> usize {
+        self.scene_index
+    }
+
+    /// The scene operations `range` covers.
+    pub(crate) fn scene_range(range: &Range<Self>) -> Range<usize> {
+        range.start.scene_index..range.end.scene_index
+    }
+}
+
+/// A cached view rendering again in the frame being built, whose records in
+/// the frame before the cached views inside it may reuse theirs from.
+pub(crate) struct FreshView<I> {
+    /// The subframe it renders into now, and where its records start.
+    pub(crate) subframe: SubframeId,
+    pub(crate) start: I,
+    /// Its records in the rendered frame, if it was drawn there.
+    pub(crate) previous: Option<PreviousRecords<I>>,
+}
+
+/// Where a cached view's records lie in the frame before this one.
+#[derive(Clone)]
+pub(crate) struct PreviousRecords<I> {
+    pub(crate) subframe: SubframeId,
+    pub(crate) start: I,
+    /// Where its scene operations are, and how far they have moved, in device
+    /// pixels, since it last rendered.
+    pub(crate) scene: SceneRecords,
+}
+
+/// Where a cached view's scene operations are: in the rendered frame's
+/// scene, from its paint range, or in its chunk, from the start; and how far
+/// they have moved, in device pixels, since the view rendered.
+#[derive(Clone, Default)]
+pub(crate) struct SceneRecords {
+    pub(crate) chunk: Option<Rc<crate::SceneChunk>>,
+    pub(crate) moved: TransformationMatrix,
+}
+
+/// Where a reused cached view's scene operations are, if not at its paint
+/// range in the rendered frame's scene, unmoved.
+pub(crate) struct SceneSource {
+    pub(crate) chunk: Option<Rc<crate::SceneChunk>>,
+    pub(crate) range: Range<usize>,
+    /// How far they have moved, in device pixels, since the view's records
+    /// were where its cache key says.
+    pub(crate) moved: TransformationMatrix,
 }
 
 impl Frame {
@@ -1624,6 +1732,10 @@ pub struct Window {
     /// A chunk drawn stretched this frame will be prepared at its scale once
     /// its placement settles, which needs another frame.
     chunk_settling: bool,
+    /// The cached views rendering again, innermost last, in prepaint and in
+    /// paint: the cached views inside them reuse their records from theirs.
+    pub(crate) fresh_prepaints: Vec<FreshView<PrepaintStateIndex>>,
+    pub(crate) fresh_paints: Vec<FreshView<PaintIndex>>,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -2397,6 +2509,8 @@ impl Window {
             element_states: ElementStates::default(),
             subframe_stack: Vec::new(),
             chunk_settling: false,
+            fresh_prepaints: Vec::new(),
+            fresh_paints: Vec::new(),
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -4319,6 +4433,7 @@ impl Window {
                         deferred_draw.paint_range.clone(),
                         deferred_draw.reuse_placement,
                         None,
+                        None,
                         cx,
                     );
                 });
@@ -4546,7 +4661,8 @@ impl Window {
         &mut self,
         range: Range<PaintIndex>,
         placement: Placement,
-        chunk: Option<&mut Option<ViewChunk>>,
+        chunk: Option<(&mut Option<ViewChunk>, TransformationMatrix)>,
+        source: Option<SceneSource>,
         cx: &App,
     ) {
         self.next_frame.cursor_styles.extend(
@@ -4576,52 +4692,55 @@ impl Window {
             range.start.line_layout_index.clone()..range.end.line_layout_index.clone(),
         );
         let clip = self.snapped_content_mask();
-        let scale_factor = self.scale_factor();
-        if let Some(chunk) = chunk
-            && self.reuse_chunk(&range, placement, chunk, &clip, cx)
+        let source = source.unwrap_or_else(|| SceneSource {
+            chunk: None,
+            range: PaintIndex::scene_range(&range),
+            moved: TransformationMatrix::UNIT,
+        });
+        if let Some((chunk, records_moved)) = chunk
+            && self.reuse_chunk(&source, placement, chunk, records_moved, &clip, cx)
         {
             return;
         }
-        match placement {
-            Placement::Offset(offset) => {
-                let device_offset = self.element_offset_in_window(offset).scale(scale_factor);
-                self.next_frame.scene.replay_at(
-                    range.start.scene_index..range.end.scene_index,
-                    &self.rendered_frame.scene,
-                    device_offset,
-                    &clip,
-                );
-            }
-            Placement::Transform(transformation) => {
-                let device_placement = TransformationMatrix {
-                    translation: transformation.translation.map(|value| value * scale_factor),
-                    ..transformation
-                };
-                self.next_frame.scene.replay_placed(
-                    range.start.scene_index..range.end.scene_index,
-                    &self.rendered_frame.scene,
-                    &device_placement,
-                    &clip,
-                    &mut placed_rasterizer(&self.sprite_atlas, &self.text_system, &cx.svg_renderer),
-                );
-            }
+        // The operations as the view recorded them, moved by the placement:
+        // those that have moved since, inside a view reused while this one
+        // wasn't, are first moved back.
+        let moved = self.device_placement(placement);
+        let placed = moved.compose(source.moved.inverse().unwrap_or(TransformationMatrix::UNIT));
+        let previous = match &source.chunk {
+            Some(chunk) => &chunk.scene,
+            None => &self.rendered_frame.scene,
+        };
+        // A move by an offset is rounded to whole pixels, so its glyphs move
+        // as they are; any other placement rasterizes them again where they
+        // land.
+        if matches!(placement, Placement::Offset(_))
+            && placed.rotation_scale == TransformationMatrix::UNIT.rotation_scale
+        {
+            self.next_frame.scene.replay_at(
+                source.range,
+                previous,
+                point(
+                    ScaledPixels(placed.translation[0]),
+                    ScaledPixels(placed.translation[1]),
+                ),
+                &clip,
+            );
+        } else {
+            self.next_frame.scene.replay_placed(
+                source.range,
+                previous,
+                &placed,
+                &clip,
+                &mut placed_rasterizer(&self.sprite_atlas, &self.text_system, &cx.svg_renderer),
+            );
         }
     }
 
-    /// Draws a cached view's recording, `range` of the rendered frame's scene,
-    /// moved by `placement`, as a chunk: its chunk from before, placed
-    /// again, or, for a recording long enough to be worth one, a chunk made
-    /// from it. Returns whether it did.
-    fn reuse_chunk(
-        &mut self,
-        range: &Range<PaintIndex>,
-        placement: Placement,
-        chunk: &mut Option<ViewChunk>,
-        clip: &ContentMask<ScaledPixels>,
-        cx: &App,
-    ) -> bool {
+    /// `placement` of a view's records, in device pixels in the window.
+    pub(crate) fn device_placement(&self, placement: Placement) -> TransformationMatrix {
         let scale_factor = self.scale_factor();
-        let moved = match placement {
+        match placement {
             Placement::Offset(offset) => {
                 let offset = self.element_offset_in_window(offset).scale(scale_factor);
                 TransformationMatrix {
@@ -4633,13 +4752,28 @@ impl Window {
                 translation: transformation.translation.map(|value| value * scale_factor),
                 ..transformation
             },
-        };
+        }
+    }
+
+    /// Draws a cached view's recording, `range` of the rendered frame's scene,
+    /// moved by `placement`, as a chunk: its chunk from before, placed
+    /// again, or, for a recording long enough to be worth one, a chunk made
+    /// from it. Returns whether it did.
+    fn reuse_chunk(
+        &mut self,
+        source: &SceneSource,
+        placement: Placement,
+        chunk: &mut Option<ViewChunk>,
+        records_moved: TransformationMatrix,
+        clip: &ContentMask<ScaledPixels>,
+        cx: &App,
+    ) -> bool {
+        let moved = self.device_placement(placement);
         if chunk.is_none() {
             if !self.platform_window.supports_scene_chunks() {
                 return false;
             }
-            let operations = range.end.scene_index - range.start.scene_index;
-            if operations < crate::SceneChunk::MIN_OPERATIONS {
+            if source.range.len() < crate::SceneChunk::MIN_OPERATIONS {
                 return false;
             }
             let mut scene = Scene::default();
@@ -4656,19 +4790,22 @@ impl Window {
                 ),
                 ..Default::default()
             };
-            scene.replay_at(
-                range.start.scene_index..range.end.scene_index,
-                &self.rendered_frame.scene,
-                Point::default(),
-                &unbounded,
-            );
+            let previous = match &source.chunk {
+                Some(chunk) => &chunk.scene,
+                None => &self.rendered_frame.scene,
+            };
+            scene.replay_at(source.range.clone(), previous, Point::default(), &unbounded);
             let Some(made) = crate::SceneChunk::new(scene) else {
                 return false;
             };
+            // Its operations are where the source's were: moved, since the
+            // view's records were where its cache key says, by `source.moved`,
+            // and since it rendered, by `records_moved` before that.
             *chunk = Some(ViewChunk {
                 chunk: Rc::new(made),
-                placement: TransformationMatrix::UNIT,
+                placement: source.moved.inverse().unwrap_or(TransformationMatrix::UNIT),
                 previous_placement: None,
+                operations_moved: source.moved.compose(records_moved),
             });
         }
         let Some(chunk) = chunk else {
@@ -4730,6 +4867,7 @@ impl Window {
         );
         if let Some(prepared) = crate::SceneChunk::new(scene) {
             chunk.chunk = Rc::new(prepared);
+            chunk.operations_moved = chunk.placement.compose(chunk.operations_moved);
             chunk.placement = TransformationMatrix::UNIT;
             chunk.previous_placement = Some(chunk.placement);
         }

@@ -7,7 +7,7 @@ use crate::{
 };
 use crate::{
     Empty, Window,
-    window::{SubframeId, ViewChunk},
+    window::{FreshView, PreviousRecords, SceneRecords, SceneSource, SubframeId, ViewChunk},
 };
 use anyhow::Result;
 use collections::FxHashSet;
@@ -355,6 +355,17 @@ struct ViewElementState {
     subframe: SubframeId,
     /// The view's recording as a chunk, once it has been reused.
     chunk: Option<ViewChunk>,
+    /// The cached view it was last drawn inside while that one rendered, if
+    /// it was, and where that one's records started then: its own ranges lie
+    /// after those, by however much, wherever that one's records have gone.
+    nested: Option<NestedRecords>,
+    /// How far its scene operations have moved, in device pixels, since it
+    /// last rendered.
+    records_moved: TransformationMatrix,
+    /// Its paint records in the frame before it rendered again, kept from
+    /// prepaint, where it rendered, to paint, where the cached views inside
+    /// it reuse theirs from them.
+    previous_paint: Option<PreviousRecords<PaintIndex>>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
     /// Where the reused prepaint records were placed this frame, for paint to
@@ -378,6 +389,15 @@ pub struct ViewElementRequestLayoutState {
 struct ViewDirectionState {
     known: bool,
     contribution: Option<ResolvedDirection>,
+}
+
+/// Where a cached view's records started inside the cached view it was last
+/// drawn inside, while that one rendered.
+struct NestedRecords {
+    /// That view's subframe then.
+    subframe: SubframeId,
+    prepaint: PrepaintStateIndex,
+    paint: PaintIndex,
 }
 
 struct ViewElementCacheKey {
@@ -610,6 +630,69 @@ impl<V: View> Element for ViewElement<V> {
                     |element_state, window| {
                         let previous_subframe = element_state.as_ref().map(|state| state.subframe);
                         let subframe_placement = window.subframe_placement();
+                        // Its records in the frame before, if it was drawn
+                        // there, for the cached views inside it to reuse
+                        // theirs from if it renders again.
+                        let previous = element_state
+                            .as_ref()
+                            .filter(|state| state.frame == window.rendered_frame.id)
+                            .map(|state| {
+                                let scene = state.chunk.as_ref().map_or(
+                                    SceneRecords {
+                                        chunk: None,
+                                        moved: state.records_moved,
+                                    },
+                                    ViewChunk::scene_records,
+                                );
+                                (
+                                    PreviousRecords {
+                                        subframe: state.subframe,
+                                        start: state.prepaint_range.start.clone(),
+                                        scene: SceneRecords::default(),
+                                    },
+                                    PreviousRecords {
+                                        subframe: state.subframe,
+                                        start: state.paint_range.start.clone(),
+                                        scene,
+                                    },
+                                )
+                            });
+                        // The cached view rendering around it, if any, whose
+                        // records in the frame before hold its own.
+                        let parent = window.fresh_prepaints.last().map(|parent| {
+                            (
+                                parent.subframe,
+                                parent.start.clone(),
+                                parent.previous.clone(),
+                            )
+                        });
+                        let nested_here = || {
+                            parent.as_ref().map(|(subframe, start, _)| NestedRecords {
+                                subframe: *subframe,
+                                prepaint: start.clone(),
+                                paint: PaintIndex::default(),
+                            })
+                        };
+                        // Where its prepaint records are in the frame before.
+                        let reusable_range = |state: &ViewElementState| match &parent {
+                            None => Some(state.prepaint_range.clone()),
+                            Some((_, _, previous)) => {
+                                let previous = previous.as_ref()?;
+                                let nested = state.nested.as_ref()?;
+                                (nested.subframe == previous.subframe
+                                    && PrepaintStateIndex::defers_nothing(&state.prepaint_range))
+                                .then(|| {
+                                    state
+                                        .prepaint_range
+                                        .start
+                                        .relocated(&nested.prepaint, &previous.start)
+                                        ..state
+                                            .prepaint_range
+                                            .end
+                                            .relocated(&nested.prepaint, &previous.start)
+                                })
+                            }
+                        };
                         window.with_cached_view_recording(|window| {
                             let content_mask = window.content_mask();
                             let cache_key = ViewElementCacheKey {
@@ -636,12 +719,13 @@ impl<V: View> Element for ViewElement<V> {
                                 && !window.dirty_views.contains(&entity_id)
                                 && !window.refreshing
                                 && window.has_subframe(element_state.subframe)
+                                && let Some(prepaint_range) = reusable_range(&element_state)
                                 && let Some(placement) =
                                     element_state.reuse_placement(bounds, &content_mask, window)
                             {
                                 let prepaint_start = window.prepaint_index();
                                 window.reuse_prepaint_at(
-                                    element_state.prepaint_range.clone(),
+                                    prepaint_range,
                                     placement,
                                     Some(element_state.subframe),
                                     &subframe_placement,
@@ -651,6 +735,15 @@ impl<V: View> Element for ViewElement<V> {
                                 let prepaint_end = window.prepaint_index();
                                 element_state.frame = window.next_frame.id;
                                 element_state.prepaint_range = prepaint_start..prepaint_end;
+                                // Paint relocates its paint records from where
+                                // they were, then notes where they start now.
+                                match (element_state.nested.as_mut(), nested_here()) {
+                                    (Some(nested), Some(here)) => {
+                                        nested.subframe = here.subframe;
+                                        nested.prepaint = here.prepaint;
+                                    }
+                                    (_, here) => element_state.nested = here,
+                                }
                                 element_state.reuse_placement = placement;
                                 element_state.moved_since_render |= !placement.is_zero();
                                 // The records now describe the view here, clipped
@@ -672,9 +765,14 @@ impl<V: View> Element for ViewElement<V> {
                                 return (None, element_state);
                             }
 
-                            let refreshing = mem::replace(&mut window.refreshing, true);
                             let subframe = window.begin_subframe(previous_subframe);
                             let prepaint_start = window.prepaint_index();
+                            let (previous_prepaint, previous_paint) = previous.unzip();
+                            window.fresh_prepaints.push(FreshView {
+                                subframe,
+                                start: prepaint_start.clone(),
+                                previous: previous_prepaint,
+                            });
                             let mut accessed_entities =
                                 mem::take(&mut request_layout.accessed_entities);
                             let (element, additional_entities) =
@@ -710,8 +808,8 @@ impl<V: View> Element for ViewElement<V> {
                             }
 
                             let prepaint_end = window.prepaint_index();
+                            window.fresh_prepaints.pop();
                             window.end_subframe(subframe_placement);
-                            window.refreshing = refreshing;
 
                             (
                                 Some(element),
@@ -722,6 +820,9 @@ impl<V: View> Element for ViewElement<V> {
                                     paint_range: PaintIndex::default()..PaintIndex::default(),
                                     subframe,
                                     chunk: None,
+                                    nested: nested_here(),
+                                    records_moved: TransformationMatrix::UNIT,
+                                    previous_paint,
                                     cache_key,
                                     reuse_placement: Placement::default(),
                                     moved_since_render: false,
@@ -771,17 +872,40 @@ impl<V: View> Element for ViewElement<V> {
                             window.with_cached_view_recording(|window| {
                                 window.with_subframe(subframe, |window| {
                                     let paint_start = window.paint_index();
+                                    let parent_start = window
+                                        .fresh_paints
+                                        .last()
+                                        .map(|parent| parent.start.clone());
                                     if let Some(element) = element {
-                                        let refreshing = mem::replace(&mut window.refreshing, true);
+                                        window.fresh_paints.push(FreshView {
+                                            subframe,
+                                            start: paint_start.clone(),
+                                            previous: element_state.previous_paint.take(),
+                                        });
                                         element.paint(window, cx);
-                                        window.refreshing = refreshing;
+                                        window.fresh_paints.pop();
                                     } else {
+                                        let (range, source) =
+                                            reused_paint_records(&element_state, window);
+                                        let placement = element_state.reuse_placement;
                                         window.reuse_paint_at(
-                                            element_state.paint_range.clone(),
-                                            element_state.reuse_placement,
-                                            Some(&mut element_state.chunk),
+                                            range,
+                                            placement,
+                                            Some((
+                                                &mut element_state.chunk,
+                                                element_state.records_moved,
+                                            )),
+                                            source,
                                             cx,
                                         );
+                                        element_state.records_moved = window
+                                            .device_placement(placement)
+                                            .compose(element_state.records_moved);
+                                    }
+                                    if let (Some(nested), Some(parent_start)) =
+                                        (element_state.nested.as_mut(), parent_start)
+                                    {
+                                        nested.paint = parent_start;
                                     }
                                     let paint_end = window.paint_index();
                                     element_state.paint_range = paint_start..paint_end;
@@ -821,6 +945,43 @@ impl<V: View> Element for ViewElement<V> {
             );
         }
     }
+}
+
+/// Where a reused cached view's paint records are in the frame before: at
+/// its paint range, or, inside a cached view rendering again, as far into
+/// that one's records as they were when it was last drawn inside it, with
+/// its scene operations wherever that one's are.
+fn reused_paint_records(
+    state: &ViewElementState,
+    window: &Window,
+) -> (Range<PaintIndex>, Option<SceneSource>) {
+    let range = state.paint_range.clone();
+    let Some(parent) = window.fresh_paints.last() else {
+        return (range, None);
+    };
+    let (Some(previous), Some(nested)) = (parent.previous.as_ref(), state.nested.as_ref()) else {
+        debug_assert!(
+            false,
+            "a view reused inside one rendering again without its records"
+        );
+        return (range, None);
+    };
+    let relocated = range.start.relocated(&nested.paint, &previous.start)
+        ..range.end.relocated(&nested.paint, &previous.start);
+    let scene_range = match &previous.scene.chunk {
+        // The chunk holds the parent's operations from its first.
+        Some(_) => {
+            range.start.scene_index() - nested.paint.scene_index()
+                ..range.end.scene_index() - nested.paint.scene_index()
+        }
+        None => PaintIndex::scene_range(&relocated),
+    };
+    let source = SceneSource {
+        chunk: previous.scene.chunk.clone(),
+        range: scene_range,
+        moved: previous.scene.moved,
+    };
+    (relocated, Some(source))
 }
 
 #[cfg(test)]

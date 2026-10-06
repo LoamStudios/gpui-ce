@@ -803,13 +803,10 @@ fn cached_view_keeps_the_clips_inside_it_when_moved(cx: &mut TestAppContext) {
 }
 
 /// A cached view inside one that was reused for a frame, then rendered
-/// again, is drawn where it should be. It is rendered again too: a view that
-/// renders renders the cached views inside it (`Window::refreshing`), since
-/// their records index the frame they were made in, which may be older than
-/// the one before. Reusing them needs every frame list kept in subframes
-/// (decision 006 of workroom-canvas-gpui); then this counts one render.
+/// again, is reused from its records as they were last drawn: in the frame
+/// the outer view was reused in, not the one its own records were made in.
 #[crate::test]
-fn cached_view_inside_a_reused_one_is_drawn_right_after_it_renders_again(cx: &mut TestAppContext) {
+fn cached_view_inside_a_reused_one_is_reused_after_it_renders_again(cx: &mut TestAppContext) {
     let renders = Rc::new(Cell::new(0));
     let scroll = Rc::new(Cell::new(30.));
     let panel = Rc::new(std::cell::RefCell::new(None));
@@ -852,7 +849,7 @@ fn cached_view_inside_a_reused_one_is_drawn_right_after_it_renders_again(cx: &mu
     // And once more, with both reused.
     draw(cx, false);
 
-    assert_eq!(renders.get(), 2, "the card renders again with the panel");
+    assert_eq!(renders.get(), 1, "the card was never rendered again");
     assert_eq!(
         quads(cx, window),
         vec![(50., 50., 20., 20.), (50., 50., 100., 60.)],
@@ -862,5 +859,109 @@ fn cached_view_inside_a_reused_one_is_drawn_right_after_it_renders_again(cx: &mu
         hitboxes(cx, window).len(),
         1,
         "the card's hitbox is kept once"
+    );
+}
+
+/// A panel, cached, holding a card, cached, that nothing clips, so the card
+/// can be reused wherever the panel puts it.
+struct OpenPanel {
+    card: Entity<Card>,
+}
+
+impl Render for OpenPanel {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(150.)).child(
+            div()
+                .mt(px(20.))
+                .child(self.card.clone().cached(card_style())),
+        )
+    }
+}
+
+/// The open panel at (`x`, `y`).
+struct OpenPanelViewport {
+    panel: Entity<OpenPanel>,
+    at: Rc<Cell<(f32, f32)>>,
+}
+
+impl Render for OpenPanelViewport {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let (x, y) = self.at.get();
+        let mut style = StyleRefinement::default();
+        style.size.width = Some(px(150.).into());
+        style.size.height = Some(px(150.).into());
+        // A backdrop drawn first, so the panel's records don't start at the
+        // frame's first.
+        div()
+            .size(px(600.))
+            .bg(hsla(0.3, 0.2, 0.9, 1.0))
+            .on_mouse_down(MouseButton::Left, |_, _, _| {})
+            .child(
+                div()
+                    .ml(px(x))
+                    .mt(px(y))
+                    .child(self.panel.clone().cached(style)),
+            )
+    }
+}
+
+/// A cached view inside one that moved while reused, then rendered again
+/// somewhere else still, is reused from where its records moved to, and
+/// drawn, and hit, where it now is.
+#[crate::test]
+fn cached_view_is_reused_inside_one_that_moved_then_rendered_again(cx: &mut TestAppContext) {
+    let renders = Rc::new(Cell::new(0));
+    let at = Rc::new(Cell::new((50., 50.)));
+    let panel = Rc::new(std::cell::RefCell::new(None));
+    let window = cx.add_window({
+        let (renders, at, panel) = (renders.clone(), at.clone(), panel.clone());
+        move |_, cx| {
+            let entity = cx.new(|cx| OpenPanel {
+                card: cx.new(|_| Card { renders }),
+            });
+            *panel.borrow_mut() = Some(entity.clone());
+            OpenPanelViewport { panel: entity, at }
+        }
+    });
+    let window = AnyWindowHandle::from(window);
+    let panel = panel.borrow().clone().unwrap();
+    let draw = |cx: &mut TestAppContext, notify_panel: bool| {
+        cx.update_window(window, |root, window, cx| {
+            root.downcast::<OpenPanelViewport>()
+                .unwrap()
+                .update(cx, |_, cx| cx.notify());
+            if notify_panel {
+                panel.update(cx, |_, cx| cx.notify());
+            }
+            window.draw(cx).clear(cx)
+        })
+        .unwrap();
+    };
+
+    // Moved, the panel is reused with the card inside it.
+    at.set((80., 90.));
+    draw(cx, false);
+    // Moved again, the panel renders again; the card is reused from where
+    // the panel's last records put it.
+    at.set((120., 60.));
+    draw(cx, true);
+    // And once more, moved, with both reused.
+    at.set((130., 70.));
+    draw(cx, false);
+
+    assert_eq!(renders.get(), 1, "the card was never rendered again");
+    assert_eq!(
+        quads(cx, window),
+        vec![
+            (0., 0., 600., 600.),
+            (130., 90., 20., 20.),
+            (130., 90., 100., 100.)
+        ],
+        "the card is drawn where the panel now is"
+    );
+    assert_eq!(
+        hitboxes(cx, window),
+        vec![(0., 600.), (90., 100.)],
+        "the card's hitbox is where it is drawn"
     );
 }

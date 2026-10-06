@@ -2,7 +2,8 @@
 //! camera transform that moves and zooms it, and checks its pixels land
 //! where the transform puts them: its quads, and a path beside them. Once
 //! the camera settles, the chunk is prepared at the scale it is drawn at, so
-//! its text is sharper than when it was stretched.
+//! its text is sharper than when it was stretched. Rendered again, it
+//! reuses the cached view inside it from its chunk, in place.
 //!
 //! Runs only with `GPUI_RUN_RENDERING_TESTS` set, in an offscreen window;
 //! `GPUI_RENDERING_TEST_OUTPUT=<path.png>` saves the image.
@@ -14,7 +15,11 @@ use gpui::{
     px, rgb,
 };
 #[cfg(target_os = "macos")]
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::Cell,
+    rc::Rc,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 /// Cells per side of the grid, and their pitch and size.
 const CELLS: usize = 20;
@@ -35,8 +40,27 @@ fn cell_color(row: usize, column: usize) -> u32 {
     [0xff0000, 0x00c000, 0x0000ff, 0xffc000][(row + 2 * column) % 4]
 }
 
+/// A purple square, cached inside the grid, counting its renders.
 #[cfg(target_os = "macos")]
-struct Grid;
+struct Badge;
+
+static BADGE_RENDERS: AtomicUsize = AtomicUsize::new(0);
+/// Where the badge sits in the grid, and its side.
+const BADGE_ORIGIN: (f32, f32) = (430., 150.);
+const BADGE: f32 = 30.;
+
+#[cfg(target_os = "macos")]
+impl Render for Badge {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        BADGE_RENDERS.fetch_add(1, Ordering::Relaxed);
+        div().size(px(BADGE)).bg(rgb(0x8000ff))
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct Grid {
+    badge: Entity<Badge>,
+}
 
 #[cfg(target_os = "macos")]
 impl Render for Grid {
@@ -53,6 +77,16 @@ impl Render for Grid {
                     .size(px(CELL))
                     .bg(rgb(cell_color(row, column)))
             }))
+            .child({
+                let mut style = StyleRefinement::default();
+                style.size.width = Some(px(BADGE).into());
+                style.size.height = Some(px(BADGE).into());
+                div()
+                    .absolute()
+                    .left(px(BADGE_ORIGIN.0))
+                    .top(px(BADGE_ORIGIN.1))
+                    .child(self.badge.clone().cached(style))
+            })
             .child(
                 div()
                     .absolute()
@@ -127,7 +161,9 @@ fn render() {
             let camera = camera.clone();
             move |_, cx| {
                 cx.new(|cx| ChunksFixture {
-                    grid: cx.new(|_| Grid),
+                    grid: cx.new(|cx| Grid {
+                        badge: cx.new(|_| Badge),
+                    }),
                     camera,
                 })
             }
@@ -266,6 +302,47 @@ fn render() {
                 pixel(x, y).0
             ));
         }
+    }
+
+    // The grid renders again; the badge inside it is reused from the
+    // grid's chunk, prepared at the zoom, and drawn where it is.
+    cx.update_window(window, |root, window, cx| {
+        let grid = root
+            .downcast::<ChunksFixture>()
+            .unwrap()
+            .read(cx)
+            .grid
+            .clone();
+        grid.update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+    })
+    .expect("failed to draw the window");
+    let image = cx
+        .capture_screenshot(window)
+        .expect("failed to capture the rendered window");
+    let pixel = |x: f32, y: f32| *image.get_pixel((x * scale) as u32, (y * scale) as u32);
+    if BADGE_RENDERS.load(Ordering::Relaxed) != 1 {
+        failures.push(format!(
+            "badge: rendered {} times, not reused",
+            BADGE_RENDERS.load(Ordering::Relaxed)
+        ));
+    }
+    let (x, y) = (
+        on_screen(GRID_ORIGIN + BADGE_ORIGIN.0 + BADGE / 2., camera_x),
+        on_screen(GRID_ORIGIN + BADGE_ORIGIN.1 + BADGE / 2., camera_y),
+    );
+    if pixel(x, y).0[..3] != [0x80, 0x00, 0xff] {
+        failures.push(format!(
+            "badge after the grid rendered again: at ({x}, {y}) expected purple, got {:?}",
+            pixel(x, y).0
+        ));
+    }
+    let outside = on_screen(GRID_ORIGIN + BADGE_ORIGIN.0 + BADGE + 4., camera_x);
+    if pixel(outside, y).0[..3] != [255, 255, 255] {
+        failures.push(format!(
+            "beside the badge: at ({outside}, {y}) expected white, got {:?}",
+            pixel(outside, y).0
+        ));
     }
 
     std::mem::forget(cx);

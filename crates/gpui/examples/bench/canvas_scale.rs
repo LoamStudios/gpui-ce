@@ -20,6 +20,9 @@
 //! scale, and the camera is one transform on the page: zooming and panning
 //! change only that transform, so every item is reused, placed under it.
 //!
+//! With `--page --edit`, one item changes each frame, so the page renders
+//! again around it, every other item inside it reused.
+//!
 //! With `--pan=<zoom>`, the camera holds that zoom and pans across the grid
 //! instead of zooming, so items move without changing: what a cached item is
 //! reused for.
@@ -190,6 +193,10 @@ struct Stage {
     /// The item entities made so far, for `Draw::Cached`.
     entities: Vec<Option<Entity<Item>>>,
     page: Option<Entity<Page>>,
+    /// With `--edit`, one item changes each frame, as editing would change
+    /// it, so the page around it renders again.
+    edit: bool,
+    edits: usize,
     zoom: Rc<Cell<f32>>,
     /// Whether items showed their labels last frame, for `Draw::Transformed`,
     /// whose items are told when that changes.
@@ -211,6 +218,8 @@ impl Stage {
             motion,
             entities: Vec::new(),
             page: None,
+            edit: false,
+            edits: 0,
             zoom: Rc::new(Cell::new(1.0)),
             labelled: true,
             started: Instant::now(),
@@ -536,6 +545,11 @@ impl Stage {
                 })
             })
             .clone();
+        if self.edit {
+            self.edits += 1;
+            let item = page.read(cx).items[self.edits * 7919 % items].clone();
+            item.update(cx, |_, cx| cx.notify());
+        }
         // Items render their labels or not as the zoom crosses the width
         // that shows them: tell them, and the page, when it does.
         if labelled(zoom) != self.labelled {
@@ -701,6 +715,7 @@ fn run_example() {
             Motion::Pan(zoom.parse().expect("--pan=<zoom>, e.g. --pan=0.4"))
         });
     let onscreen = args.iter().any(|arg| arg == "--onscreen");
+    let edit = args.iter().any(|arg| arg == "--edit");
     let draws: Rc<RefCell<Vec<(Duration, Duration)>>> = Rc::default();
     // A benchmark run never takes the keyboard: the process cannot be
     // activated, and the window has no focus.
@@ -731,6 +746,7 @@ fn run_example() {
                     |_, cx| {
                         cx.new(|_| Stage {
                             draws: draws.clone(),
+                            edit,
                             ..Stage::new(items, draw, motion)
                         })
                     },

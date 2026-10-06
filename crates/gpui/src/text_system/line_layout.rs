@@ -1058,11 +1058,25 @@ fn repaint_shaped_text_layout(
     })
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub(crate) struct LineLayoutIndex {
     lines_index: usize,
     shaped_texts_index: usize,
     inline_layouts_index: usize,
+}
+
+impl LineLayoutIndex {
+    /// This index, which lies after `from` in some records, moved with them
+    /// to start at `to`.
+    pub(crate) fn relocated(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            lines_index: to.lines_index + (self.lines_index - from.lines_index),
+            shaped_texts_index: to.shaped_texts_index
+                + (self.shaped_texts_index - from.shaped_texts_index),
+            inline_layouts_index: to.inline_layouts_index
+                + (self.inline_layouts_index - from.inline_layouts_index),
+        }
+    }
 }
 
 impl LineLayoutCache {

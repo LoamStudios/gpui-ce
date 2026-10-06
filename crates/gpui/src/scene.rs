@@ -491,16 +491,37 @@ impl Scene {
                         Some(source.clone()),
                     ));
                 };
-                // Rasterized again only once it is known to be in view.
+                // Rasterized again only once it is known to be in view. Out of
+                // view, or with nothing to rasterize, it keeps its place in the
+                // recording, so the records after it keep their indices: a
+                // cached view inside this one finds its records by them.
                 sprite.place_uniformly(uniform, content_mask);
+                let source = source.placed(uniform);
                 if sprite
                     .bounds()
                     .intersect(&sprite.content_mask().bounds)
                     .is_empty()
                 {
-                    return None;
+                    return Some(ReplayOperation::Primitive(
+                        sprite,
+                        None,
+                        Some(Box::new(source)),
+                    ));
                 }
-                let raster = rasterize(source.placed(uniform))?;
+                let Some(raster) = rasterize(source.clone()) else {
+                    let empty = Bounds::new(sprite.bounds().origin, Size::default());
+                    match &mut sprite {
+                        Primitive::MonochromeSprite(sprite) => sprite.bounds = empty,
+                        Primitive::SubpixelSprite(sprite) => sprite.bounds = empty,
+                        Primitive::PolychromeSprite(sprite) => sprite.bounds = empty,
+                        _ => {}
+                    }
+                    return Some(ReplayOperation::Primitive(
+                        sprite,
+                        None,
+                        Some(Box::new(source)),
+                    ));
+                };
                 match &mut sprite {
                     Primitive::MonochromeSprite(sprite) => {
                         (sprite.bounds, sprite.tile) = (raster.bounds, raster.tile);
