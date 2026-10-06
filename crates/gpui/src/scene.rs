@@ -130,7 +130,22 @@ impl Scene {
     /// primitives' bounds, transformed into the viewport and clipped to their
     /// masks. `None` for a batch that draws nothing.
     pub(crate) fn batch_region(&self, batch: &PrimitiveBatch) -> Option<Bounds<ScaledPixels>> {
-        let region =
+        let mut union: Option<Bounds<ScaledPixels>> = None;
+        self.for_each_primitive_region(batch, &mut |bounds| {
+            union = Some(union.map_or(bounds, |union| union.union(&bounds)));
+        });
+        union
+    }
+
+    /// Calls `f` with the viewport bounds of each primitive `batch` draws,
+    /// transformed into the viewport and clipped to its mask, skipping those
+    /// that are empty.
+    pub(crate) fn for_each_primitive_region(
+        &self,
+        batch: &PrimitiveBatch,
+        f: &mut dyn FnMut(Bounds<ScaledPixels>),
+    ) {
+        let mut region =
             |bounds: Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>, transform: u32| {
                 let bounds = match transform {
                     0 => bounds,
@@ -143,64 +158,116 @@ impl Scene {
                         .map(|value| ScaledPixels(value.0))
                     }
                 };
-                bounds.intersect(&mask.bounds)
+                let bounds = bounds.intersect(&mask.bounds);
+                if !bounds.is_empty() {
+                    f(bounds);
+                }
             };
-        let union = |regions: &mut dyn Iterator<Item = Bounds<ScaledPixels>>| {
-            regions
-                .filter(|bounds| !bounds.is_empty())
-                .reduce(|union, bounds| union.union(&bounds))
-        };
         match batch {
-            PrimitiveBatch::Shadows { range, .. } => union(
-                &mut self.shadows[range.clone()]
-                    .iter()
-                    .map(|shadow| region(shadow.bounds, &shadow.content_mask, shadow.transform)),
-            ),
-            PrimitiveBatch::Quads { range, .. } => union(
-                &mut self.quads[range.clone()]
-                    .iter()
-                    .map(|quad| region(quad.bounds, &quad.content_mask, quad.transform)),
-            ),
-            PrimitiveBatch::Paths { range, .. } => union(
-                &mut self.paths[range.clone()]
-                    .iter()
-                    .map(|path| region(path.bounds, &path.content_mask, 0)),
-            ),
+            PrimitiveBatch::Shadows { range, .. } => {
+                for shadow in &self.shadows[range.clone()] {
+                    region(shadow.bounds, &shadow.content_mask, shadow.transform);
+                }
+            }
+            PrimitiveBatch::Quads { range, .. } => {
+                for quad in &self.quads[range.clone()] {
+                    region(quad.bounds, &quad.content_mask, quad.transform);
+                }
+            }
+            PrimitiveBatch::Paths { range, .. } => {
+                for path in &self.paths[range.clone()] {
+                    region(path.bounds, &path.content_mask, 0);
+                }
+            }
             PrimitiveBatch::Underlines(range) => {
-                union(&mut self.underlines[range.clone()].iter().map(|underline| {
+                for underline in &self.underlines[range.clone()] {
                     region(
                         underline.bounds,
                         &underline.content_mask,
                         underline.transform,
-                    )
-                }))
+                    );
+                }
             }
-            PrimitiveBatch::MonochromeSprites { range, .. } => union(
-                &mut self.monochrome_sprites[range.clone()]
-                    .iter()
-                    .map(|sprite| region(sprite.bounds, &sprite.content_mask, sprite.transform)),
-            ),
-            PrimitiveBatch::SubpixelSprites { range, .. } => union(
-                &mut self.subpixel_sprites[range.clone()]
-                    .iter()
-                    .map(|sprite| region(sprite.bounds, &sprite.content_mask, sprite.transform)),
-            ),
-            PrimitiveBatch::PolychromeSprites { range, .. } => union(
-                &mut self.polychrome_sprites[range.clone()]
-                    .iter()
-                    .map(|sprite| region(sprite.bounds, &sprite.content_mask, sprite.transform)),
-            ),
-            PrimitiveBatch::Surfaces(range) => union(
-                &mut self.surfaces[range.clone()]
-                    .iter()
-                    .map(|surface| region(surface.bounds, &surface.content_mask, 0)),
-            ),
-            PrimitiveBatch::BackdropFilters(range) => union(
-                &mut self.backdrop_filters[range.clone()]
-                    .iter()
-                    .map(|filter| region(filter.bounds, &filter.content_mask, 0)),
-            ),
-            PrimitiveBatch::GroupBoundary(_) => None,
+            PrimitiveBatch::MonochromeSprites { range, .. } => {
+                for sprite in &self.monochrome_sprites[range.clone()] {
+                    region(sprite.bounds, &sprite.content_mask, sprite.transform);
+                }
+            }
+            PrimitiveBatch::SubpixelSprites { range, .. } => {
+                for sprite in &self.subpixel_sprites[range.clone()] {
+                    region(sprite.bounds, &sprite.content_mask, sprite.transform);
+                }
+            }
+            PrimitiveBatch::PolychromeSprites { range, .. } => {
+                for sprite in &self.polychrome_sprites[range.clone()] {
+                    region(sprite.bounds, &sprite.content_mask, sprite.transform);
+                }
+            }
+            PrimitiveBatch::Surfaces(range) => {
+                for surface in &self.surfaces[range.clone()] {
+                    region(surface.bounds, &surface.content_mask, 0);
+                }
+            }
+            PrimitiveBatch::BackdropFilters(range) => {
+                for filter in &self.backdrop_filters[range.clone()] {
+                    region(filter.bounds, &filter.content_mask, 0);
+                }
+            }
+            PrimitiveBatch::GroupBoundary(_) => {}
+        }
+    }
+
+    /// Fades everything `batch` draws by `opacity`, as a group's opacity
+    /// folded into its primitives.
+    pub(crate) fn fade_batch(&mut self, batch: &PrimitiveBatch, opacity: f32) {
+        match batch {
+            PrimitiveBatch::Shadows { range, .. } => {
+                for shadow in &mut self.shadows[range.clone()] {
+                    shadow.color = shadow.color.opacity(opacity);
+                }
+            }
+            PrimitiveBatch::Quads { range, .. } => {
+                for quad in &mut self.quads[range.clone()] {
+                    quad.background = quad.background.opacity(opacity);
+                    quad.border_color = quad.border_color.opacity(opacity);
+                }
+            }
+            PrimitiveBatch::Paths { range, .. } => {
+                for path in &mut self.paths[range.clone()] {
+                    path.color = path.color.opacity(opacity);
+                }
+            }
+            PrimitiveBatch::Underlines(range) => {
+                for underline in &mut self.underlines[range.clone()] {
+                    underline.color = underline.color.opacity(opacity);
+                }
+            }
+            PrimitiveBatch::MonochromeSprites { range, .. } => {
+                for sprite in &mut self.monochrome_sprites[range.clone()] {
+                    sprite.color = sprite.color.opacity(opacity);
+                }
+            }
+            PrimitiveBatch::SubpixelSprites { range, .. } => {
+                for sprite in &mut self.subpixel_sprites[range.clone()] {
+                    sprite.color = sprite.color.opacity(opacity);
+                }
+            }
+            PrimitiveBatch::PolychromeSprites { range, .. } => {
+                for sprite in &mut self.polychrome_sprites[range.clone()] {
+                    sprite.opacity *= opacity;
+                }
+            }
+            PrimitiveBatch::Surfaces(range) => {
+                for surface_opacity in &mut self.surface_opacities[range.clone()] {
+                    *surface_opacity *= opacity;
+                }
+            }
+            PrimitiveBatch::BackdropFilters(range) => {
+                for filter in &mut self.backdrop_filters[range.clone()] {
+                    filter.opacity *= opacity;
+                }
+            }
+            PrimitiveBatch::GroupBoundary(_) => {}
         }
     }
 
@@ -950,7 +1017,19 @@ impl Scene {
         self.group_boundaries
             .sort_by_key(|boundary| (boundary.order, !boundary.is_start));
         let commands = std::mem::take(&mut self.render_plan.commands);
-        self.render_plan = ScenePlan::build(self, commands);
+        let folds = std::mem::take(&mut self.render_plan.folds);
+        self.render_plan = ScenePlan::build(self, commands, folds);
+        // Fade the groups drawn in place by their opacity, once: their
+        // markers lose it, so a plan built again draws them as they are.
+        let folds = std::mem::take(&mut self.render_plan.folds);
+        for fold in &folds {
+            for batch in &fold.batches {
+                self.fade_batch(batch, fold.opacity);
+            }
+            self.group_boundaries[fold.start].opacity = 1.0;
+            self.group_boundaries[fold.end].opacity = 1.0;
+        }
+        self.render_plan.folds = folds;
         self.is_finished = true;
     }
 
@@ -1019,6 +1098,16 @@ pub struct SceneHsla {
     /// Alpha, in a range from 0 to 1
     pub(crate) a: f32,
 }
+impl SceneHsla {
+    /// This colour with its alpha multiplied by `factor`.
+    pub(crate) fn opacity(self, factor: f32) -> Self {
+        Self {
+            a: self.a * factor,
+            ..self
+        }
+    }
+}
+
 impl Into<palette::Hsla> for SceneHsla {
     fn into(self) -> palette::Hsla {
         palette::Hsla::new(self.h * 360.0, self.s, self.l, self.a)
@@ -3465,6 +3554,85 @@ mod tests {
         assert!(scene.render_commands().is_empty());
         let scene = masked_scene(Some(rect(500., 500., 10., 10.)));
         assert!(scene.render_commands().is_empty());
+    }
+
+    /// A faded group whose primitives don't overlap draws in place, each
+    /// primitive faded, once however often the plan is built; one whose
+    /// primitives overlap is rendered on its own.
+    #[test]
+    fn a_faded_group_of_separate_primitives_draws_in_place() {
+        let rect = |x: f32, y: f32| Bounds {
+            origin: point(sp(x), sp(y)),
+            size: Size {
+                width: sp(20.),
+                height: sp(20.),
+            },
+        };
+        let wide_mask = ContentMask {
+            bounds: Bounds {
+                origin: point(sp(0.), sp(0.)),
+                size: Size {
+                    width: sp(1000.),
+                    height: sp(1000.),
+                },
+            },
+            ..Default::default()
+        };
+        let group = |is_start: bool| GroupBoundary {
+            order: 0,
+            bounds: wide_mask.bounds,
+            content_mask: wide_mask,
+            filters: SmallVec::new(),
+            opacity: 0.5,
+            blend_mode: BlendMode::Normal,
+            masked: false,
+            mask_mode: None,
+            is_start,
+        };
+        let quad_at = |bounds: Bounds<ScaledPixels>| Quad {
+            bounds,
+            content_mask: wide_mask,
+            background: crate::black().into(),
+            ..Default::default()
+        };
+        let faded_scene = |second: Bounds<ScaledPixels>| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(group(true));
+            scene.insert_primitive(quad_at(rect(0., 0.)));
+            scene.insert_primitive(quad_at(second));
+            scene.insert_primitive(group(false));
+            scene.finish();
+            scene
+        };
+        let begin_target = |scene: &Scene| {
+            scene
+                .render_commands()
+                .iter()
+                .find_map(|command| match command {
+                    RenderCommand::BeginGroup { target, .. } => Some(*target),
+                    _ => None,
+                })
+        };
+
+        let mut scene = faded_scene(rect(50., 0.));
+        assert_eq!(begin_target(&scene), Some(GroupTarget::Inline));
+        let alphas = |scene: &Scene| {
+            scene
+                .quads
+                .iter()
+                .map(|quad| quad.background.solid.a)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(alphas(&scene), vec![0.5, 0.5]);
+        scene.finish();
+        assert_eq!(alphas(&scene), vec![0.5, 0.5], "faded once");
+
+        let scene = faded_scene(rect(10., 10.));
+        assert!(matches!(
+            begin_target(&scene),
+            Some(GroupTarget::Isolated { .. })
+        ));
+        assert_eq!(alphas(&scene), vec![1.0, 1.0]);
     }
 
     #[test]

@@ -43,6 +43,9 @@ pub struct ScenePlanRequirements {
 pub struct ScenePlan {
     // Retain this allocation across `Scene::clear`/`Scene::finish`; scenes are rebuilt every frame.
     pub(super) commands: Vec<RenderCommand>,
+    /// Groups drawn in place with their opacity folded into what they draw,
+    /// for [`Scene::finish`] to fade.
+    pub(super) folds: Vec<OpacityFold>,
     requirements: ScenePlanRequirements,
     scene_lengths: SceneLengths,
 }
@@ -50,12 +53,18 @@ pub struct ScenePlan {
 impl ScenePlan {
     pub(super) fn clear(&mut self) {
         self.commands.clear();
+        self.folds.clear();
         self.requirements = ScenePlanRequirements::default();
         self.scene_lengths = SceneLengths::default();
     }
 
-    pub(super) fn build(scene: &Scene, mut commands: Vec<RenderCommand>) -> Self {
+    pub(super) fn build(
+        scene: &Scene,
+        mut commands: Vec<RenderCommand>,
+        mut folds: Vec<OpacityFold>,
+    ) -> Self {
         commands.clear();
+        folds.clear();
         commands.reserve(scene.len());
         let mut matched_starts =
             SmallVec::<[bool; 8]>::from_elem(false, scene.group_boundaries.len());
@@ -121,7 +130,19 @@ impl ScenePlan {
                                 GroupTarget::Isolated { region }
                             }
                             Some(region) if matched && start.isolates() && !region.is_empty() => {
-                                GroupTarget::Isolated { region }
+                                match foldable_batches(scene, start, &commands[group.command + 1..])
+                                {
+                                    Some(batches) => {
+                                        folds.push(OpacityFold {
+                                            start: group.boundary_index,
+                                            end: boundary_index,
+                                            opacity: start.opacity,
+                                            batches,
+                                        });
+                                        GroupTarget::Inline
+                                    }
+                                    None => GroupTarget::Isolated { region },
+                                }
                             }
                             None if matched && start.masked => {
                                 commands.truncate(group.command);
@@ -182,6 +203,7 @@ impl ScenePlan {
         requirements.command_count = commands.len();
         Self {
             commands,
+            folds,
             requirements,
             scene_lengths: SceneLengths::for_scene(scene),
         }
@@ -204,6 +226,67 @@ impl ScenePlan {
             "scene primitive storage changed after Scene::finish"
         );
     }
+}
+
+/// A faded group drawn in place: its markers, its opacity, and the batches
+/// it draws, to be faded by it.
+#[derive(Debug)]
+pub(super) struct OpacityFold {
+    pub(super) start: usize,
+    pub(super) end: usize,
+    pub(super) opacity: f32,
+    pub(super) batches: SmallVec<[PrimitiveBatch; 4]>,
+}
+
+/// Groups that fade up to this many primitives are checked for overlap,
+/// pair by pair; larger ones are rendered on their own.
+const MAX_FOLDED_PRIMITIVES: usize = 16;
+
+/// The batches of a group that only fades, whose `commands` draw nothing
+/// that overlaps, so fading each primitive fades the group as one picture:
+/// `None` when the group must be rendered on its own.
+fn foldable_batches(
+    scene: &Scene,
+    start: &GroupBoundary,
+    commands: &[RenderCommand],
+) -> Option<SmallVec<[PrimitiveBatch; 4]>> {
+    if start.blend_mode != BlendMode::Normal
+        || start.max_blur_radius() > 0.0
+        || start.masked
+        || start.mask_mode.is_some()
+    {
+        return None;
+    }
+    let mut batches = SmallVec::new();
+    let mut regions = SmallVec::<[Bounds<ScaledPixels>; MAX_FOLDED_PRIMITIVES]>::new();
+    let mut overflowed = false;
+    for command in commands {
+        // A nested group, or a backdrop filter, which reads what the group
+        // has drawn so far, needs the group's own target.
+        let RenderCommand::Batch(batch) = command else {
+            return None;
+        };
+        if matches!(batch, PrimitiveBatch::BackdropFilters(_)) {
+            return None;
+        }
+        scene.for_each_primitive_region(batch, &mut |region| {
+            if overflowed
+                || regions.len() == MAX_FOLDED_PRIMITIVES
+                || regions
+                    .iter()
+                    .any(|other| !other.intersect(&region).is_empty())
+            {
+                overflowed = true;
+            } else {
+                regions.push(region);
+            }
+        });
+        if overflowed {
+            return None;
+        }
+        batches.push(batch.clone());
+    }
+    Some(batches)
 }
 
 impl ScenePlanRequirements {

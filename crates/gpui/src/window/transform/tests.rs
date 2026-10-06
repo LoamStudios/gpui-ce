@@ -486,7 +486,8 @@ impl Render for NestedFades {
 }
 
 /// Content that does not overlap the elements that make its groups still
-/// falls inside every one of them.
+/// falls inside every one of them. The innermost group fades one square,
+/// so it is drawn in place, the square faded.
 #[crate::test]
 fn content_falls_inside_the_groups_that_enclose_it(cx: &mut TestAppContext) {
     let window: AnyWindowHandle = cx.add_window(|_, _| NestedFades).into();
@@ -511,7 +512,7 @@ fn content_falls_inside_the_groups_that_enclose_it(cx: &mut TestAppContext) {
             .collect();
         assert_eq!(
             commands,
-            ["begin", "begin", "begin", "quad", "end", "end", "end"]
+            ["begin", "begin", "inline", "quad", "inline", "end", "end"]
         );
     })
     .unwrap();
