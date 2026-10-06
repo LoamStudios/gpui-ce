@@ -44,7 +44,7 @@ impl PhotoTiles {
         let Some(uploads) = &scene.photo_uploads else {
             return;
         };
-        let (layers, tiles) = uploads.take();
+        let (layers, tiles) = uploads.take(self.layers);
         if layers > self.layers {
             let texture = new_array(device, PHOTO_LAYER_SIZE, layers, self.storage_mode);
             let side = PHOTO_LAYER_SIZE as u64;

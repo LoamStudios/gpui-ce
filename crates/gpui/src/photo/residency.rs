@@ -43,6 +43,8 @@ pub struct PhotoUploads {
 struct PhotoUploadState {
     layers: u32,
     tiles: Vec<PhotoTileUpload>,
+    /// How many layers the renderer's array held when it last took tiles.
+    held: u32,
     /// Whether the renderer lost what its array held.
     lost: bool,
 }
@@ -63,21 +65,24 @@ pub struct PhotoTileUpload {
 
 impl PhotoUploads {
     /// How many layers of [`PHOTO_LAYER_SIZE`] pixels square the photo
-    /// texture array needs, and the tiles to copy into it, which are taken.
-    /// The array keeps what was copied into it as it grows.
-    pub fn take(&self) -> (u32, Vec<PhotoTileUpload>) {
+    /// texture array needs, and the tiles to copy into it, which are taken,
+    /// for a renderer whose array holds `held` layers of tiles. The array
+    /// keeps what was copied into it as it grows.
+    ///
+    /// An array that holds fewer layers than it did, as when the renderer's
+    /// device is lost and its array made again, has lost its tiles: there
+    /// are none to copy, and the window places them all again.
+    pub fn take(&self, held: u32) -> (u32, Vec<PhotoTileUpload>) {
         let mut state = self.state.lock();
+        if held < state.held {
+            state.lost = true;
+            state.layers = 0;
+            state.held = 0;
+            state.tiles.clear();
+            return (0, Vec::new());
+        }
+        state.held = state.layers.max(held);
         (state.layers, std::mem::take(&mut state.tiles))
-    }
-
-    /// Tells the window the renderer lost what its photo texture array held,
-    /// as when its device is lost and made again: the window places and
-    /// uploads every tile again, from a new, empty array.
-    pub fn lose(&self) {
-        let mut state = self.state.lock();
-        state.lost = true;
-        state.layers = 0;
-        state.tiles.clear();
     }
 }
 
@@ -602,6 +607,19 @@ mod tests {
         residency.frame += 1;
         assert!(residency.allocate(tile).is_some());
         assert!(residency.tiles.len() < placed as usize);
+    }
+
+    #[test]
+    fn an_array_holding_fewer_layers_than_it_did_has_lost_its_tiles() {
+        let uploads = PhotoUploads::default();
+        uploads.state.lock().layers = 2;
+        assert_eq!(uploads.take(0).0, 2, "a new array grows to what is placed");
+        assert_eq!(uploads.take(2).0, 2);
+        assert!(!uploads.state.lock().lost);
+
+        // Made again, empty, after the device was lost.
+        assert_eq!(uploads.take(0).0, 0);
+        assert!(uploads.state.lock().lost);
     }
 
     #[test]

@@ -73,7 +73,7 @@ impl PhotoTiles {
         let Some(uploads) = &scene.photo_uploads else {
             return false;
         };
-        let (layers, tiles) = uploads.take();
+        let (layers, tiles) = uploads.take(self.layers);
         let mut replaced = false;
         if layers > self.layers {
             let limits = device.limits();

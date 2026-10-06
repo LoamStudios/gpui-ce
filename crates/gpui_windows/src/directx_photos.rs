@@ -83,7 +83,7 @@ impl PhotoTiles {
         let Some(uploads) = &scene.photo_uploads else {
             return Ok(());
         };
-        let (layers, tiles) = uploads.take();
+        let (layers, tiles) = uploads.take(self.layers);
         if layers > self.layers {
             let (texture, view) = new_array(device, PHOTO_LAYER_SIZE, layers)?;
             for layer in 0..self.layers {
