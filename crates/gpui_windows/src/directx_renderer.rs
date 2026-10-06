@@ -3494,7 +3494,7 @@ mod tests {
         ImageId, MonochromeSprite, PlacedChunk, PlatformAtlas, Point, PolychromeSprite, Primitive,
         PrimitiveBatch, Quad, RenderCommand, RenderImageParams, RenderSvgParams, ScaledPixels,
         Scene, SceneChunk, SceneClip, ScenePaintRef, SceneTransform, ShaderBool, Size,
-        TransformationMatrix, WindowBackgroundAppearance, hsla, rgb, rgb_to_hsla, solid_background,
+        TransformationMatrix, WindowBackgroundAppearance, hsla, rgb, rgb_to_hsla,
     };
     use std::borrow::Cow;
     use std::rc::Rc;
@@ -3564,7 +3564,7 @@ mod tests {
             scene.insert_primitive(Quad {
                 bounds,
                 content_mask: full_mask(),
-                background: solid_background(hsla(0.05, 0.8, 0.45, 1.0)),
+                background: gpui::ScenePaintRef::from(hsla(0.05, 0.8, 0.45, 1.0)),
                 border_style: BorderStyle::Dashed,
                 border_dashed_length: dash_length,
                 border_dashed_gap: dash_gap,
@@ -3674,7 +3674,7 @@ mod tests {
             order: 0,
             bounds: scaled(10.0, 10.0, 30.0, 30.0),
             content_mask: full_mask(),
-            background: solid_background(green),
+            background: gpui::ScenePaintRef::from(green),
             ..Default::default()
         });
         scene.insert_primitive(MonochromeSprite {
@@ -3706,7 +3706,7 @@ mod tests {
             order: 0,
             bounds: scaled(60.0, 70.0, 30.0, 30.0),
             content_mask: full_mask(),
-            background: solid_background(blue),
+            background: gpui::ScenePaintRef::from(blue),
             ..Default::default()
         });
         scene.finish();
@@ -3766,7 +3766,7 @@ mod tests {
             transform,
             bounds: scaled(10.0, 40.0, 30.0, 20.0),
             content_mask: full_mask(),
-            background: solid_background(green),
+            background: gpui::ScenePaintRef::from(green),
             ..Default::default()
         });
         // A full quad, x 100..200, clipped to x 130..170 and y 40..60 in the space of a
@@ -3789,7 +3789,7 @@ mod tests {
             clip,
             bounds: scaled(100.0, 0.0, 100.0, 100.0),
             content_mask: full_mask(),
-            background: solid_background(green),
+            background: gpui::ScenePaintRef::from(green),
             ..Default::default()
         });
         scene.finish();
