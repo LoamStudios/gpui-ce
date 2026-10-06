@@ -16,7 +16,7 @@ use gpui_render::shaders::{
 
 use super::{
     WgpuRenderer,
-    buffers::{DynamicUniformBuffer, InstanceBufferArena},
+    buffers::{DynamicUniformBuffer, InstanceBufferArena, InstanceTransport, SceneTable},
     filters::FrameUniformRequirements,
     pipelines::{WgpuBindGroupLayouts, WgpuPipelines},
     settings::RenderingParameters,
@@ -51,6 +51,8 @@ pub(super) struct WgpuResources {
     pub(super) filter_uniforms: DynamicUniformBuffer<BlurUniforms>,
     blur_bind_groups: RefCell<BlurBindGroups>,
     pub(super) globals_buffer: wgpu::Buffer,
+    globals_offsets: GlobalOffsets,
+    scene_tables: SceneTables,
     pub(super) globals_bind_group: wgpu::BindGroup,
     pub(super) path_globals_bind_group: wgpu::BindGroup,
     pub(super) instances: InstanceBufferArena,
@@ -66,6 +68,28 @@ pub(super) struct WgpuResources {
     pub(super) blur_pong_view: Option<wgpu::TextureView>,
     pub(super) filter_group_textures: Vec<wgpu::Texture>,
     pub(super) filter_group_views: Vec<wgpu::TextureView>,
+}
+
+/// Where each group-0 uniform lives in `globals_buffer`.
+#[derive(Clone, Copy)]
+struct GlobalOffsets {
+    path_globals: u64,
+    font_rasterization: u64,
+}
+
+/// The scene's transform and clip tables, bound in group 0 beside the frame uniforms.
+struct SceneTables {
+    transforms: SceneTable<gpui::SceneTransform>,
+    clips: SceneTable<gpui::SceneClip>,
+}
+
+impl SceneTables {
+    fn new(device: &wgpu::Device, transport: InstanceTransport) -> Self {
+        Self {
+            transforms: SceneTable::new(device, "scene_transforms", transport),
+            clips: SceneTable::new(device, "scene_clips", transport),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -140,25 +164,18 @@ impl WgpuResources {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let create_globals = |label, offset| {
-            bind_group_layouts.create_globals(
-                &device,
-                label,
-                wgpu::BufferBinding {
-                    buffer: &globals_buffer,
-                    offset,
-                    size: NonZeroU64::new(globals_size),
-                },
-                wgpu::BufferBinding {
-                    buffer: &globals_buffer,
-                    offset: gamma_offset,
-                    size: NonZeroU64::new(gamma_size),
-                },
-            )
+        let globals_offsets = GlobalOffsets {
+            path_globals: path_globals_offset,
+            font_rasterization: gamma_offset,
         };
-        let globals_bind_group = create_globals("globals_bind_group", 0);
-        let path_globals_bind_group =
-            create_globals("path_globals_bind_group", path_globals_offset);
+        let scene_tables = SceneTables::new(&device, InstanceTransport::from_tier(renderer_tier));
+        let (globals_bind_group, path_globals_bind_group) = create_globals_bind_groups(
+            &device,
+            &bind_group_layouts,
+            &globals_buffer,
+            globals_offsets,
+            &scene_tables,
+        );
         let last_error = context.uncaptured_error_slot();
         let surface_cache = SurfaceCache::new(&device)?;
 
@@ -185,6 +202,8 @@ impl WgpuResources {
             filter_uniforms,
             blur_bind_groups: RefCell::default(),
             globals_buffer,
+            globals_offsets,
+            scene_tables,
             globals_bind_group,
             path_globals_bind_group,
             path_intermediate_texture: None,
@@ -220,6 +239,36 @@ impl WgpuResources {
         self.filter_group_views.clear();
     }
 
+    /// Uploads the scene's transform and clip tables, growing them, and rebuilding the
+    /// group-0 bind groups that reference them, as needed. Returns false when the device
+    /// cannot hold them.
+    pub(super) fn upload_scene_tables(&mut self, scene: &gpui::Scene) -> bool {
+        let transforms = scene.transforms();
+        let clips = scene.clips();
+        let (Some(transforms_grew), Some(clips_grew)) = (
+            self.scene_tables
+                .transforms
+                .ensure_capacity(&self.device, transforms.len() as u64),
+            self.scene_tables
+                .clips
+                .ensure_capacity(&self.device, clips.len() as u64),
+        ) else {
+            return false;
+        };
+        if transforms_grew || clips_grew {
+            (self.globals_bind_group, self.path_globals_bind_group) = create_globals_bind_groups(
+                &self.device,
+                &self.bind_group_layouts,
+                &self.globals_buffer,
+                self.globals_offsets,
+                &self.scene_tables,
+            );
+        }
+        self.scene_tables.transforms.write(&self.queue, transforms);
+        self.scene_tables.clips.write(&self.queue, clips);
+        true
+    }
+
     pub(super) fn finish_frame_uploads(&self) {
         self.filter_uniforms.finish_upload();
         self.surface_uniforms.finish_upload();
@@ -249,6 +298,40 @@ impl WgpuResources {
             })
             .clone()
     }
+}
+
+/// Creates the scene and path group-0 bind groups, which differ only in their globals.
+fn create_globals_bind_groups(
+    device: &wgpu::Device,
+    layouts: &WgpuBindGroupLayouts,
+    globals_buffer: &wgpu::Buffer,
+    offsets: GlobalOffsets,
+    tables: &SceneTables,
+) -> (wgpu::BindGroup, wgpu::BindGroup) {
+    let globals_size = NonZeroU64::new(std::mem::size_of::<GlobalUniforms>() as u64);
+    let font_size = NonZeroU64::new(std::mem::size_of::<FontRasterizationUniforms>() as u64);
+    let create = |label, offset| {
+        layouts.create_globals(
+            device,
+            label,
+            wgpu::BufferBinding {
+                buffer: globals_buffer,
+                offset,
+                size: globals_size,
+            },
+            wgpu::BufferBinding {
+                buffer: globals_buffer,
+                offset: offsets.font_rasterization,
+                size: font_size,
+            },
+            tables.transforms.binding(),
+            tables.clips.binding(),
+        )
+    };
+    (
+        create("globals_bind_group", 0),
+        create("path_globals_bind_group", offsets.path_globals),
+    )
 }
 
 impl WgpuRenderer {

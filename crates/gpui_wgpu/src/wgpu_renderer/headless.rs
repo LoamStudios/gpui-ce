@@ -151,9 +151,19 @@ pub struct WgpuHeadlessRenderer {
 
 impl WgpuHeadlessRenderer {
     pub fn new() -> anyhow::Result<Self> {
-        let context = WgpuContext::new_headless(None)?;
+        Self::from_context(&WgpuContext::new_headless(None)?)
+    }
+
+    /// A renderer on the downlevel (WebGL2/GLES) tier, which reads scene data from data
+    /// textures, whatever the GPU supports.
+    #[cfg(feature = "test-support")]
+    pub fn new_downlevel() -> anyhow::Result<Self> {
+        Self::from_context(&WgpuContext::new_headless_downlevel()?)
+    }
+
+    fn from_context(context: &WgpuContext) -> anyhow::Result<Self> {
         let renderer = WgpuRenderer::new_headless(
-            &context,
+            context,
             Size {
                 width: DevicePixels(1),
                 height: DevicePixels(1),

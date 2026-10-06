@@ -478,7 +478,8 @@ impl InstanceBufferArena {
                 wgpu::BufferUsages::STORAGE,
             )),
             InstanceTransport::DataTexture => {
-                let texture = create_data_texture(device, capacity / TEXEL_BYTES);
+                let texture =
+                    create_data_texture(device, "instance_data_texture", capacity / TEXEL_BYTES);
                 let view = view_of(&texture);
                 InstanceStorage::DataTexture {
                     texture,
@@ -560,7 +561,11 @@ impl InstanceBufferArena {
             } => {
                 if required > self.capacity {
                     self.capacity = required.next_power_of_two().min(self.maximum_size);
-                    *texture = create_data_texture(device, self.capacity / TEXEL_BYTES);
+                    *texture = create_data_texture(
+                        device,
+                        "instance_data_texture",
+                        self.capacity / TEXEL_BYTES,
+                    );
                     *view = view_of(texture);
                     *staging = create_buffer(
                         device,
@@ -706,6 +711,183 @@ impl InstanceBufferArena {
     }
 }
 
+/// A per-frame scene table that every pipeline reads through group 0, from entry zero.
+///
+/// The storage-buffer transport binds it as a read-only storage buffer; the data-texture
+/// transport packs its entries into an `rgba32uint` texture that the generated
+/// `dl_load_<TABLE>` decoders read from texel zero.
+pub(super) struct SceneTable<T> {
+    label: &'static str,
+    storage: SceneTableStorage,
+    /// Entries the current storage holds.
+    capacity: u64,
+    /// Entries the device can hold in one binding.
+    maximum: u64,
+    value: PhantomData<T>,
+}
+
+enum SceneTableStorage {
+    Buffer(wgpu::Buffer),
+    DataTexture {
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+    },
+}
+
+impl<T: BufferData> SceneTable<T> {
+    // Most frames hold only the identity entry; transformed UI grows the table geometrically.
+    const INITIAL_CAPACITY: u64 = 64;
+    const STRIDE: u64 = std::mem::size_of::<T>() as u64;
+
+    pub(super) fn new(
+        device: &wgpu::Device,
+        label: &'static str,
+        transport: InstanceTransport,
+    ) -> Self {
+        let maximum_bytes = match transport {
+            InstanceTransport::StorageBuffer => device
+                .limits()
+                .max_buffer_size
+                .min(device.limits().max_storage_buffer_binding_size),
+            InstanceTransport::DataTexture => {
+                u64::from(DATA_TEXTURE_WIDTH)
+                    * u64::from(device.limits().max_texture_dimension_2d)
+                    * TEXEL_BYTES
+            }
+        };
+        let maximum = maximum_bytes / Self::STRIDE;
+        let capacity = Self::INITIAL_CAPACITY.min(maximum);
+        Self {
+            label,
+            storage: Self::create_storage(device, label, transport, capacity),
+            capacity,
+            maximum,
+            value: PhantomData,
+        }
+    }
+
+    fn create_storage(
+        device: &wgpu::Device,
+        label: &str,
+        transport: InstanceTransport,
+        capacity: u64,
+    ) -> SceneTableStorage {
+        let bytes = capacity * Self::STRIDE;
+        match transport {
+            InstanceTransport::StorageBuffer => SceneTableStorage::Buffer(create_buffer(
+                device,
+                label,
+                bytes,
+                wgpu::BufferUsages::STORAGE,
+            )),
+            InstanceTransport::DataTexture => {
+                let texture = create_data_texture(device, label, bytes.div_ceil(TEXEL_BYTES));
+                let view = view_of(&texture);
+                SceneTableStorage::DataTexture { texture, view }
+            }
+        }
+    }
+
+    /// Grows the table to hold `entries`. Returns whether its storage was replaced, in
+    /// which case the bind groups that reference it must be recreated, or `None` when the
+    /// device cannot hold that many entries.
+    pub(super) fn ensure_capacity(&mut self, device: &wgpu::Device, entries: u64) -> Option<bool> {
+        if entries <= self.capacity {
+            return Some(false);
+        }
+        if entries > self.maximum {
+            log::error!(
+                "scene requires {entries} {} entries, exceeding the GPU limit of {}",
+                self.label,
+                self.maximum
+            );
+            return None;
+        }
+        let transport = match self.storage {
+            SceneTableStorage::Buffer(_) => InstanceTransport::StorageBuffer,
+            SceneTableStorage::DataTexture { .. } => InstanceTransport::DataTexture,
+        };
+        self.capacity = entries.next_power_of_two().min(self.maximum);
+        self.storage = Self::create_storage(device, self.label, transport, self.capacity);
+        Some(true)
+    }
+
+    /// Schedules `entries` to be written before the next submission.
+    pub(super) fn write(&self, queue: &wgpu::Queue, entries: &[T]) {
+        assert!(
+            entries.len() as u64 <= self.capacity,
+            "{} capacity must be ensured before uploading",
+            self.label
+        );
+        let bytes = shader_interface::slice_as_bytes(entries);
+        match &self.storage {
+            SceneTableStorage::Buffer(buffer) => queue.write_buffer(buffer, 0, bytes),
+            SceneTableStorage::DataTexture { texture, .. } => {
+                write_data_texture(queue, texture, bytes)
+            }
+        }
+    }
+
+    pub(super) fn binding(&self) -> wgpu::BindingResource<'_> {
+        match &self.storage {
+            SceneTableStorage::Buffer(buffer) => {
+                wgpu::BindingResource::Buffer(whole_buffer(buffer))
+            }
+            SceneTableStorage::DataTexture { view, .. } => wgpu::BindingResource::TextureView(view),
+        }
+    }
+}
+
+/// Writes `bytes` into a data texture from texel zero, in `DATA_TEXTURE_WIDTH`-texel rows.
+fn write_data_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, bytes: &[u8]) {
+    let padded;
+    let bytes = if (bytes.len() as u64).is_multiple_of(TEXEL_BYTES) {
+        bytes
+    } else {
+        let mut copy = bytes.to_vec();
+        copy.resize(
+            (bytes.len() as u64).next_multiple_of(TEXEL_BYTES) as usize,
+            0,
+        );
+        padded = copy;
+        &padded
+    };
+    let row_texels = u64::from(DATA_TEXTURE_WIDTH);
+    let texels = bytes.len() as u64 / TEXEL_BYTES;
+    let full_rows = texels / row_texels;
+    let remainder = texels % row_texels;
+    let full_bytes = (full_rows * row_texels * TEXEL_BYTES) as usize;
+    let write = |data: &[u8], y: u64, width: u64, height: u64| {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: y as u32,
+                    z: 0,
+                },
+                ..texture.as_image_copy()
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some((width * TEXEL_BYTES) as u32),
+                rows_per_image: Some(height as u32),
+            },
+            wgpu::Extent3d {
+                width: width as u32,
+                height: height as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+    };
+    if full_rows > 0 {
+        write(&bytes[..full_bytes], 0, row_texels, full_rows);
+    }
+    if remainder > 0 {
+        write(&bytes[full_bytes..], full_rows, remainder, 1);
+    }
+}
+
 /// Creates the group-1 bind group for the arena's current storage.
 fn instance_bind_group(
     device: &wgpu::Device,
@@ -722,9 +904,9 @@ fn instance_bind_group(
     layouts.create_instances(device, source)
 }
 
-fn create_data_texture(device: &wgpu::Device, texels: u64) -> wgpu::Texture {
+fn create_data_texture(device: &wgpu::Device, label: &str, texels: u64) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("instance_data_texture"),
+        label: Some(label),
         size: wgpu::Extent3d {
             width: DATA_TEXTURE_WIDTH,
             height: texels.div_ceil(u64::from(DATA_TEXTURE_WIDTH)) as u32,

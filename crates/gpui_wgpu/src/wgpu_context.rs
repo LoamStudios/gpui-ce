@@ -487,6 +487,21 @@ impl WgpuContext {
     pub fn new_headless(
         extra_requirements: Option<&WgpuDeviceRequirements>,
     ) -> anyhow::Result<Self> {
+        Self::new_headless_with_tier(extra_requirements, None)
+    }
+
+    /// A headless context on the downlevel (WebGL2/GLES) tier whatever the adapter
+    /// supports, so tests can exercise the data-texture transport on any GPU.
+    #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+    pub fn new_headless_downlevel() -> anyhow::Result<Self> {
+        Self::new_headless_with_tier(None, Some(RendererTier::WebGl2))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn new_headless_with_tier(
+        extra_requirements: Option<&WgpuDeviceRequirements>,
+        tier: Option<RendererTier>,
+    ) -> anyhow::Result<Self> {
         NativeBackend::try_in_preference_order("a headless GPU context", |backend| {
             let instance = backend.instance(None);
             let adapter =
@@ -500,7 +515,12 @@ impl WgpuContext {
                 .map_err(|error| {
                     anyhow::anyhow!("failed to request headless GPU adapter: {error}")
                 })?;
-            let device = gpui::block_on(Self::create_device(&adapter, extra_requirements))?;
+            let tier = tier.unwrap_or_else(|| renderer_tier(&adapter));
+            let device = gpui::block_on(Self::create_device_for_tier(
+                &adapter,
+                extra_requirements,
+                tier,
+            ))?;
             Self::from_created_device(instance.raw, adapter, device)
         })
     }
@@ -639,7 +659,14 @@ impl WgpuContext {
         adapter: &wgpu::Adapter,
         extra_requirements: Option<&WgpuDeviceRequirements>,
     ) -> anyhow::Result<CreatedDevice> {
-        let renderer_tier = renderer_tier(adapter);
+        Self::create_device_for_tier(adapter, extra_requirements, renderer_tier(adapter)).await
+    }
+
+    async fn create_device_for_tier(
+        adapter: &wgpu::Adapter,
+        extra_requirements: Option<&WgpuDeviceRequirements>,
+        renderer_tier: RendererTier,
+    ) -> anyhow::Result<CreatedDevice> {
         // Our LCD shader uses storage buffers even when the adapter exposes dual-source
         // blending. Downlevel devices must use grayscale and the data-texture dialect.
         let dual_source_blending = renderer_tier == RendererTier::Modern
@@ -969,10 +996,14 @@ impl WgpuContext {
     }
 }
 
+/// Storage buffers one modern-tier shader stage reads: the scene's transform and clip
+/// tables, and its instances.
+const MODERN_STORAGE_BUFFERS_PER_STAGE: u32 = 3;
+
 fn renderer_tier(adapter: &wgpu::Adapter) -> RendererTier {
     let limits = adapter.limits();
     let flags = adapter.get_downlevel_capabilities().flags;
-    if limits.max_storage_buffers_per_shader_stage > 0
+    if limits.max_storage_buffers_per_shader_stage >= MODERN_STORAGE_BUFFERS_PER_STAGE
         && flags.contains(wgpu::DownlevelFlags::VERTEX_STORAGE)
         && flags.contains(wgpu::DownlevelFlags::FRAGMENT_STORAGE)
     {

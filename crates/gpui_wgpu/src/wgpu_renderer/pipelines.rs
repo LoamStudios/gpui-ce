@@ -2,9 +2,9 @@ use crate::RendererTier;
 use gpui_render::{
     artifacts::{
         BASE_DOWNLEVEL_WGSL, BASE_WGSL, BLUR_BINDINGS, DOWNLEVEL_BLUR_BINDINGS,
-        DOWNLEVEL_INSTANCE_BINDINGS, DOWNLEVEL_RANGE_BINDING, DOWNLEVEL_SURFACE_BINDINGS,
-        DOWNLEVEL_TEXTURED_INSTANCE_BINDINGS, GLOBAL_BINDINGS, GeneratedBinding,
-        GeneratedBindingKind, INSTANCE_BINDINGS, MONOCHROME_INSTANCE_BINDINGS,
+        DOWNLEVEL_GLOBAL_BINDINGS, DOWNLEVEL_INSTANCE_BINDINGS, DOWNLEVEL_RANGE_BINDING,
+        DOWNLEVEL_SURFACE_BINDINGS, DOWNLEVEL_TEXTURED_INSTANCE_BINDINGS, GLOBAL_BINDINGS,
+        GeneratedBinding, GeneratedBindingKind, INSTANCE_BINDINGS, MONOCHROME_INSTANCE_BINDINGS,
         SUBPIXEL_DUAL_SOURCE_WGSL, SUBPIXEL_INSTANCE_BINDINGS, SURFACE_BINDINGS,
         TEXTURED_INSTANCE_BINDINGS,
     },
@@ -118,6 +118,7 @@ pub(super) struct WgpuBindGroupLayouts {
 impl WgpuBindGroupLayouts {
     pub(super) fn new(device: &wgpu::Device, tier: RendererTier) -> Self {
         let (
+            global_table,
             instance_table,
             monochrome_table,
             subpixel_table,
@@ -127,6 +128,7 @@ impl WgpuBindGroupLayouts {
             instance_dynamic,
         ) = match tier {
             RendererTier::Modern => (
+                GLOBAL_BINDINGS,
                 INSTANCE_BINDINGS,
                 MONOCHROME_INSTANCE_BINDINGS,
                 SUBPIXEL_INSTANCE_BINDINGS,
@@ -136,6 +138,7 @@ impl WgpuBindGroupLayouts {
                 None,
             ),
             RendererTier::WebGl2 => (
+                DOWNLEVEL_GLOBAL_BINDINGS,
                 DOWNLEVEL_INSTANCE_BINDINGS,
                 DOWNLEVEL_TEXTURED_INSTANCE_BINDINGS,
                 DOWNLEVEL_TEXTURED_INSTANCE_BINDINGS,
@@ -145,7 +148,7 @@ impl WgpuBindGroupLayouts {
                 Some(DOWNLEVEL_RANGE_BINDING),
             ),
         };
-        let globals = generated_bind_group_layout(device, "globals_layout", GLOBAL_BINDINGS, None);
+        let globals = generated_bind_group_layout(device, "globals_layout", global_table, None);
         let instances = generated_bind_group_layout(
             device,
             "instances_layout",
@@ -193,12 +196,16 @@ impl WgpuBindGroupLayouts {
         }
     }
 
+    /// Creates the group-0 bind group: frame uniforms and the scene's transform and clip
+    /// tables, as storage buffers or, downlevel, data textures.
     pub(super) fn create_globals(
         &self,
         device: &wgpu::Device,
         label: &str,
         globals: wgpu::BufferBinding,
         font_rasterization: wgpu::BufferBinding,
+        transforms: wgpu::BindingResource,
+        clips: wgpu::BindingResource,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
@@ -211,6 +218,14 @@ impl WgpuBindGroupLayouts {
                 wgpu::BindGroupEntry {
                     binding: shader::FONT_RASTERIZATION_BINDING,
                     resource: wgpu::BindingResource::Buffer(font_rasterization),
+                },
+                wgpu::BindGroupEntry {
+                    binding: shader::TRANSFORMS_BINDING,
+                    resource: transforms,
+                },
+                wgpu::BindGroupEntry {
+                    binding: shader::CLIPS_BINDING,
+                    resource: clips,
                 },
             ],
         })
@@ -744,7 +759,14 @@ mod tests {
             size: NonZeroU64::new(256),
         };
 
-        let _globals = layouts.create_globals(device, "test_globals", binding(), binding());
+        let _globals = layouts.create_globals(
+            device,
+            "test_globals",
+            binding(),
+            binding(),
+            wgpu::BindingResource::Buffer(binding()),
+            wgpu::BindingResource::Buffer(binding()),
+        );
         let _instances = layouts.create_instances(device, InstanceBindingSource::Buffer(binding()));
         let _textured = layouts.create_textured_instances(
             device,
@@ -768,7 +790,7 @@ mod tests {
     /// The downlevel artifacts must also build and bind against a real device.
     #[test]
     fn downlevel_tier_builds_pipelines_and_data_texture_arena() -> anyhow::Result<()> {
-        use super::super::buffers::{InstanceBufferArena, InstanceTransport};
+        use super::super::buffers::{InstanceBufferArena, InstanceTransport, SceneTable};
         use gpui::Quad;
 
         let context = WgpuContext::new_headless(None)?;
@@ -785,6 +807,41 @@ mod tests {
             tier,
         );
         assert!(pipelines.quads.fixed_vertex_count() > 0);
+
+        // The group-0 scene tables become data textures, read from texel zero.
+        let mut transforms = SceneTable::<gpui::SceneTransform>::new(
+            device,
+            "downlevel_test_transforms",
+            InstanceTransport::DataTexture,
+        );
+        let clips = SceneTable::<gpui::SceneClip>::new(
+            device,
+            "downlevel_test_clips",
+            InstanceTransport::DataTexture,
+        );
+        assert_eq!(transforms.ensure_capacity(device, 1), Some(false));
+        assert_eq!(transforms.ensure_capacity(device, 3000), Some(true));
+        transforms.write(&context.queue, &[gpui::SceneTransform::IDENTITY; 3000]);
+        clips.write(&context.queue, &[gpui::SceneClip::default(); 3]);
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("downlevel_test_uniforms"),
+            size: 256,
+            usage: wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+        let uniform = || wgpu::BufferBinding {
+            buffer: &uniforms,
+            offset: 0,
+            size: NonZeroU64::new(256),
+        };
+        let _globals = layouts.create_globals(
+            device,
+            "downlevel_test_globals",
+            uniform(),
+            uniform(),
+            transforms.binding(),
+            clips.binding(),
+        );
 
         let mut arena = InstanceBufferArena::new(device, &layouts, tier);
         assert_eq!(arena.transport(), InstanceTransport::DataTexture);

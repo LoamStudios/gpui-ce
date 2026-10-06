@@ -87,6 +87,9 @@ impl PreparedTargets {
                 requirements.instance_batches,
             )?
         };
+        if !renderer.resources_mut().upload_scene_tables(scene) {
+            return None;
+        }
         if !renderer.ensure_uniform_capacity(requirements.uniforms) {
             return None;
         }
