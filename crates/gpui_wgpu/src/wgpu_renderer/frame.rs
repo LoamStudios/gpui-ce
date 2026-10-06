@@ -28,7 +28,7 @@ pub(super) fn render_to_view(
     renderer.retain_surface_cache(&scene.surfaces);
 
     match FrameEncoder::new(renderer, scene, targets).encode(readback) {
-        Ok(command_buffer) => Some(renderer.resources().queue.submit([command_buffer])),
+        Ok(command_buffers) => Some(renderer.resources().queue.submit(command_buffers)),
         Err(DrawError::ExternalSurface) => None,
         Err(DrawError::CapacityPlanningInvariant) => {
             log::error!("frame storage exceeded its precomputed capacity");
@@ -87,6 +87,9 @@ impl PreparedTargets {
                 requirements.instance_batches,
             )?
         };
+        if !renderer.resources_mut().upload_scene_tables(scene) {
+            return None;
+        }
         if !renderer.ensure_uniform_capacity(requirements.uniforms) {
             return None;
         }
@@ -343,10 +346,13 @@ impl<'a> FrameEncoder<'a> {
         }
     }
 
+    /// Encodes the frame. Instances are written while the passes are recorded, so the
+    /// downlevel staging-to-texture copy travels in a command buffer of its own, submitted
+    /// before the passes that read the texture.
     fn encode(
         mut self,
         readback: Option<ReadbackCopy<'_>>,
-    ) -> Result<wgpu::CommandBuffer, DrawError> {
+    ) -> Result<[wgpu::CommandBuffer; 2], DrawError> {
         let result = self.encode_commands();
         if result.is_ok() {
             if let Some(offscreen) = &self.offscreen {
@@ -372,10 +378,15 @@ impl<'a> FrameEncoder<'a> {
                 );
             }
         }
-        self.instances.finish(&mut self.encoder);
+        let mut uploads = self.renderer.resources().device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor {
+                label: Some("gpui_frame_uploads"),
+            },
+        );
+        self.instances.finish(&mut uploads);
         self.renderer.resources().finish_frame_uploads();
-        let command_buffer = self.encoder.finish();
-        result.map(|()| command_buffer)
+        let command_buffers = [uploads.finish(), self.encoder.finish()];
+        result.map(|()| command_buffers)
     }
 
     fn encode_commands(&mut self) -> DrawResult {

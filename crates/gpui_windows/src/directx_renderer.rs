@@ -47,15 +47,23 @@ const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
-// Group 0 occupies registers 0 and 1 in native shaders, so generated group-1 bindings start at 2.
-const GROUP_1_REGISTER_OFFSET: u32 = 2;
-const DATA_REGISTER: u32 = shader_interface::DATA_BUFFER_BINDING + GROUP_1_REGISTER_OFFSET;
-const PRIMARY_TEXTURE_REGISTER: u32 =
-    shader_interface::PRIMARY_TEXTURE_BINDING + GROUP_1_REGISTER_OFFSET;
-const PRIMARY_SAMPLER_REGISTER: u32 =
-    shader_interface::PRIMARY_SAMPLER_BINDING + GROUP_1_REGISTER_OFFSET;
-const SURFACE_SAMPLER_REGISTER: u32 =
-    shader_interface::SURFACE_SAMPLER_BINDING + GROUP_1_REGISTER_OFFSET;
+// Native shaders number group 0's registers first and group 1's after them.
+const fn global_register(binding: u32) -> u32 {
+    shader_interface::native_slot(shader_interface::GLOBAL_BIND_GROUP, binding)
+}
+const fn data_register(binding: u32) -> u32 {
+    shader_interface::native_slot(shader_interface::DATA_BIND_GROUP, binding)
+}
+/// The scene's transform and clip tables, bound together from this register.
+const SCENE_TABLES_REGISTER: u32 = global_register(shader_interface::TRANSFORMS_BINDING);
+const _: () = assert!(
+    global_register(shader_interface::CLIPS_BINDING) == SCENE_TABLES_REGISTER + 1,
+    "the clip table must follow the transform table"
+);
+const DATA_REGISTER: u32 = data_register(shader_interface::DATA_BUFFER_BINDING);
+const PRIMARY_TEXTURE_REGISTER: u32 = data_register(shader_interface::PRIMARY_TEXTURE_BINDING);
+const PRIMARY_SAMPLER_REGISTER: u32 = data_register(shader_interface::PRIMARY_SAMPLER_BINDING);
+const SURFACE_SAMPLER_REGISTER: u32 = data_register(shader_interface::SURFACE_SAMPLER_BINDING);
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -268,12 +276,72 @@ struct DirectXGlobalElements {
     /// Per-draw [`Dx11DrawConstants`]; rewritten before every instanced draw.
     draw_constants_buffer: ID3D11Buffer,
     sampler: Option<ID3D11SamplerState>,
+    transforms: SceneTableBuffer<SceneTransform>,
+    clips: SceneTableBuffer<SceneClip>,
 }
 
 impl DirectXGlobalElements {
     /// Global constant buffers at registers b0 (globals) and b1 (font rasterization).
     fn cbuffers(&self) -> [Option<ID3D11Buffer>; 2] {
         [self.globals_buffer.clone(), self.font_buffer.clone()]
+    }
+
+    /// The transform and clip tables, for registers from [`SCENE_TABLES_REGISTER`].
+    fn scene_tables(&self) -> [Option<ID3D11ShaderResourceView>; 2] {
+        [self.transforms.view.clone(), self.clips.view.clone()]
+    }
+}
+
+/// A per-frame scene table that every batch pipeline reads in both stages, entry zero first.
+struct SceneTableBuffer<T> {
+    label: &'static str,
+    buffer: ID3D11Buffer,
+    view: Option<ID3D11ShaderResourceView>,
+    capacity: usize,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T> SceneTableBuffer<T> {
+    // Most frames hold only entry zero; transformed UI grows the table geometrically.
+    const INITIAL_CAPACITY: usize = 64;
+
+    fn new(device: &ID3D11Device, label: &'static str) -> Result<Self> {
+        let buffer = create_buffer(device, std::mem::size_of::<T>(), Self::INITIAL_CAPACITY)?;
+        let view = create_buffer_view(device, &buffer)?;
+        Ok(Self {
+            label,
+            buffer,
+            view,
+            capacity: Self::INITIAL_CAPACITY,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    fn update(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        entries: &[T],
+    ) -> Result<()> {
+        if self.capacity < entries.len() {
+            let element_size = std::mem::size_of::<T>();
+            let max_entries = MAX_INSTANCE_BUFFER_SIZE / element_size;
+            anyhow::ensure!(
+                entries.len() <= max_entries,
+                "{} needs {} entries, above the {MAX_INSTANCE_BUFFER_SIZE}-byte limit",
+                self.label,
+                entries.len(),
+            );
+            let capacity = entries
+                .len()
+                .checked_next_power_of_two()
+                .unwrap_or(max_entries)
+                .min(max_entries);
+            self.buffer = create_buffer(device, element_size, capacity)?;
+            self.view = create_buffer_view(device, &self.buffer)?;
+            self.capacity = capacity;
+        }
+        update_buffer(device_context, &self.buffer, entries)
     }
 }
 
@@ -906,6 +974,15 @@ impl DirectXRenderer {
 
     fn upload_scene_buffers(&mut self, scene: &Scene) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
+
+        self.globals.transforms.update(
+            &devices.device,
+            &devices.device_context,
+            scene.transforms(),
+        )?;
+        self.globals
+            .clips
+            .update(&devices.device, &devices.device_context, scene.clips())?;
 
         if !scene.shadows.is_empty() {
             self.pipelines.shadow_pipeline.update_buffer(
@@ -1781,6 +1858,8 @@ impl DirectXGlobalElements {
             font_buffer: Some(font_buffer),
             draw_constants_buffer,
             sampler,
+            transforms: SceneTableBuffer::new(device, "scene_transforms")?,
+            clips: SceneTableBuffer::new(device, "scene_clips")?,
         })
     }
 }
@@ -2015,7 +2094,10 @@ impl<T> PipelineState<T> {
             }
         };
         let draw_constants = [Some(frame.globals.draw_constants_buffer.clone())];
+        let scene_tables = frame.globals.scene_tables();
         unsafe {
+            ctx.VSSetShaderResources(SCENE_TABLES_REGISTER, Some(&scene_tables));
+            ctx.PSSetShaderResources(SCENE_TABLES_REGISTER, Some(&scene_tables));
             ctx.VSSetShaderResources(DATA_REGISTER, Some(slice::from_ref(&self.view)));
             ctx.PSSetShaderResources(DATA_REGISTER, Some(slice::from_ref(&self.view)));
             ctx.IASetPrimitiveTopology(topology);
@@ -2827,12 +2909,13 @@ mod tests {
     // Explicit imports: a glob of `super` would also pull in gpui's `#[test]` proc macro.
     use super::DirectXRenderer;
     use crate::directx_devices::DirectXDevices;
-    use anyhow::Result;
+    use anyhow::{Context as _, Result};
     use gpui::{
         AtlasKey, AtlasTile, BorderStyle, Bounds, ContentMask, Corners, DevicePixels, Edges,
         ImageId, MonochromeSprite, PlatformAtlas, Point, PolychromeSprite, PrimitiveBatch, Quad,
-        RenderCommand, RenderImageParams, RenderSvgParams, ScaledPixels, Scene, ShaderBool, Size,
-        WindowBackgroundAppearance, hsla, rgb, rgb_to_hsla, solid_background,
+        RenderCommand, RenderImageParams, RenderSvgParams, ScaledPixels, Scene, SceneClip,
+        SceneTransform, ShaderBool, Size, TransformationMatrix, WindowBackgroundAppearance, hsla,
+        rgb, rgb_to_hsla, solid_background,
     };
     use std::borrow::Cow;
     use windows::Win32::Foundation::HWND;
@@ -3015,6 +3098,8 @@ mod tests {
             ..Default::default()
         });
         scene.insert_primitive(MonochromeSprite {
+            transform: 0,
+            clip: 0,
             order: 0,
             padding: 0,
             bounds: scaled(10.0, 60.0, 30.0, 30.0),
@@ -3024,6 +3109,8 @@ mod tests {
             transformation: Default::default(),
         });
         scene.insert_primitive(PolychromeSprite {
+            transform: 0,
+            clip: 0,
             order: 0,
             grayscale: ShaderBool::Disabled,
             opacity: 1.0,
@@ -3067,6 +3154,84 @@ mod tests {
         expect("polychrome sprite", 55, 65, [255, 0, 0]);
         expect("second quad batch", 85, 85, [0, 0, 255]);
         expect("background", 190, 20, [255, 255, 255]);
+        Ok(())
+    }
+
+    /// A transform-table entry moves a quad, and a transformed clip-table entry cuts one;
+    /// neither would land here if the tables were not bound or not uploaded.
+    #[test]
+    fn scene_tables_reach_directx_shaders() -> Result<()> {
+        let window = HiddenWindow::new()?;
+        let devices = DirectXDevices::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        renderer.resize(Size {
+            width: DevicePixels(200),
+            height: DevicePixels(100),
+        })?;
+        let green = rgb_to_hsla(rgb(0x00ff00));
+        // A quarter turn clockwise about (50, 50): a point at (x, y) lands at (100 - y, x).
+        let turn = TransformationMatrix {
+            rotation_scale: [[0.0, -1.0], [1.0, 0.0]],
+            translation: [100.0, 0.0],
+        };
+        let quarter_turn = SceneTransform {
+            transformation: turn,
+            inverse: turn.inverse().context("a rotation is invertible")?,
+        };
+
+        let mut scene = Scene::default();
+        let transform = scene.push_transform(quarter_turn);
+        // A horizontal bar, x 10..40 and y 40..60, turned into x 40..60 and y 10..40.
+        scene.insert_primitive(Quad {
+            transform,
+            bounds: scaled(10.0, 40.0, 30.0, 20.0),
+            content_mask: full_mask(),
+            background: solid_background(green),
+            ..Default::default()
+        });
+        // A full quad, x 100..200, clipped to x 130..170 and y 40..60 in the space of a
+        // quarter turn about (150, 50): x 140..160 and y 30..70 in the viewport.
+        let shifted = TransformationMatrix {
+            rotation_scale: turn.rotation_scale,
+            translation: [200.0, -100.0],
+        };
+        let clip_transform = scene.push_transform(SceneTransform {
+            transformation: shifted,
+            inverse: shifted.inverse().context("a rotation is invertible")?,
+        });
+        let clip = scene.push_clip(SceneClip {
+            bounds: scaled(130.0, 40.0, 40.0, 20.0),
+            corner_radii: Corners::default(),
+            transform: clip_transform,
+            parent: 0,
+        });
+        scene.insert_primitive(Quad {
+            clip,
+            bounds: scaled(100.0, 0.0, 100.0, 100.0),
+            content_mask: full_mask(),
+            background: solid_background(green),
+            ..Default::default()
+        });
+        scene.finish();
+
+        let image = renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+        for (what, x, y, painted) in [
+            ("transformed bar", 50, 15, true),
+            ("transformed bar", 55, 35, true),
+            ("untransformed bar", 15, 50, false),
+            ("untransformed bar", 35, 55, false),
+            ("transformed clip", 150, 35, true),
+            ("transformed clip", 155, 65, true),
+            ("untransformed clip", 135, 50, false),
+            ("outside the clip", 190, 90, false),
+        ] {
+            let [r, g, b, _] = image.get_pixel(x, y).0;
+            assert_eq!(
+                (r, g, b) == (0, 255, 0),
+                painted,
+                "{what} at ({x},{y}) rendered ({r},{g},{b})"
+            );
+        }
         Ok(())
     }
 }

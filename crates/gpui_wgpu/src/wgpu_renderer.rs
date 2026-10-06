@@ -471,6 +471,8 @@ mod tests {
         // Forces a non-zero first-instance index in the mixed-type arena.
         scene.insert_primitive(Quad::default());
         scene.insert_primitive(Underline {
+            transform: 0,
+            clip: 0,
             order: 0,
             padding: 0,
             bounds,
@@ -844,6 +846,8 @@ mod tests {
                 ..Default::default()
             });
             scene.insert_primitive(Underline {
+                transform: 0,
+                clip: 0,
                 order: index * 2 + 1,
                 padding: 0,
                 bounds,

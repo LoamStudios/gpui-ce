@@ -89,6 +89,8 @@ fn unplanned_mixed_scene(count: usize) -> Scene {
             ..Default::default()
         });
         scene.insert_primitive(Underline {
+            transform: 0,
+            clip: 0,
             order: (index * 2 + 1) as u32,
             padding: 0,
             bounds,
