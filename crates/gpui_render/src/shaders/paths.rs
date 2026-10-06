@@ -99,7 +99,12 @@ pub mod path {
         let vertex = rectangle_vertex(vertex_id, sprite.bounds);
         PathVarying {
             position: vertex.clip_position,
-            texture_coords: vertex.viewport_position / get!(GLOBALS).viewport_size,
+            // The path was rasterized where a chunk's placement put it.
+            texture_coords: apply_affine(
+                get!(GLOBALS).placement,
+                get!(GLOBALS).placement_translation,
+                vertex.viewport_position,
+            ) / get!(GLOBALS).viewport_size,
         }
     }
 

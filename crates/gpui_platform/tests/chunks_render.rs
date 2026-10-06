@@ -1,14 +1,15 @@
 //! Renders a cached view large enough to be drawn as a chunk, reused under a
 //! camera transform that moves and zooms it, and checks its pixels land
-//! where the transform puts them.
+//! where the transform puts them: its quads, and a path beside them.
 //!
 //! Runs only with `GPUI_RUN_RENDERING_TESTS` set, in an offscreen window;
 //! `GPUI_RENDERING_TEST_OUTPUT=<path.png>` saves the image.
 
 #[cfg(target_os = "macos")]
 use gpui::{
-    AppContext as _, Context, Entity, IntoElement, ParentElement as _, Position, Render,
-    StyleRefinement, Styled as _, VisualTestAppContext, Window, div, kurbo, px, rgb,
+    AppContext as _, Context, Entity, IntoElement, ParentElement as _, PathBuilder, Position,
+    Render, StyleRefinement, Styled as _, VisualTestAppContext, Window, canvas, div, kurbo, point,
+    px, rgb,
 };
 #[cfg(target_os = "macos")]
 use std::{cell::Cell, rc::Rc};
@@ -17,6 +18,10 @@ use std::{cell::Cell, rc::Rc};
 const CELLS: usize = 20;
 const PITCH: f32 = 20.;
 const CELL: f32 = 16.;
+/// A black triangle beside the cells, in the grid's coordinates.
+const TRIANGLE: [(f32, f32); 3] = [(420., 0.), (500., 0.), (460., 80.)];
+/// The grid's width, triangle included.
+const GRID_WIDTH: f32 = 520.;
 /// Where the grid sits on the page, away from the pointer at the origin.
 const GRID_ORIGIN: f32 = 50.;
 
@@ -44,6 +49,22 @@ impl Render for Grid {
                     .size(px(CELL))
                     .bg(rgb(cell_color(row, column)))
             }))
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    |bounds, _, window, _| {
+                        let mut path = PathBuilder::fill();
+                        let corner = |(x, y): (f32, f32)| bounds.origin + point(px(x), px(y));
+                        path.move_to(corner(TRIANGLE[0]));
+                        path.line_to(corner(TRIANGLE[1]));
+                        path.line_to(corner(TRIANGLE[2]));
+                        path.close();
+                        window.paint_path(path.build().unwrap(), rgb(0x000000));
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
     }
 }
 
@@ -62,7 +83,7 @@ impl Render for ChunksFixture {
         style.position = Some(Position::Absolute);
         style.inset.left = Some(px(GRID_ORIGIN).into());
         style.inset.top = Some(px(GRID_ORIGIN).into());
-        style.size.width = Some(px(CELLS as f32 * PITCH).into());
+        style.size.width = Some(px(GRID_WIDTH).into());
         style.size.height = Some(px(CELLS as f32 * PITCH).into());
         div().size_full().relative().bg(rgb(0xffffff)).child(
             // A page at the window's origin, so its transform maps page
@@ -156,6 +177,17 @@ fn render() {
                 actual.0
             ));
         }
+    }
+    // The triangle, at its centre.
+    let (x, y) = (
+        on_screen(GRID_ORIGIN + 460., camera_x),
+        on_screen(GRID_ORIGIN + 27., camera_y),
+    );
+    if pixel(x, y).0[..3] != [0, 0, 0] {
+        failures.push(format!(
+            "triangle: at ({x}, {y}) expected black, got {:?}",
+            pixel(x, y).0
+        ));
     }
     // Between cells, and where the grid was before it moved, is white.
     let gap = on_screen(GRID_ORIGIN + CELL + 2., camera_x);
