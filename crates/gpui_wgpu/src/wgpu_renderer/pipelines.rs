@@ -15,6 +15,14 @@ use std::num::NonZeroU64;
 /// The group composite's mask texture, `MASK_TEXTURE` in the group shader.
 const GROUP_MASK_TEXTURE_BINDING: u32 = 4;
 
+/// The scene's group-0 tables: storage buffers on modern tiers, data textures downlevel.
+pub(super) struct SceneTableBindings<'a> {
+    pub(super) transforms: wgpu::BindingResource<'a>,
+    pub(super) clips: wgpu::BindingResource<'a>,
+    pub(super) paints: wgpu::BindingResource<'a>,
+    pub(super) color_stops: wgpu::BindingResource<'a>,
+}
+
 /// Group-1 payload: a storage buffer on modern tiers, a data texture plus per-batch
 /// range uniform on downlevel.
 pub(super) enum InstanceBindingSource<'a> {
@@ -219,16 +227,15 @@ impl WgpuBindGroupLayouts {
         }
     }
 
-    /// Creates the group-0 bind group: frame uniforms and the scene's transform and clip
-    /// tables, as storage buffers or, downlevel, data textures.
+    /// Creates the group-0 bind group: frame uniforms and the scene's transform, clip,
+    /// paint and colour-stop tables, as storage buffers or, downlevel, data textures.
     pub(super) fn create_globals(
         &self,
         device: &wgpu::Device,
         label: &str,
         globals: wgpu::BufferBinding,
         font_rasterization: wgpu::BufferBinding,
-        transforms: wgpu::BindingResource,
-        clips: wgpu::BindingResource,
+        tables: SceneTableBindings<'_>,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
@@ -244,11 +251,19 @@ impl WgpuBindGroupLayouts {
                 },
                 wgpu::BindGroupEntry {
                     binding: shader::TRANSFORMS_BINDING,
-                    resource: transforms,
+                    resource: tables.transforms,
                 },
                 wgpu::BindGroupEntry {
                     binding: shader::CLIPS_BINDING,
-                    resource: clips,
+                    resource: tables.clips,
+                },
+                wgpu::BindGroupEntry {
+                    binding: shader::PAINTS_BINDING,
+                    resource: tables.paints,
+                },
+                wgpu::BindGroupEntry {
+                    binding: shader::COLOR_STOPS_BINDING,
+                    resource: tables.color_stops,
                 },
             ],
         })
@@ -819,8 +834,12 @@ mod tests {
             "test_globals",
             binding(),
             binding(),
-            wgpu::BindingResource::Buffer(binding()),
-            wgpu::BindingResource::Buffer(binding()),
+            SceneTableBindings {
+                transforms: wgpu::BindingResource::Buffer(binding()),
+                clips: wgpu::BindingResource::Buffer(binding()),
+                paints: wgpu::BindingResource::Buffer(binding()),
+                color_stops: wgpu::BindingResource::Buffer(binding()),
+            },
         );
         let _instances = layouts.create_instances(device, InstanceBindingSource::Buffer(binding()));
         let _textured = layouts.create_textured_instances(
@@ -880,6 +899,16 @@ mod tests {
         assert_eq!(transforms.ensure_capacity(device, 3000), Some(true));
         transforms.write(&context.queue, &[gpui::SceneTransform::IDENTITY; 3000]);
         clips.write(&context.queue, &[gpui::SceneClip::default(); 3]);
+        let paints = SceneTable::<gpui::ScenePaint>::new(
+            device,
+            "downlevel_test_paints",
+            InstanceTransport::DataTexture,
+        );
+        let color_stops = SceneTable::<gpui::SceneColorStop>::new(
+            device,
+            "downlevel_test_color_stops",
+            InstanceTransport::DataTexture,
+        );
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("downlevel_test_uniforms"),
             size: 256,
@@ -896,8 +925,12 @@ mod tests {
             "downlevel_test_globals",
             uniform(),
             uniform(),
-            transforms.binding(),
-            clips.binding(),
+            SceneTableBindings {
+                transforms: transforms.binding(),
+                clips: clips.binding(),
+                paints: paints.binding(),
+                color_stops: color_stops.binding(),
+            },
         );
 
         let mut arena = InstanceBufferArena::new(device, &layouts, tier);

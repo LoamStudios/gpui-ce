@@ -18,7 +18,7 @@ use super::{
     WgpuRenderer,
     buffers::{DynamicUniformBuffer, InstanceBufferArena, InstanceTransport, SceneTable},
     filters::FrameUniformRequirements,
-    pipelines::{WgpuBindGroupLayouts, WgpuPipelines},
+    pipelines::{SceneTableBindings, WgpuBindGroupLayouts, WgpuPipelines},
     settings::RenderingParameters,
     surfaces::SurfaceCache,
     target_pool::TexturePool,
@@ -77,10 +77,13 @@ pub(super) struct WgpuResources {
     pub(super) target_pool: RefCell<TexturePool>,
 }
 
-/// The scene's transform and clip tables, bound in group 0 beside the frame uniforms.
+/// The scene's transform, clip, paint and colour-stop tables, bound in group 0 beside the
+/// frame uniforms.
 struct SceneTables {
     transforms: SceneTable<gpui::SceneTransform>,
     clips: SceneTable<gpui::SceneClip>,
+    paints: SceneTable<gpui::ScenePaint>,
+    color_stops: SceneTable<gpui::SceneColorStop>,
 }
 
 impl SceneTables {
@@ -88,6 +91,17 @@ impl SceneTables {
         Self {
             transforms: SceneTable::new(device, "scene_transforms", transport),
             clips: SceneTable::new(device, "scene_clips", transport),
+            paints: SceneTable::new(device, "scene_paints", transport),
+            color_stops: SceneTable::new(device, "scene_color_stops", transport),
+        }
+    }
+
+    fn bindings(&self) -> SceneTableBindings<'_> {
+        SceneTableBindings {
+            transforms: self.transforms.binding(),
+            clips: self.clips.binding(),
+            paints: self.paints.binding(),
+            color_stops: self.color_stops.binding(),
         }
     }
 }
@@ -240,27 +254,36 @@ impl WgpuResources {
         self.scene_color_view = None;
     }
 
-    /// Uploads the scene's transform and clip tables, growing them, and rebuilding the
-    /// group-0 bind groups that reference them, as needed. Returns false when the device
-    /// cannot hold them.
+    /// Uploads the scene's transform, clip, paint and colour-stop tables, growing them, and
+    /// rebuilding the group-0 bind groups that reference them, as needed. Returns false when
+    /// the device cannot hold them.
     pub(super) fn upload_scene_tables(&mut self, scene: &gpui::Scene) -> bool {
-        let transforms = scene.transforms();
-        let clips = scene.clips();
-        let (Some(transforms_grew), Some(clips_grew)) = (
-            self.scene_tables
+        let tables = &mut self.scene_tables;
+        let device = &self.device;
+        let (Some(transforms_grew), Some(clips_grew), Some(paints_grew), Some(color_stops_grew)) = (
+            tables
                 .transforms
-                .ensure_capacity(&self.device, transforms.len() as u64),
-            self.scene_tables
+                .ensure_capacity(device, scene.transforms().len() as u64),
+            tables
                 .clips
-                .ensure_capacity(&self.device, clips.len() as u64),
+                .ensure_capacity(device, scene.clips().len() as u64),
+            tables
+                .paints
+                .ensure_capacity(device, scene.paints().len() as u64),
+            tables
+                .color_stops
+                .ensure_capacity(device, scene.color_stops().len() as u64),
         ) else {
             return false;
         };
-        if transforms_grew || clips_grew {
+        if transforms_grew || clips_grew || paints_grew || color_stops_grew {
             self.rebuild_globals_bind_group();
         }
-        self.scene_tables.transforms.write(&self.queue, transforms);
-        self.scene_tables.clips.write(&self.queue, clips);
+        let tables = &self.scene_tables;
+        tables.transforms.write(&self.queue, scene.transforms());
+        tables.clips.write(&self.queue, scene.clips());
+        tables.paints.write(&self.queue, scene.paints());
+        tables.color_stops.write(&self.queue, scene.color_stops());
         true
     }
 
@@ -373,8 +396,7 @@ fn create_globals_bind_group(
             offset: 0,
             size: NonZeroU64::new(std::mem::size_of::<FontRasterizationUniforms>() as u64),
         },
-        tables.transforms.binding(),
-        tables.clips.binding(),
+        tables.bindings(),
     )
 }
 

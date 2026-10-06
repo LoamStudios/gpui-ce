@@ -189,6 +189,11 @@ mod tests {
                 std::mem::size_of::<gpui::SceneTransform>(),
             ),
             ("dl_load_CLIPS", std::mem::size_of::<gpui::SceneClip>()),
+            ("dl_load_PAINTS", std::mem::size_of::<gpui::ScenePaint>()),
+            (
+                "dl_load_COLOR_STOPS",
+                std::mem::size_of::<gpui::SceneColorStop>(),
+            ),
         ] {
             let body = generated_function(BASE_DOWNLEVEL_WGSL, loader);
             assert!(
@@ -205,7 +210,11 @@ mod tests {
             BASE_DOWNLEVEL_WGSL
                 .contains("@group(0) @binding(2) var TRANSFORMS_DATA: texture_2d<u32>;")
                 && BASE_DOWNLEVEL_WGSL
-                    .contains("@group(0) @binding(3) var CLIPS_DATA: texture_2d<u32>;"),
+                    .contains("@group(0) @binding(3) var CLIPS_DATA: texture_2d<u32>;")
+                && BASE_DOWNLEVEL_WGSL
+                    .contains("@group(0) @binding(4) var PAINTS_DATA: texture_2d<u32>;")
+                && BASE_DOWNLEVEL_WGSL
+                    .contains("@group(0) @binding(5) var COLOR_STOPS_DATA: texture_2d<u32>;"),
             "downlevel scene tables must be group-0 data textures at their storage bindings"
         );
         assert!(!BASE_DOWNLEVEL_WGSL.contains("var<storage"));

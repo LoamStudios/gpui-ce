@@ -693,6 +693,11 @@ impl WgpuContext {
         let mut required_limits = baseline
             .using_resolution(adapter.limits())
             .using_alignment(adapter.limits());
+        if renderer_tier == RendererTier::Modern {
+            required_limits.max_storage_buffers_per_shader_stage = required_limits
+                .max_storage_buffers_per_shader_stage
+                .max(MODERN_STORAGE_BUFFERS_PER_STAGE);
+        }
 
         // Merge application-requested requirements.
         if let Some(reqs) = extra_requirements {
@@ -996,9 +1001,9 @@ impl WgpuContext {
     }
 }
 
-/// Storage buffers one modern-tier shader stage reads: the scene's transform and clip
-/// tables, and its instances.
-const MODERN_STORAGE_BUFFERS_PER_STAGE: u32 = 3;
+/// Storage buffers one modern-tier shader stage reads: the scene's transform, clip, paint
+/// and colour-stop tables, and its instances. One more than `downlevel_defaults` grants.
+const MODERN_STORAGE_BUFFERS_PER_STAGE: u32 = 5;
 
 fn renderer_tier(adapter: &wgpu::Adapter) -> RendererTier {
     let limits = adapter.limits();
