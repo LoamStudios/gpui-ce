@@ -73,6 +73,7 @@ impl PreparedTargets {
         if !begin_frame(renderer) {
             return None;
         }
+        renderer.resources_mut().upload_photo_tiles(scene);
         let requirements = {
             let transport = renderer.resources().instances.transport();
             FrameRequirements::for_scene(scene, transport)

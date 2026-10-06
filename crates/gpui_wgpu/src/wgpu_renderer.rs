@@ -21,6 +21,7 @@ mod frame;
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 mod headless;
 mod path_types;
+mod photos;
 mod pipelines;
 mod platform;
 mod resources;
