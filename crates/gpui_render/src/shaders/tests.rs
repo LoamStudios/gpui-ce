@@ -287,6 +287,7 @@ fn gradient(kind: common::PaintKind, geometry: [f32; 4], radii: [f32; 2]) -> com
         color_space: PaintColorSpace::Srgb,
         first_stop: 0,
         stop_count: 0,
+        y_extend: PaintExtend::Pad,
         geometry: vec4f(geometry[0], geometry[1], geometry[2], geometry[3]),
         radii: vec4f(radii[0], radii[1], 0.0, 0.0),
     }

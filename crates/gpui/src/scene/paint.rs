@@ -4,9 +4,9 @@
 //! exactly, so every backend reads the table as plain `vec4<f32>`s.
 
 use super::{SceneHsla, TransformationMatrix};
-use crate::{Background, BackgroundKind, Bounds, ColorSpace, ScaledPixels};
+use crate::{Background, BackgroundKind, Bounds, ColorSpace, ScaledPixels, Size};
 use peniko::color::{ColorSpaceTag, DynamicColor, HueDirection};
-use peniko::{Extend, Gradient, GradientKind, InterpolationAlphaSpace};
+use peniko::{Extend, Gradient, GradientKind, ImageQuality, ImageSampler, InterpolationAlphaSpace};
 
 /// The shape of a paint-table gradient.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -23,6 +23,9 @@ pub enum PaintKind {
     /// Squares of the first stop's colour, `geometry[0]` wide, alternating
     /// with transparent ones.
     Checkerboard = 4,
+    /// A photo, placed by the transformation into pixels of its level 0. Its
+    /// tile words take the place of stops; see [`ScenePaint::photo`].
+    Image = 5,
 }
 
 /// How a paint-table gradient continues past its ends.
@@ -76,6 +79,9 @@ pub struct ScenePaint {
     pub color_space: PaintColorSpace,
     pub first_stop: u32,
     pub stop_count: u32,
+    /// How an image continues past its top and bottom; `extend` is how it
+    /// continues past its sides, and how a gradient continues.
+    pub y_extend: PaintExtend,
     pub geometry: [f32; 4],
     pub radii: [f32; 4],
 }
@@ -107,7 +113,7 @@ impl ScenePaint {
                 self.color_space as u32 as f32,
                 self.first_stop as f32,
                 self.stop_count as f32,
-                0.,
+                self.y_extend as u32 as f32,
             ],
             self.geometry,
             self.radii,
@@ -118,7 +124,12 @@ impl ScenePaint {
     pub fn from_words(words: &[PaintWord]) -> Self {
         let [a, b, c, d] = words[0];
         let [x, y, kind, extend] = words[1];
-        let [color_space, first_stop, stop_count, _] = words[2];
+        let [color_space, first_stop, stop_count, y_extend] = words[2];
+        let extend_of = |value: f32| match value as u32 {
+            1 => PaintExtend::Repeat,
+            2 => PaintExtend::Reflect,
+            _ => PaintExtend::Pad,
+        };
         Self {
             transformation: TransformationMatrix {
                 rotation_scale: [[a, b], [c, d]],
@@ -129,13 +140,11 @@ impl ScenePaint {
                 2 => PaintKind::Sweep,
                 3 => PaintKind::Stripes,
                 4 => PaintKind::Checkerboard,
+                5 => PaintKind::Image,
                 _ => PaintKind::Linear,
             },
-            extend: match extend as u32 {
-                1 => PaintExtend::Repeat,
-                2 => PaintExtend::Reflect,
-                _ => PaintExtend::Pad,
-            },
+            extend: extend_of(extend),
+            y_extend: extend_of(y_extend),
             color_space: match color_space as u32 {
                 1 => PaintColorSpace::LinearSrgb,
                 2 => PaintColorSpace::Oklab,
@@ -277,17 +286,49 @@ impl ScenePaint {
         Some(Self {
             transformation: to_gradient,
             kind,
-            extend: match gradient.extend {
-                Extend::Pad => PaintExtend::Pad,
-                Extend::Repeat => PaintExtend::Repeat,
-                Extend::Reflect => PaintExtend::Reflect,
-            },
+            extend: gradient.extend.into(),
             color_space,
             first_stop,
             stop_count: stops.len() as u32 - first_stop,
+            y_extend: PaintExtend::Pad,
             geometry,
             radii,
         })
+    }
+
+    /// The entry for a photo `size` at level 0, placed by `to_photo`, from
+    /// viewport positions to pixels of its level 0, and sampled by `sampler`.
+    /// Its level and tile words are filled in when the frame is prepared:
+    /// until then it draws nothing.
+    pub(crate) fn photo(
+        size: Size<u32>,
+        to_photo: TransformationMatrix,
+        sampler: &ImageSampler,
+    ) -> Self {
+        let filtered = !matches!(sampler.quality, ImageQuality::Low);
+        Self {
+            transformation: to_photo,
+            kind: PaintKind::Image,
+            extend: sampler.x_extend.into(),
+            y_extend: sampler.y_extend.into(),
+            geometry: [
+                size.width as f32,
+                size.height as f32,
+                0.,
+                if filtered { 1. } else { 0. },
+            ],
+            ..Self::default()
+        }
+    }
+}
+
+impl From<Extend> for PaintExtend {
+    fn from(extend: Extend) -> Self {
+        match extend {
+            Extend::Pad => Self::Pad,
+            Extend::Repeat => Self::Repeat,
+            Extend::Reflect => Self::Reflect,
+        }
     }
 }
 

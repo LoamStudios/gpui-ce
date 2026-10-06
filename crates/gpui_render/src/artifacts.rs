@@ -21,6 +21,8 @@ pub enum GeneratedBindingKind {
     Uniform(u64),
     StorageRead(u64),
     Texture2dFloat,
+    /// A filterable float 2D texture array: the photo tiles.
+    Texture2dArrayFloat,
     FilteringSampler,
     /// Downlevel only: the `rgba32uint` scene-data texture.
     DataTexture,

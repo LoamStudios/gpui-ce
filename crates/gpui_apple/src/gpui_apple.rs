@@ -5,5 +5,6 @@
 //! by GPUI's Apple platform backends.
 
 mod metal_atlas;
+mod metal_photos;
 pub mod metal_renderer;
 mod metal_targets;

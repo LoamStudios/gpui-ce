@@ -46,6 +46,7 @@ gpui_macos.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+image.workspace = true
 gpui_apple = { workspace = true, features = ["test-support"] }
 gpui_macos = { workspace = true, features = ["test-support"] }
 
@@ -82,4 +83,9 @@ harness = false
 [[test]]
 name = "paints_render"
 path = "tests/paints_render.rs"
+harness = false
+
+[[test]]
+name = "photos_render"
+path = "tests/photos_render.rs"
 harness = false

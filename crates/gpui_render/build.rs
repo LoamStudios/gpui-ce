@@ -803,6 +803,15 @@ fn binding_kind(
             } => "GeneratedBindingKind::Texture2dFloat".into(),
             naga::TypeInner::Image {
                 dim: naga::ImageDimension::D2,
+                arrayed: true,
+                class:
+                    naga::ImageClass::Sampled {
+                        kind: naga::ScalarKind::Float,
+                        multi: false,
+                    },
+            } => "GeneratedBindingKind::Texture2dArrayFloat".into(),
+            naga::TypeInner::Image {
+                dim: naga::ImageDimension::D2,
                 arrayed: false,
                 class:
                     naga::ImageClass::Sampled {

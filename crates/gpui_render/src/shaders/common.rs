@@ -87,6 +87,8 @@ mod source {
         Sweep = 2,
         Stripes = 3,
         Checkerboard = 4,
+        /// A photo, sampled from its resident tiles.
+        Image = 5,
     }
 
     /// How a paint-table gradient continues past its ends.
@@ -363,6 +365,9 @@ mod source {
         pub color_space: PaintColorSpace,
         pub first_stop: u32,
         pub stop_count: u32,
+        /// How an image continues past its top and bottom; `extend` is how it
+        /// continues past its sides, and how a gradient continues.
+        pub y_extend: PaintExtend,
         pub geometry: Vec4f,
         pub radii: Vec4f,
     }
@@ -396,6 +401,9 @@ mod source {
         }
         if kind == 4u32 {
             return PaintKind::Checkerboard;
+        }
+        if kind == 5u32 {
+            return PaintKind::Image;
         }
         PaintKind::Linear
     }
@@ -450,6 +458,7 @@ mod source {
             color_space: paint_color_space(stops.x),
             first_stop: u32(stops.y),
             stop_count: u32(stops.z),
+            y_extend: paint_extend(stops.w),
             geometry: get!(PAINTS)[fourth as usize].value,
             radii: get!(PAINTS)[fifth as usize].value,
         }
@@ -609,11 +618,77 @@ mod source {
         vec4f(encoded.x, encoded.y, encoded.z, alpha)
     }
 
+    // The texture array photo tiles are kept in, and how it is sampled.
+    texture!(group(0), binding(5), PHOTO_TILES: Texture2DArray<f32>);
+    sampler!(group(0), binding(6), PHOTO_SAMPLER: Sampler);
+
+    /// The side of a photo tile, and of each layer of [`PHOTO_TILES`]; as
+    /// `gpui::PHOTO_TILE_SIZE` and `gpui::PHOTO_LAYER_SIZE`.
+    pub const PHOTO_TILE_SIZE: f32 = 256.0;
+    pub const PHOTO_LAYER_SIZE: f32 = 4096.0;
+
+    /// The colour of a photo paint at `point`, in pixels of the photo's
+    /// level 0, as unpremultiplied sRGB-encoded RGBA.
+    ///
+    /// Its geometry is the photo's size at level 0, the level it is drawn
+    /// from, and 0 to sample its nearest pixel or 1 to filter; `radii` is the
+    /// first tile of that level its tile words cover, and how many across and
+    /// down they cover. Each tile word is the layer, origin and level offset
+    /// of the resident tile that holds it: the tile itself, or one of a
+    /// coarser level, which covers it; its layer is negative if none does.
+    pub fn photo_color(paint: ScenePaint, point: Vec2f) -> Vec4f {
+        let photo_size = paint.geometry.xy();
+        let scale = exp2(paint.geometry.z);
+        let level_size = ceil(photo_size / scale);
+        let position = vec2f(
+            extend_offset(paint.extend, point.x / photo_size.x) * level_size.x,
+            extend_offset(paint.y_extend, point.y / photo_size.y) * level_size.y,
+        );
+        let last_tile = ceil(level_size / PHOTO_TILE_SIZE) - vec2f(1.0, 1.0);
+        let tile = min(floor(position / PHOTO_TILE_SIZE), last_tile);
+        let grid = tile - paint.radii.xy();
+        if grid.x < 0.0 || grid.y < 0.0 || grid.x >= paint.radii.z || grid.y >= paint.radii.w {
+            return transparent();
+        }
+        let word = paint.first_stop + u32(grid.y * paint.radii.z + grid.x);
+        let resident = get!(PAINTS)[word as usize].value;
+        if resident.x < 0.0 {
+            return transparent();
+        }
+        // Where the position is in the resident tile, which may be `k` levels
+        // coarser, covering `2^k` tiles each way.
+        let span = exp2(resident.w);
+        let first_covered = floor(tile / span) * span;
+        let mut texel = resident.yz() + (position - first_covered * PHOTO_TILE_SIZE) / span;
+        if paint.geometry.w == 0.0 {
+            texel = floor(texel) + vec2f(0.5, 0.5);
+        }
+        let color = texture_sample_level_array(
+            PHOTO_TILES,
+            PHOTO_SAMPLER,
+            texel / PHOTO_LAYER_SIZE,
+            u32(resident.x),
+            0.0,
+        );
+        if color.w <= 0.0 {
+            return transparent();
+        }
+        vec4f(
+            color.x / color.w,
+            color.y / color.w,
+            color.z / color.w,
+            color.w,
+        )
+    }
+
     /// The colour of paint-table entry `index` at a viewport position.
     pub fn table_paint_color(index: u32, viewport_position: Vec2f) -> Vec4f {
         let paint = scene_paint(index);
         let point =
             TransformationMatrix::transform_position(paint.transformation, viewport_position);
+        if paint.kind == PaintKind::Image {
+            return photo_color(paint, point);
+        }
         if paint.kind == PaintKind::Stripes || paint.kind == PaintKind::Checkerboard {
             let mut color =
                 paint_space_to_srgba(PaintColorSpace::Srgb, color_stop(paint, 0u32).color);

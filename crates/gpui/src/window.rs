@@ -1432,6 +1432,7 @@ pub struct Window {
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
     atlas_eviction: AtlasEviction,
+    photos: crate::PhotoResidency,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -2201,6 +2202,7 @@ impl Window {
             is_minimizable,
             sprite_atlas,
             atlas_eviction: AtlasEviction::default(),
+            photos: crate::PhotoResidency::default(),
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -3602,6 +3604,15 @@ impl Window {
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+        let device_viewport_size = self
+            .viewport_size
+            .map(|length| DevicePixels((length.0 * self.scale_factor).ceil() as i32));
+        self.photos.prepare(
+            &mut self.next_frame.scene,
+            device_viewport_size,
+            self.handle,
+            cx,
+        );
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -5623,6 +5634,98 @@ impl Window {
             Some(index) => Background::paint(index),
             None => transparent_black().into(),
         }
+    }
+
+    /// A background that paints `photo` with its top left at the current
+    /// element's origin, a pixel of the photo to a pixel; see
+    /// [`Self::transformed_photo`].
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn photo(&mut self, photo: &crate::Photo, sampler: &peniko::ImageSampler) -> Background {
+        self.transformed_photo(photo, sampler, kurbo::Affine::IDENTITY)
+    }
+
+    /// A background that paints `photo` moved into the current element's
+    /// coordinates by `transform`, from the photo's pixels, and sampled by
+    /// `sampler`: fill quads, borders and paths with it.
+    ///
+    /// The photo is drawn from the level of its pyramid that its size on
+    /// screen calls for, from tiles decoded in the background: until they
+    /// arrive, it is drawn from coarser ones, or not at all.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn transformed_photo(
+        &mut self,
+        photo: &crate::Photo,
+        sampler: &peniko::ImageSampler,
+        transform: impl Into<kurbo::Affine>,
+    ) -> Background {
+        self.photo_background(photo, sampler, transform.into(), None)
+    }
+
+    fn photo_background(
+        &mut self,
+        photo: &crate::Photo,
+        sampler: &peniko::ImageSampler,
+        transform: kurbo::Affine,
+        region: Option<kurbo::Rect>,
+    ) -> Background {
+        self.invalidator.debug_assert_paint();
+        let to_viewport = kurbo::Affine::scale(f64::from(self.scale_factor()))
+            * self.element_to_window()
+            * transform;
+        let to_photo = TransformationMatrix::from(to_viewport.inverse());
+        let index = self
+            .next_frame
+            .scene
+            .push_photo(photo, to_photo, sampler, region);
+        Background::paint(index).opacity(sampler.alpha)
+    }
+
+    /// Paints `photo` into `bounds`, fitted as `object_fit` says, with
+    /// `corner_radii`; see [`Self::transformed_photo`].
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_photo(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        photo: &crate::Photo,
+        object_fit: crate::ObjectFit,
+    ) {
+        let photo_size = photo.size();
+        if photo_size.width == 0 || photo_size.height == 0 {
+            return;
+        }
+        let fitted = object_fit.get_bounds(
+            bounds,
+            size(
+                DevicePixels(photo_size.width as i32),
+                DevicePixels(photo_size.height as i32),
+            ),
+        );
+        let visible = bounds.intersect(&fitted);
+        if visible.size.width <= Pixels::ZERO || visible.size.height <= Pixels::ZERO {
+            return;
+        }
+        let scale_x = f64::from(fitted.size.width.0) / f64::from(photo_size.width);
+        let scale_y = f64::from(fitted.size.height.0) / f64::from(photo_size.height);
+        let transform =
+            kurbo::Affine::translate((f64::from(fitted.origin.x.0), f64::from(fitted.origin.y.0)))
+                * kurbo::Affine::scale_non_uniform(scale_x, scale_y);
+        let region = kurbo::Rect::new(
+            f64::from((visible.origin.x - fitted.origin.x).0) / scale_x,
+            f64::from((visible.origin.y - fitted.origin.y).0) / scale_y,
+            f64::from((visible.origin.x + visible.size.width - fitted.origin.x).0) / scale_x,
+            f64::from((visible.origin.y + visible.size.height - fitted.origin.y).0) / scale_y,
+        );
+        let background = self.photo_background(
+            photo,
+            &peniko::ImageSampler::default(),
+            transform,
+            Some(region),
+        );
+        self.paint_quad(fill(visible, background).corner_radii(corner_radii));
     }
 
     /// Paint the given `Path` into the scene for the next frame at the current z-index.

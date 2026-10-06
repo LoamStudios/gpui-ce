@@ -610,6 +610,11 @@ fn generated_bind_group_layout(
                     view_dimension: wgpu::TextureViewDimension::D2,
                     multisampled: false,
                 },
+                GeneratedBindingKind::Texture2dArrayFloat => wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
                 GeneratedBindingKind::FilteringSampler => {
                     wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)
                 }

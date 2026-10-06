@@ -89,8 +89,25 @@ pub struct Scene {
     /// The paint table paint references point into; see
     /// [`Self::paint_table`].
     paint_table: Vec<PaintWord>,
+    /// The paint table's photo paints, whose levels and tiles are chosen when
+    /// the frame is prepared.
+    photo_paints: Vec<PhotoPaint>,
+    /// The photo tiles the renderer copies into its photo texture array
+    /// before it draws.
+    pub photo_uploads: Option<std::sync::Arc<crate::PhotoUploads>>,
     /// Scratch space for [`Self::replay_run_at`], kept to reuse its allocation.
     replay_run: Vec<ReplayOperation>,
+}
+
+/// A photo paint in a scene's paint table.
+#[derive(Clone, Debug)]
+pub(crate) struct PhotoPaint {
+    /// Its entry in the paint table.
+    pub index: u32,
+    pub photo: crate::Photo,
+    /// The part of the photo drawn, in pixels of its level 0, when it is
+    /// known: tiles outside it are not loaded.
+    pub region: Option<kurbo::Rect>,
 }
 
 #[expect(missing_docs)]
@@ -115,6 +132,7 @@ impl Scene {
         self.transforms.clear();
         self.clips.clear();
         self.paint_table.clear();
+        self.photo_paints.clear();
         self.is_finished = false;
     }
 
@@ -333,6 +351,10 @@ impl Scene {
         }
         let table = prev_scene.paint_table();
         let mut entry = ScenePaint::from_words(&table[paint as usize..]);
+        if entry.kind == PaintKind::Image {
+            // Its tiles are chosen again when this scene is prepared.
+            entry.stop_count = 0;
+        }
         let stops: SmallVec<[SceneColorStop; 8]> = (0..entry.stop_count as usize)
             .map(|stop| {
                 let word = entry.first_stop as usize + stop * SceneColorStop::WORDS;
@@ -344,6 +366,17 @@ impl Scene {
             .compose(placement.inverse().unwrap_or(TransformationMatrix::UNIT));
         let index = self.push_paint(entry, &stops);
         adopted.paints.insert(paint, index);
+        if entry.kind == PaintKind::Image
+            && let Some(photo_paint) = prev_scene
+                .photo_paints
+                .iter()
+                .find(|photo_paint| photo_paint.index == paint)
+        {
+            self.photo_paints.push(PhotoPaint {
+                index,
+                ..photo_paint.clone()
+            });
+        }
         index
     }
 
@@ -650,6 +683,57 @@ impl Scene {
         let mut stops = Vec::new();
         let paint = ScenePaint::gradient(gradient, to_gradient, &mut stops)?;
         Some(self.push_paint(paint, &stops))
+    }
+
+    /// Adds a paint of `photo`, placed by `to_photo`, from viewport positions to
+    /// pixels of its level 0, and sampled by `sampler`, to the paint table,
+    /// and returns its index. Only the tiles within `region` of level 0 are
+    /// loaded, if it is given.
+    pub(crate) fn push_photo(
+        &mut self,
+        photo: &crate::Photo,
+        to_photo: TransformationMatrix,
+        sampler: &peniko::ImageSampler,
+        region: Option<kurbo::Rect>,
+    ) -> u32 {
+        let index = self.push_paint(ScenePaint::photo(photo.size(), to_photo, sampler), &[]);
+        self.photo_paints.push(PhotoPaint {
+            index,
+            photo: photo.clone(),
+            region,
+        });
+        index
+    }
+
+    /// The paint table's photo paints.
+    pub(crate) fn photo_paints(&self) -> &[PhotoPaint] {
+        &self.photo_paints
+    }
+
+    /// Has photo paint `index` draw from `level`, through `words`, the tiles
+    /// `count` across and down from tile `first` of that level, row by row.
+    pub(crate) fn place_photo_tiles(
+        &mut self,
+        index: u32,
+        level: u32,
+        first: (u32, u32),
+        count: (u32, u32),
+        words: &[PaintWord],
+    ) {
+        let first_word = self.paint_table.len();
+        self.paint_table.extend_from_slice(words);
+        let mut entry = ScenePaint::from_words(&self.paint_table[index as usize..]);
+        entry.first_stop = first_word as u32;
+        entry.stop_count = words.len() as u32;
+        entry.geometry[2] = level as f32;
+        entry.radii = [
+            first.0 as f32,
+            first.1 as f32,
+            count.0 as f32,
+            count.1 as f32,
+        ];
+        let start = index as usize;
+        self.paint_table[start..start + ScenePaint::WORDS].copy_from_slice(&entry.words());
     }
 
     /// What a primitive with `bounds`, in the space of transform-table entry

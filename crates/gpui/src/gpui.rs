@@ -35,6 +35,7 @@ mod keymap;
 mod lerp;
 mod motion;
 mod path_builder;
+mod photo;
 mod platform;
 pub mod prelude;
 /// Profiling utilities for task, frame, and thread performance tracking.
@@ -117,6 +118,7 @@ pub use gpui_macros::{
 };
 pub use kurbo;
 pub use peniko;
+pub use photo::*;
 pub use spring::*;
 
 /// Defines a Criterion benchmark group for benchmarks annotated with [`gpui::bench`].

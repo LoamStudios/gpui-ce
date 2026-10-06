@@ -141,9 +141,13 @@ pub const CLIPS_BINDING: u32 = 3;
 /// Group-0 storage table of the scene's paints and their colour stops, as `vec4<f32>`
 /// words, shared by every pipeline.
 pub const PAINTS_BINDING: u32 = 4;
+/// Group-0 texture array of the window's resident photo tiles, shared by every pipeline.
+pub const PHOTO_TILES_BINDING: u32 = 5;
+/// Group-0 sampler photo tiles are filtered with: linear, clamped to their edges.
+pub const PHOTO_SAMPLER_BINDING: u32 = 6;
 /// How many bindings group 0 declares. Native backends have one flat slot space per
 /// resource class, so group 0 takes the first slots and group 1 follows it.
-pub const GLOBAL_BINDING_COUNT: u32 = 5;
+pub const GLOBAL_BINDING_COUNT: u32 = 7;
 pub const RECTANGLE_VERTEX_COUNT: u32 = 4;
 pub const FULLSCREEN_TRIANGLE_VERTEX_COUNT: u32 = 3;
 /// D3D11 constant-buffer register of the per-draw instance base for instanced pipelines.

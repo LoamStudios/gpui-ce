@@ -84,6 +84,8 @@ const PRIMARY_TEXTURE_SLOT: u64 = 0;
 const SECONDARY_TEXTURE_SLOT: u64 = 1;
 /// The group composite's mask texture: its binding 4, less one.
 const MASK_TEXTURE_SLOT: u64 = 3;
+/// The photo tile array: group 0's binding 5, less one.
+const PHOTO_TILES_SLOT: u64 = shader_interface::PHOTO_TILES_BINDING as u64 - 1;
 const SAMPLER_SLOT: u64 = 0;
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
@@ -96,6 +98,9 @@ struct SceneUniforms {
     globals: GlobalUniforms,
     font: FontRasterizationUniforms,
     tables: SceneTables,
+    /// The photo tile array, and the sampler that filters it.
+    photo_tiles: metal::Texture,
+    sampler: metal::SamplerState,
 }
 
 /// Where this frame's transform, clip and paint tables live in its instance buffer.
@@ -166,7 +171,12 @@ fn scene_table_bytes(scene: &Scene) -> usize {
 }
 
 impl SceneUniforms {
-    fn new(viewport_size: Size<DevicePixels>, tables: SceneTables) -> Self {
+    fn new(
+        viewport_size: Size<DevicePixels>,
+        tables: SceneTables,
+        photo_tiles: metal::Texture,
+        sampler: metal::SamplerState,
+    ) -> Self {
         Self {
             globals: GlobalUniforms {
                 viewport_size: vec2f(
@@ -192,6 +202,8 @@ impl SceneUniforms {
                 padding: 0,
             },
             tables,
+            photo_tiles,
+            sampler,
         }
     }
 
@@ -274,6 +286,10 @@ fn bind_scene_uniforms(encoder: &metal::RenderCommandEncoderRef, uniforms: &Scen
         encoder.set_vertex_buffer(slot, Some(&tables.buffer), offset);
         encoder.set_fragment_buffer(slot, Some(&tables.buffer), offset);
     }
+    encoder.set_fragment_texture(PHOTO_TILES_SLOT, Some(&uniforms.photo_tiles));
+    // Every pipeline samples with the same sampler, so a photo paint may share
+    // the slot with a pipeline's own texture.
+    encoder.set_fragment_sampler_state(SAMPLER_SLOT, Some(&uniforms.sampler));
 }
 
 /// Binds a frame's instances from `offset`, and the runtime-array sizes Naga's MSL declares
@@ -410,6 +426,7 @@ pub struct MetalRenderer {
     /// Composites an isolated group into its parent (premultiplied).
     group_composite_pipeline_state: metal::RenderPipelineState,
     sampler: metal::SamplerState,
+    photo_tiles: crate::metal_photos::PhotoTiles,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
@@ -640,6 +657,7 @@ impl MetalRenderer {
         let sampler = device.new_sampler(&sampler_descriptor);
 
         let command_queue = device.new_command_queue();
+        let photo_tiles = crate::metal_photos::PhotoTiles::new(&device);
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
@@ -669,6 +687,7 @@ impl MetalRenderer {
             smoothed_blur_composite_pipeline_state,
             group_composite_pipeline_state,
             sampler,
+            photo_tiles,
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
@@ -1037,6 +1056,7 @@ impl MetalRenderer {
         self.prepare_intermediate_textures(scene, viewport_size);
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
+        self.photo_tiles.upload(&self.device, scene, command_buffer);
         let alpha = if self.opaque { 1. } else { 0. };
         let mut instance_offset = 0;
         let tables =
@@ -1048,7 +1068,12 @@ impl MetalRenderer {
                     scene.paint_table().len()
                 )
             })?;
-        let scene_uniforms = SceneUniforms::new(viewport_size, tables);
+        let scene_uniforms = SceneUniforms::new(
+            viewport_size,
+            tables,
+            self.photo_tiles.texture().clone(),
+            self.sampler.clone(),
+        );
 
         // Render the scene into an offscreen color texture when backdrop filters or blend modes
         // read what is already painted, then blit it to `texture`; otherwise render straight to
