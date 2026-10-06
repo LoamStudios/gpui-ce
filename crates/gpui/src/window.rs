@@ -75,8 +75,11 @@ use crate::Inspector;
 use crate::profiler;
 
 pub(crate) mod a11y;
+mod retained;
 mod transform;
 use crate::scene::{GlyphSource, PlacedRaster, RasterSource, SvgSource};
+pub(crate) use retained::SubframeId;
+use retained::{Entry, ListIndex, RetainedList};
 pub(crate) use transform::{
     ElementSpace, HitboxClip, Placement, TransformedClip, transformed_bounds,
 };
@@ -905,14 +908,16 @@ pub struct HitTest {
 }
 
 impl HitTest {
-    /// Creates a new hit-test by iterating the provided hitboxes to find all those which are not occluded.
-    fn new<'a>(hitboxes: impl Iterator<Item = &'a Hitbox>, position: Point<Pixels>) -> Self {
+    /// Creates a new hit-test by iterating the provided hitboxes, front to
+    /// back, each with whether the position hits it, to find all those which
+    /// are not occluded.
+    fn new<'a>(hitboxes: impl Iterator<Item = (&'a Hitbox, bool)>) -> Self {
         let mut num_until_mouse_blocked = None::<usize>;
         let mut ids_until_occlusion = SmallVec::default();
         let mut entries = HashMap::default();
         let mut found_hit_occlusion = false;
         // index is 0=closest to viewer, n=farthest from viewer
-        for (index, hitbox) in hitboxes.enumerate() {
+        for (index, (hitbox, hit)) in hitboxes.enumerate() {
             entries.insert(
                 hitbox.id,
                 HitTestEntry {
@@ -925,7 +930,7 @@ impl HitTest {
                 continue;
             }
 
-            if !hitbox.hit(&position) {
+            if !hit {
                 continue;
             }
 
@@ -1095,14 +1100,20 @@ pub struct Hitbox {
 }
 
 impl Hitbox {
-    /// Whether a point in window coordinates hits this hitbox, without
-    /// occlusion checks.
+    /// Whether a point in the window coordinates the hitbox was recorded in
+    /// hits it, without occlusion checks: within its recorded content mask,
+    /// since what clips it from outside its cached view clips the view's
+    /// subframe.
     pub(crate) fn hit(&self, window_point: &Point<Pixels>) -> bool {
         let point = match &self.to_element {
             Some(to_element) => to_element.apply(*window_point),
             None => *window_point,
         };
-        self.contains(&point)
+        self.recorded_content_mask.bounds.contains(&point)
+            && self.fragments.as_ref().map_or_else(
+                || self.bounds.contains(&point),
+                |fragments| fragments.iter().any(|bounds| bounds.contains(&point)),
+            )
             && self.transformed_clips.as_deref().is_none_or(|clips| {
                 clips
                     .iter()
@@ -1148,6 +1159,56 @@ impl Hitbox {
     /// this sets `HitboxBehavior::BlockMouse` (`InteractiveElement::occlude`).
     pub fn should_handle_scroll(&self, window: &Window) -> bool {
         self.id.should_handle_scroll(window)
+    }
+}
+
+/// How a cached view's subframe of hitboxes sits in the coordinates of what
+/// contains it.
+#[derive(Clone)]
+pub(crate) struct HitboxPlacement {
+    /// From the window coordinates of what contains the subframe to those its
+    /// hitboxes were recorded in.
+    to_recorded: TransformationMatrix,
+    /// The content mask that clips the subframe there, which its hitboxes'
+    /// recorded masks leave out, and the clips set under transforms.
+    clip: Bounds<Pixels>,
+    transformed_clips: Option<Arc<[HitboxClip]>>,
+}
+
+impl HitboxPlacement {
+    /// Where `point`, in the coordinates of what contains the subframe, is in
+    /// those its hitboxes were recorded in, if the subframe's clip lets it
+    /// through.
+    fn place(&self, point: Point<Pixels>) -> Option<Point<Pixels>> {
+        let clipped = !self.clip.contains(&point)
+            || self.transformed_clips.as_deref().is_some_and(|clips| {
+                !clips
+                    .iter()
+                    .all(|(bounds, to_clip)| bounds.contains(&to_clip.apply(point)))
+            });
+        (!clipped).then(|| self.to_recorded.apply(point))
+    }
+}
+
+/// Every hitbox of `entries`, front to back, each with whether `point`, in
+/// the coordinates they sit in, hits it; `None` when nothing in them can be
+/// hit there.
+fn hitboxes_front_to_back<'a>(
+    entries: &'a [Entry<Hitbox, HitboxPlacement>],
+    point: Option<Point<Pixels>>,
+    out: &mut Vec<(&'a Hitbox, bool)>,
+) {
+    for entry in entries.iter().rev() {
+        match entry {
+            Entry::Item(hitbox) => {
+                out.push((hitbox, point.is_some_and(|point| hitbox.hit(&point))))
+            }
+            Entry::Subframe(subframe) => hitboxes_front_to_back(
+                &subframe.entries,
+                point.and_then(|point| subframe.placement.place(point)),
+                out,
+            ),
+        }
     }
 }
 
@@ -1270,6 +1331,9 @@ pub(crate) struct DeferredDraw {
     /// Where the recorded ranges go when this draw is reused from the
     /// previous frame; nowhere once they have been replayed in this one.
     reuse_placement: Placement,
+    /// The draw's part of the frame its prepaint was recorded in, once it
+    /// has been.
+    subframe: Option<SubframeId>,
 }
 
 pub(crate) struct Frame {
@@ -1283,7 +1347,7 @@ pub(crate) struct Frame {
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
-    pub(crate) hitboxes: Vec<Hitbox>,
+    pub(crate) hitboxes: RetainedList<Hitbox, HitboxPlacement>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
@@ -1300,7 +1364,7 @@ pub(crate) struct Frame {
 
 #[derive(Clone, Default)]
 pub(crate) struct PrepaintStateIndex {
-    hitboxes_index: usize,
+    hitboxes_index: ListIndex,
     tooltips_index: usize,
     deferred_draws_index: usize,
     dispatch_tree_index: usize,
@@ -1330,7 +1394,7 @@ impl Frame {
             mouse_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
-            hitboxes: Vec::new(),
+            hitboxes: RetainedList::default(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
@@ -1391,8 +1455,64 @@ impl Frame {
             .into_inner()
     }
 
+    /// The frame's hitboxes as they sit in the window, in paint order:
+    /// those in subframes moved by their subframes' placements, with their
+    /// content masks cut by the subframes' clips.
+    #[cfg(test)]
+    pub(crate) fn placed_hitboxes(&self) -> Vec<Hitbox> {
+        fn place(
+            entries: &[Entry<Hitbox, HitboxPlacement>],
+            to_window: TransformationMatrix,
+            clip: Option<Bounds<Pixels>>,
+            out: &mut Vec<Hitbox>,
+        ) {
+            for entry in entries {
+                match entry {
+                    Entry::Item(hitbox) => {
+                        let mut mask =
+                            transformed_bounds(&to_window, hitbox.recorded_content_mask.bounds);
+                        if let Some(clip) = clip {
+                            mask = mask.intersect(&clip);
+                        }
+                        out.push(Hitbox {
+                            bounds: transformed_bounds(&to_window, hitbox.bounds),
+                            content_mask: ContentMask {
+                                bounds: mask,
+                                ..hitbox.content_mask
+                            },
+                            ..hitbox.clone()
+                        });
+                    }
+                    Entry::Subframe(subframe) => {
+                        let placement = &subframe.placement;
+                        let window_clip = transformed_bounds(&to_window, placement.clip);
+                        let to_window = to_window.compose(
+                            placement
+                                .to_recorded
+                                .inverse()
+                                .unwrap_or(TransformationMatrix::UNIT),
+                        );
+                        let clip =
+                            Some(clip.map_or(window_clip, |clip| clip.intersect(&window_clip)));
+                        place(&subframe.entries, to_window, clip, out);
+                    }
+                }
+            }
+        }
+        let mut hitboxes = Vec::new();
+        place(
+            self.hitboxes.entries(),
+            TransformationMatrix::UNIT,
+            None,
+            &mut hitboxes,
+        );
+        hitboxes
+    }
+
     pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
-        HitTest::new(self.hitboxes.iter().rev(), position)
+        let mut hitboxes = Vec::new();
+        hitboxes_front_to_back(self.hitboxes.entries(), Some(position), &mut hitboxes);
+        HitTest::new(hitboxes.into_iter())
     }
 
     pub(crate) fn focus_path(&self) -> SmallVec<[FocusId; 8]> {
@@ -3557,6 +3677,8 @@ impl Window {
             }
         }
         if !cx.mode.skip_drawing() {
+            // The rendered frame's subframes are the next frame's to take.
+            self.rendered_frame.hitboxes.make_available();
             self.draw_roots(cx);
             #[cfg(feature = "profiler")]
             {
@@ -4005,6 +4127,7 @@ impl Window {
                     absolute_offset,
                     prepaint_range,
                     reuse_placement,
+                    previous_subframe,
                 ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
@@ -4020,10 +4143,17 @@ impl Window {
                         deferred_draw.absolute_offset,
                         deferred_draw.prepaint_range.clone(),
                         deferred_draw.reuse_placement,
+                        deferred_draw.subframe,
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
 
+                let placement = self.subframe_placement();
+                let subframe = if element.is_some() {
+                    Some(self.begin_subframe(previous_subframe))
+                } else {
+                    previous_subframe
+                };
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
                     self.with_rendered_view(current_view, |window| {
@@ -4036,9 +4166,11 @@ impl Window {
                         });
                     });
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
+                    self.end_subframe(placement);
                 } else {
-                    self.reuse_prepaint_at(prepaint_range, reuse_placement);
+                    self.reuse_prepaint_at(prepaint_range, reuse_placement, subframe, &placement);
                 }
+                self.next_frame.deferred_draws[deferred_draw_ix].subframe = subframe;
                 let prepaint_end = self.prepaint_index();
                 self.next_frame.deferred_draws[deferred_draw_ix].prepaint_range =
                     prepaint_start..prepaint_end;
@@ -4111,7 +4243,7 @@ impl Window {
 
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
         PrepaintStateIndex {
-            hitboxes_index: self.next_frame.hitboxes.len(),
+            hitboxes_index: self.next_frame.hitboxes.index(),
             tooltips_index: self.next_frame.tooltip_requests.len(),
             deferred_draws_index: self.next_frame.deferred_draws.len(),
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
@@ -4130,12 +4262,12 @@ impl Window {
         &mut self,
         range: Range<PrepaintStateIndex>,
         placement: Placement,
+        subframe: Option<SubframeId>,
+        clip: &HitboxPlacement,
     ) {
-        match placement {
-            Placement::Offset(offset) => self.reuse_hitboxes_moved(&range, offset),
-            Placement::Transform(transformation) => {
-                self.reuse_hitboxes_transformed(&range, &transformation)
-            }
+        match subframe {
+            Some(subframe) => self.reuse_hitboxes(subframe, placement, clip),
+            None => debug_assert!(false, "reused a prepaint recorded without a subframe"),
         }
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
@@ -4200,73 +4332,77 @@ impl Window {
                         prepaint_range: deferred_draw.prepaint_range.clone(),
                         paint_range: deferred_draw.paint_range.clone(),
                         reuse_placement: deferred_draw.reuse_placement.then(window_placement),
+                        subframe: deferred_draw.subframe,
                     }
                 }),
         );
     }
 
-    /// Reuses the rendered frame's hitboxes in `range`, moved by `offset` in
-    /// their elements' coordinates.
-    fn reuse_hitboxes_moved(&mut self, range: &Range<PrepaintStateIndex>, offset: Point<Pixels>) {
-        let clip = self.content_mask();
-        let moved_mask = |mask: ContentMask<Pixels>| mask.translate(offset).intersect(&clip);
-        let recording_clip = self.element_recording_clip();
-        let clipped_for_recording = |mask: ContentMask<Pixels>| match &recording_clip {
-            Some(clip) => mask.intersect(clip),
-            None => mask,
-        };
-        self.next_frame.hitboxes.extend(
-            self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
-                .iter()
-                .map(|hitbox| {
-                    let recorded_content_mask = moved_mask(hitbox.recorded_content_mask);
-                    Hitbox {
-                        bounds: hitbox.bounds + offset,
-                        content_mask: clipped_for_recording(recorded_content_mask),
-                        recorded_content_mask,
-                        ..hitbox.clone()
-                    }
-                }),
-        );
-    }
-
-    /// Reuses the rendered frame's hitboxes in `range`, placed by
-    /// `transformation` of window coordinates. They keep their bounds, in
-    /// their elements' coordinates, and reach them through the placement;
-    /// the window's clip here becomes one of their clips.
-    fn reuse_hitboxes_transformed(
+    /// Takes the rendered frame's subframe of hitboxes `subframe` into this
+    /// one, moved by `placement`, and clipped by `clip`, what clips it here.
+    fn reuse_hitboxes(
         &mut self,
-        range: &Range<PrepaintStateIndex>,
-        transformation: &TransformationMatrix,
+        subframe: SubframeId,
+        placement: Placement,
+        clip: &HitboxPlacement,
     ) {
-        let inverse = transformation
-            .inverse()
-            .unwrap_or(TransformationMatrix::UNIT);
-        let window_clip = self
-            .recording_clip
-            .unwrap_or_else(|| self.window_content_mask());
-        self.next_frame.hitboxes.extend(
-            self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
-                .iter()
-                .map(|hitbox| {
-                    let to_element = hitbox
-                        .to_element
-                        .unwrap_or(TransformationMatrix::UNIT)
-                        .compose(inverse);
-                    let transformed_clips = hitbox
-                        .transformed_clips
-                        .iter()
-                        .flat_map(|clips| clips.iter())
-                        .map(|(bounds, to_clip)| (*bounds, to_clip.compose(inverse)))
-                        .chain([(window_clip.bounds, TransformationMatrix::UNIT)])
-                        .collect();
-                    Hitbox {
-                        to_element: Some(to_element),
-                        transformed_clips: Some(transformed_clips),
-                        ..hitbox.clone()
-                    }
-                }),
+        let moved = match placement {
+            // An offset in the element's coordinates, which move with it.
+            Placement::Offset(offset) => {
+                let [[a, b], [c, d]] = self.element_space().to_window.rotation_scale;
+                TransformationMatrix {
+                    rotation_scale: TransformationMatrix::UNIT.rotation_scale,
+                    translation: [
+                        a * offset.x.0 + b * offset.y.0,
+                        c * offset.x.0 + d * offset.y.0,
+                    ],
+                }
+            }
+            Placement::Transform(transformation) => transformation,
+        };
+        let back = moved.inverse().unwrap_or(TransformationMatrix::UNIT);
+        let reused = self.next_frame.hitboxes.reuse(
+            &mut self.rendered_frame.hitboxes,
+            subframe,
+            |previous| HitboxPlacement {
+                to_recorded: previous.to_recorded.compose(back),
+                ..clip.clone()
+            },
         );
+        debug_assert!(reused, "reused a view whose hitboxes were let go");
+    }
+
+    /// What clips a cached view's subframe drawn here, as it sits here.
+    /// Taken outside the view's recording (`with_cached_view_recording`),
+    /// where clips are those of the recording it is inside, if any.
+    pub(crate) fn subframe_placement(&self) -> HitboxPlacement {
+        HitboxPlacement {
+            to_recorded: TransformationMatrix::UNIT,
+            clip: self.window_content_mask().bounds,
+            transformed_clips: self.hitbox_clips(),
+        }
+    }
+
+    /// Whether the rendered frame holds subframe `subframe` for reuse.
+    pub(crate) fn has_subframe(&self, subframe: SubframeId) -> bool {
+        self.rendered_frame.hitboxes.has(subframe)
+    }
+
+    /// Starts recording a cached view's prepaint as a subframe of its own,
+    /// letting go of `previous`, its last one, whose children it may reuse.
+    pub(crate) fn begin_subframe(&mut self, previous: Option<SubframeId>) -> SubframeId {
+        if let Some(previous) = previous {
+            self.rendered_frame.hitboxes.open(previous);
+        }
+        let subframe = SubframeId::next();
+        self.next_frame.hitboxes.begin(subframe);
+        subframe
+    }
+
+    /// Ends the subframe [`Self::begin_subframe`] started, as it sits here:
+    /// see [`Self::subframe_placement`].
+    pub(crate) fn end_subframe(&mut self, placement: HitboxPlacement) {
+        self.next_frame.hitboxes.end(placement);
     }
 
     pub(crate) fn paint_index(&self) -> PaintIndex {
@@ -5034,6 +5170,7 @@ impl Window {
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
             reuse_placement: Placement::default(),
+            subframe: None,
         });
     }
 
@@ -6613,7 +6750,7 @@ impl Window {
             transformed_clips: self.hitbox_clips(),
         };
 
-        self.next_frame.hitboxes.push_mut(hitbox)
+        self.next_frame.hitboxes.push(hitbox)
     }
 
     /// Set a hitbox which will act as a control area of the platform window.
@@ -8486,7 +8623,6 @@ impl Window {
                 && let Some(hitbox) = self
                     .next_frame
                     .hitboxes
-                    .iter()
                     .find(|hitbox| hitbox.id == hitbox_id)
             {
                 self.paint_quad(crate::fill(hitbox.bounds, crate::rgba(0x61afef4d)));
@@ -9143,7 +9279,10 @@ mod tests {
                 bounds,
                 ..Default::default()
             },
-            recorded_content_mask: ContentMask::default(),
+            recorded_content_mask: ContentMask {
+                bounds,
+                ..Default::default()
+            },
             behavior: HitboxBehavior::Normal,
             tags: vec!["background".into()],
             fragments: None,
@@ -9157,7 +9296,10 @@ mod tests {
                 bounds: Bounds::new(Point::default(), size(px(80.), px(80.))),
                 ..Default::default()
             },
-            recorded_content_mask: ContentMask::default(),
+            recorded_content_mask: ContentMask {
+                bounds: Bounds::new(Point::default(), size(px(80.), px(80.))),
+                ..Default::default()
+            },
             behavior: HitboxBehavior::Normal,
             tags: vec!["inline".into()],
             to_element: None,
@@ -9182,7 +9324,11 @@ mod tests {
                 (point(px(90.), px(20.)), false, true),
                 (point(px(120.), px(20.)), false, false),
             ] {
-                let hit_test = HitTest::new([&inline, &background].into_iter(), position);
+                let hit_test = HitTest::new(
+                    [&inline, &background]
+                        .into_iter()
+                        .map(|hitbox| (hitbox, hitbox.hit(&position))),
+                );
                 let mut hovered = Vec::new();
                 let mut scrollable = Vec::new();
 

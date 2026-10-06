@@ -5,7 +5,7 @@ use crate::{
     RenderOnce, ResolvedDirection, Style, StyleRefinement, TextStyle, TransformationMatrix,
     UnicodeBidi, WeakEntity, px,
 };
-use crate::{Empty, Window};
+use crate::{Empty, Window, window::SubframeId};
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
@@ -347,6 +347,9 @@ struct ViewElementState {
     frame: usize,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
+    /// The view's part of the frame it was recorded in, which reusing the
+    /// view takes whole.
+    subframe: SubframeId,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
     /// Where the reused prepaint records were placed this frame, for paint to
@@ -600,6 +603,8 @@ impl<V: View> Element for ViewElement<V> {
                 window.with_element_state::<ViewElementState, _>(
                     global_id.unwrap(),
                     |element_state, window| {
+                        let previous_subframe = element_state.as_ref().map(|state| state.subframe);
+                        let subframe_placement = window.subframe_placement();
                         window.with_cached_view_recording(|window| {
                             let content_mask = window.content_mask();
                             let cache_key = ViewElementCacheKey {
@@ -625,6 +630,7 @@ impl<V: View> Element for ViewElement<V> {
                                 && element_state.cache_key.unicode_bidi == cache_key.unicode_bidi
                                 && !window.dirty_views.contains(&entity_id)
                                 && !window.refreshing
+                                && window.has_subframe(element_state.subframe)
                                 && let Some(placement) =
                                     element_state.reuse_placement(bounds, &content_mask, window)
                             {
@@ -632,6 +638,8 @@ impl<V: View> Element for ViewElement<V> {
                                 window.reuse_prepaint_at(
                                     element_state.prepaint_range.clone(),
                                     placement,
+                                    Some(element_state.subframe),
+                                    &subframe_placement,
                                 );
                                 cx.entities
                                     .extend_accessed(&element_state.accessed_entities);
@@ -660,6 +668,7 @@ impl<V: View> Element for ViewElement<V> {
                             }
 
                             let refreshing = mem::replace(&mut window.refreshing, true);
+                            let subframe = window.begin_subframe(previous_subframe);
                             let prepaint_start = window.prepaint_index();
                             let mut accessed_entities =
                                 mem::take(&mut request_layout.accessed_entities);
@@ -696,6 +705,7 @@ impl<V: View> Element for ViewElement<V> {
                             }
 
                             let prepaint_end = window.prepaint_index();
+                            window.end_subframe(subframe_placement);
                             window.refreshing = refreshing;
 
                             (
@@ -705,6 +715,7 @@ impl<V: View> Element for ViewElement<V> {
                                     accessed_entities,
                                     prepaint_range: prepaint_start..prepaint_end,
                                     paint_range: PaintIndex::default()..PaintIndex::default(),
+                                    subframe,
                                     cache_key,
                                     reuse_placement: Placement::default(),
                                     moved_since_render: false,

@@ -116,8 +116,8 @@ fn hitboxes(cx: &mut TestAppContext, window: AnyWindowHandle) -> Vec<(f32, f32)>
     cx.update_window(window, |_, window, _| {
         let mut hitboxes: Vec<_> = window
             .rendered_frame
-            .hitboxes
-            .iter()
+            .placed_hitboxes()
+            .into_iter()
             .map(|hitbox| {
                 (
                     f32::from(hitbox.bounds.origin.y),
@@ -360,8 +360,8 @@ fn cached_view_is_reused_where_it_moves_to(cx: &mut TestAppContext) {
         .update_window(window, |_, window, _| {
             window
                 .rendered_frame
-                .hitboxes
-                .iter()
+                .placed_hitboxes()
+                .into_iter()
                 .map(|hitbox| f32::from(hitbox.content_mask.bounds.bottom()))
                 .collect::<Vec<_>>()
         })
