@@ -79,6 +79,11 @@ pub struct Scene {
     is_finished: bool,
     /// Clips what is drawn, but not what is recorded; see [`Self::set_clip`].
     clip: Option<ContentMask<ScaledPixels>>,
+    /// The transform table primitives refer to by index; see
+    /// [`Self::transforms`].
+    transforms: Vec<SceneTransform>,
+    /// The clip table primitives refer to by index; see [`Self::clips`].
+    clips: Vec<SceneClip>,
     /// Scratch space for [`Self::replay_run_at`], kept to reuse its allocation.
     replay_run: Vec<ReplayOperation>,
 }
@@ -102,7 +107,67 @@ impl Scene {
         self.filter_boundaries.clear();
         self.render_plan.clear();
         self.clip = None;
+        self.transforms.clear();
+        self.clips.clear();
         self.is_finished = false;
+    }
+
+    /// Adds `transform` to the transform table and returns its index.
+    pub fn push_transform(&mut self, transform: SceneTransform) -> u32 {
+        if self.transforms.is_empty() {
+            self.transforms.push(SceneTransform::IDENTITY);
+        }
+        self.transforms.push(transform);
+        (self.transforms.len() - 1) as u32
+    }
+
+    /// Adds `clip` to the clip table and returns its index.
+    pub fn push_clip(&mut self, clip: SceneClip) -> u32 {
+        if self.clips.is_empty() {
+            self.clips.push(SceneClip::default());
+        }
+        self.clips.push(clip);
+        (self.clips.len() - 1) as u32
+    }
+
+    /// The transform table, for the renderer to upload: entry 0 is always the
+    /// identity, which primitives that are not transformed refer to.
+    pub fn transforms(&self) -> &[SceneTransform] {
+        if self.transforms.is_empty() {
+            std::slice::from_ref(&SceneTransform::IDENTITY)
+        } else {
+            &self.transforms
+        }
+    }
+
+    /// The clip table, for the renderer to upload: entry 0 is always the
+    /// empty clip, which primitives with no transformed clip refer to.
+    pub fn clips(&self) -> &[SceneClip] {
+        const NONE: SceneClip = SceneClip {
+            bounds: Bounds {
+                origin: Point {
+                    x: ScaledPixels(0.),
+                    y: ScaledPixels(0.),
+                },
+                size: Size {
+                    width: ScaledPixels(0.),
+                    height: ScaledPixels(0.),
+                },
+            },
+            corner_radii: Corners {
+                top_left: ScaledPixels(0.),
+                top_right: ScaledPixels(0.),
+                bottom_right: ScaledPixels(0.),
+                bottom_left: ScaledPixels(0.),
+            },
+            transform: 0,
+            parent: 0,
+        };
+        if self.clips.is_empty() {
+            std::slice::from_ref(&NONE)
+        } else {
+            &self.clips
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -1052,11 +1117,19 @@ pub struct Quad {
     pub border_widths: Edges<ScaledPixels>,
     pub corner_smoothing: f32,
     pub padding: u32,
+    /// The primitive's entry in the scene's transform table, from its own
+    /// space, where `bounds` are, to the viewport: 0 for the identity.
+    pub transform: u32,
+    /// The primitive's entry in the scene's clip table, for clips not aligned
+    /// with the viewport, on top of `content_mask`: 0 for none.
+    pub clip: u32,
 }
 
 impl Default for Quad {
     fn default() -> Self {
         Self {
+            transform: 0,
+            clip: 0,
             order: Default::default(),
             border_style: Default::default(),
             border_dashed_length: DEFAULT_BORDER_DASHED_LENGTH,
@@ -1090,6 +1163,12 @@ pub struct Underline {
     pub color: SceneHsla,
     pub thickness: ScaledPixels,
     pub wavy: ShaderBool,
+    /// The primitive's entry in the scene's transform table, from its own
+    /// space, where `bounds` are, to the viewport: 0 for the identity.
+    pub transform: u32,
+    /// The primitive's entry in the scene's clip table, for clips not aligned
+    /// with the viewport, on top of `content_mask`: 0 for none.
+    pub clip: u32,
 }
 
 impl From<Underline> for Primitive {
@@ -1113,6 +1192,12 @@ pub struct Shadow {
     /// Whether this shadow is rendered inside the element instead of outside it.
     pub inset: ShaderBool,
     pub corner_smoothing: f32,
+    /// The primitive's entry in the scene's transform table, from its own
+    /// space, where `bounds` are, to the viewport: 0 for the identity.
+    pub transform: u32,
+    /// The primitive's entry in the scene's clip table, for clips not aligned
+    /// with the viewport, on top of `content_mask`: 0 for none.
+    pub clip: u32,
 }
 
 impl From<Shadow> for Primitive {
@@ -1211,6 +1296,42 @@ pub enum BorderStyle {
     Dashed = 1,
 }
 
+/// An entry of a scene's transform table: from a primitive's own space, where
+/// its bounds are, to the viewport, and back. Entry 0 is the identity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(C)]
+pub struct SceneTransform {
+    /// From the primitive's space to the viewport.
+    pub transformation: TransformationMatrix,
+    /// From the viewport to the primitive's space.
+    pub inverse: TransformationMatrix,
+}
+
+impl SceneTransform {
+    /// The identity, entry 0 of every transform table.
+    pub const IDENTITY: Self = Self {
+        transformation: TransformationMatrix::UNIT,
+        inverse: TransformationMatrix::UNIT,
+    };
+}
+
+/// An entry of a scene's clip table: a rounded rectangle in the space of a
+/// transform-table entry, and the clip it is nested in. Entry 0 clips nothing
+/// and ends every chain. Clips aligned with the viewport fold into a
+/// primitive's `content_mask` instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[repr(C)]
+pub struct SceneClip {
+    /// The clip rectangle, in the space of `transform`.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The rectangle's corner radii.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// The transform-table entry of the clip's space.
+    pub transform: u32,
+    /// The clip-table entry this clip is nested in: 0 for none.
+    pub parent: u32,
+}
+
 /// A data type representing a 2 dimensional transformation that can be applied to an element.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
@@ -1225,12 +1346,41 @@ pub struct TransformationMatrix {
 impl Eq for TransformationMatrix {}
 
 impl TransformationMatrix {
+    /// The unit matrix, which has no effect.
+    pub const UNIT: Self = Self {
+        rotation_scale: [[1.0, 0.0], [0.0, 1.0]],
+        translation: [0.0, 0.0],
+    };
+
     /// The unit matrix, has no effect.
     pub fn unit() -> Self {
-        Self {
-            rotation_scale: [[1.0, 0.0], [0.0, 1.0]],
-            translation: [0.0, 0.0],
+        Self::UNIT
+    }
+
+    /// The transformation that undoes this one, if it can be undone.
+    pub fn inverse(&self) -> Option<Self> {
+        let [[a, b], [c, d]] = self.rotation_scale;
+        let determinant = a * d - b * c;
+        if determinant == 0.0 || !determinant.is_finite() {
+            return None;
         }
+        let rotation_scale = [
+            [d / determinant, -b / determinant],
+            [-c / determinant, a / determinant],
+        ];
+        let [x, y] = self.translation;
+        Some(Self {
+            rotation_scale,
+            translation: [
+                -(rotation_scale[0][0] * x + rotation_scale[0][1] * y),
+                -(rotation_scale[1][0] * x + rotation_scale[1][1] * y),
+            ],
+        })
+    }
+
+    /// Whether this only translates and scales, keeping axes aligned.
+    pub fn is_axis_aligned(&self) -> bool {
+        self.rotation_scale[0][1] == 0.0 && self.rotation_scale[1][0] == 0.0
     }
 
     /// Move the origin by a given point
@@ -1339,6 +1489,11 @@ pub struct MonochromeSprite {
     pub color: SceneHsla,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
+    /// The sprite's entry in the scene's transform table, applied after
+    /// `transformation`: 0 for the identity.
+    pub transform: u32,
+    /// The sprite's entry in the scene's clip table: 0 for none.
+    pub clip: u32,
 }
 
 impl From<MonochromeSprite> for Primitive {
@@ -1358,6 +1513,11 @@ pub struct SubpixelSprite {
     pub color: SceneHsla,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
+    /// The sprite's entry in the scene's transform table, applied after
+    /// `transformation`: 0 for the identity.
+    pub transform: u32,
+    /// The sprite's entry in the scene's clip table: 0 for none.
+    pub clip: u32,
 }
 
 impl From<SubpixelSprite> for Primitive {
@@ -1378,6 +1538,12 @@ pub struct PolychromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub tile: AtlasTile,
+    /// The primitive's entry in the scene's transform table, from its own
+    /// space, where `bounds` are, to the viewport: 0 for the identity.
+    pub transform: u32,
+    /// The primitive's entry in the scene's clip table, for clips not aligned
+    /// with the viewport, on top of `content_mask`: 0 for none.
+    pub clip: u32,
 }
 
 impl From<PolychromeSprite> for Primitive {
@@ -1781,6 +1947,8 @@ mod tests {
 
     fn shadow() -> Shadow {
         Shadow {
+            transform: 0,
+            clip: 0,
             order: 0,
             blur_radius: sp(0.0),
             bounds: full_bounds(),
@@ -1796,6 +1964,8 @@ mod tests {
 
     fn polychrome_sprite(texture_index: u32) -> PolychromeSprite {
         PolychromeSprite {
+            transform: 0,
+            clip: 0,
             order: 0,
             grayscale: ShaderBool::Disabled,
             opacity: 1.0,

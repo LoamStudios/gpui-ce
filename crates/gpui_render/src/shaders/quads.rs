@@ -18,6 +18,10 @@ pub mod quad {
         pub border_widths: Edges,
         pub corner_smoothing: f32,
         pub padding: u32,
+        /// The primitive's entry in the scene's transform table.
+        pub transform: u32,
+        /// The primitive's entry in the scene's clip table.
+        pub clip: u32,
     }
     storage!(group(1), binding(0), QUADS: RuntimeArray<Quad>);
 
@@ -535,7 +539,11 @@ pub mod quad {
     }
 
     pub fn prepare_quad_vertex(vertex_id: u32, instance_id: u32, quad: Quad) -> QuadVertexData {
-        let vertex = rectangle_vertex(vertex_id, quad.bounds);
+        let vertex = transformed_rectangle_vertex(
+            vertex_id,
+            quad.bounds,
+            scene_transformation(quad.transform),
+        );
         QuadVertexData {
             position: vertex.clip_position,
             border: prepare_paint(Paint::new(quad.border_color, quad.bounds)),
@@ -600,17 +608,19 @@ pub mod quad {
             return transparent();
         }
         let quad = get!(QUADS)[input.quad_id as usize];
-        let fade = ContentMask::alpha(quad.content_mask, input.position.xy());
+        let point = local_position(quad.transform, input.position.xy());
+        let fade = ContentMask::alpha(quad.content_mask, input.position.xy())
+            * clip_coverage(quad.clip, input.position.xy());
         let fill_color = paint_color(
             Paint::new(quad.background, quad.bounds),
-            input.position.xy(),
+            point,
             PreparedPaint::new(input.fill_solid, input.fill_color0, input.fill_color1),
         );
         if Edges::is_zero(quad.border_widths) && Corners::is_zero(quad.corner_radii) {
             return blend_color(fill_color, fade);
         }
 
-        let geometry = quad_geometry(quad, input.position.xy());
+        let geometry = quad_geometry(quad, point);
         if is_unaffected_background(geometry) {
             return blend_color(fill_color, fade);
         }
@@ -620,7 +630,7 @@ pub mod quad {
         if max(distances.inner, distances.outer) < PIXEL_ANTIALIAS_RADIUS {
             let mut border_color = paint_color(
                 Paint::new(quad.border_color, quad.bounds),
-                input.position.xy(),
+                point,
                 PreparedPaint::new(input.border_solid, input.border_color0, input.border_color1),
             );
             if quad.border_style == BorderStyle::Dashed {
@@ -719,10 +729,12 @@ pub mod quad {
             return transparent();
         }
         let quad = get!(QUADS)[input.quad_id as usize];
-        let fade = ContentMask::alpha(quad.content_mask, input.position.xy());
+        let point = local_position(quad.transform, input.position.xy());
+        let fade = ContentMask::alpha(quad.content_mask, input.position.xy())
+            * clip_coverage(quad.clip, input.position.xy());
         let fill_color = paint_color(
             Paint::new(quad.background, quad.bounds),
-            input.position.xy(),
+            point,
             PreparedPaint::new(input.fill_solid, input.fill_color0, input.fill_color1),
         );
         let prepared = PreparedCorners {
@@ -734,7 +746,7 @@ pub mod quad {
 
         if Edges::is_zero(quad.border_widths) {
             let distance = prepared_corner_signed_distance(
-                input.position.xy(),
+                point,
                 quad.bounds,
                 quad.corner_radii,
                 quad.corner_smoothing,
@@ -744,9 +756,9 @@ pub mod quad {
             return blend_color(fill_color, antialiased_coverage(distance) * fade);
         }
 
-        let geometry = quad_geometry(quad, input.position.xy());
+        let geometry = quad_geometry(quad, point);
         let rectangle_sample = figma_smooth_rectangle_sample(
-            input.position.xy(),
+            point,
             quad.bounds,
             quad.corner_radii,
             prepared.horizontal_reaches,
@@ -822,7 +834,7 @@ pub mod quad {
         if max(inner, outer) < PIXEL_ANTIALIAS_RADIUS {
             let mut border_color = paint_color(
                 Paint::new(quad.border_color, quad.bounds),
-                input.position.xy(),
+                point,
                 PreparedPaint::new(input.border_solid, input.border_color0, input.border_color1),
             );
             if quad.border_style == BorderStyle::Dashed {

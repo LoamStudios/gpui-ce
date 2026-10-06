@@ -12,6 +12,10 @@ pub mod underline {
         pub color: Hsla,
         pub thickness: f32,
         pub wavy: ShaderBool,
+        /// The primitive's entry in the scene's transform table.
+        pub transform: u32,
+        /// The primitive's entry in the scene's clip table.
+        pub clip: u32,
     }
     storage!(group(1), binding(0), UNDERLINES: RuntimeArray<Underline>);
 
@@ -51,7 +55,11 @@ pub mod underline {
         #[builtin(instance_index)] instance_id: u32,
     ) -> UnderlineVarying {
         let underline = get!(UNDERLINES)[instance_id as usize];
-        let vertex = rectangle_vertex(vertex_id, underline.bounds);
+        let vertex = transformed_rectangle_vertex(
+            vertex_id,
+            underline.bounds,
+            scene_transformation(underline.transform),
+        );
         UnderlineVarying {
             position: vertex.clip_position,
             color: hsla_to_rgba(underline.color),
@@ -66,16 +74,19 @@ pub mod underline {
             return transparent();
         }
         let underline = get!(UNDERLINES)[input.underline_id as usize];
+        let point = local_position(underline.transform, input.position.xy());
         if !is_enabled(underline.wavy) {
             return blend_color(
                 input.color,
-                ContentMask::alpha(underline.content_mask, input.position.xy()),
+                ContentMask::alpha(underline.content_mask, input.position.xy())
+                    * clip_coverage(underline.clip, input.position.xy()),
             );
         }
         blend_color(
             input.color,
-            wavy_underline_coverage(underline, input.position.xy())
-                * ContentMask::alpha(underline.content_mask, input.position.xy()),
+            wavy_underline_coverage(underline, point)
+                * ContentMask::alpha(underline.content_mask, input.position.xy())
+                * clip_coverage(underline.clip, input.position.xy()),
         )
     }
 }
@@ -93,7 +104,12 @@ pub mod monochrome_sprite {
         pub content_mask: ContentMask,
         pub color: Hsla,
         pub tile: AtlasTile,
+        /// A transformation of the sprite itself, applied before `transform`.
         pub transformation: TransformationMatrix,
+        /// The sprite's entry in the scene's transform table.
+        pub transform: u32,
+        /// The sprite's entry in the scene's clip table.
+        pub clip: u32,
     }
     storage!(group(1), binding(0), MONOCHROME_SPRITES: RuntimeArray<MonochromeSprite>);
     texture!(group(1), binding(1), MONOCHROME_TEXTURE: Texture2D<f32>);
@@ -121,7 +137,14 @@ pub mod monochrome_sprite {
         #[builtin(instance_index)] instance_id: u32,
     ) -> MonochromeSpriteVarying {
         let sprite = get!(MONOCHROME_SPRITES)[instance_id as usize];
-        let vertex = transformed_rectangle_vertex(vertex_id, sprite.bounds, sprite.transformation);
+        let vertex = transformed_rectangle_vertex(
+            vertex_id,
+            sprite.bounds,
+            compose_transformations(
+                scene_transformation(sprite.transform),
+                sprite.transformation,
+            ),
+        );
         MonochromeSpriteVarying {
             position: vertex.clip_position,
             tile_position: atlas_texture_coordinates(
@@ -156,7 +179,9 @@ pub mod monochrome_sprite {
         );
         blend_color(
             input.color,
-            corrected * ContentMask::alpha(sprite.content_mask, input.position.xy()),
+            corrected
+                * ContentMask::alpha(sprite.content_mask, input.position.xy())
+                * clip_coverage(sprite.clip, input.position.xy()),
         )
     }
 }
@@ -177,6 +202,10 @@ pub mod polychrome_sprite {
         pub content_mask: ContentMask,
         pub corner_radii: Corners,
         pub tile: AtlasTile,
+        /// The primitive's entry in the scene's transform table.
+        pub transform: u32,
+        /// The primitive's entry in the scene's clip table.
+        pub clip: u32,
     }
     storage!(group(1), binding(0), POLYCHROME_SPRITES: RuntimeArray<PolychromeSprite>);
     texture!(group(1), binding(1), POLYCHROME_TEXTURE: Texture2D<f32>);
@@ -195,7 +224,11 @@ pub mod polychrome_sprite {
         instance_id: u32,
         sprite: PolychromeSprite,
     ) -> PolychromeVertexData {
-        let vertex = rectangle_vertex(vertex_id, sprite.bounds);
+        let vertex = transformed_rectangle_vertex(
+            vertex_id,
+            sprite.bounds,
+            scene_transformation(sprite.transform),
+        );
         PolychromeVertexData {
             position: vertex.clip_position,
             tile_position: atlas_texture_coordinates(
@@ -253,16 +286,18 @@ pub mod polychrome_sprite {
             return transparent();
         }
         let sprite = get!(POLYCHROME_SPRITES)[input.sprite_id as usize];
+        let point = local_position(sprite.transform, input.position.xy());
         let color = polychrome_color(sprite, input.tile_position);
         blend_color(
             color,
             sprite.opacity
                 * antialiased_coverage(rounded_rectangle_signed_distance(
-                    input.position.xy(),
+                    point,
                     sprite.bounds,
                     sprite.corner_radii,
                 ))
-                * ContentMask::alpha(sprite.content_mask, input.position.xy()),
+                * ContentMask::alpha(sprite.content_mask, input.position.xy())
+                * clip_coverage(sprite.clip, input.position.xy()),
         )
     }
 
@@ -323,12 +358,13 @@ pub mod polychrome_sprite {
             return transparent();
         }
         let sprite = get!(POLYCHROME_SPRITES)[input.sprite_id as usize];
+        let point = local_position(sprite.transform, input.position.xy());
         let color = polychrome_color(sprite, input.tile_position);
         blend_color(
             color,
             sprite.opacity
                 * antialiased_coverage(prepared_corner_signed_distance(
-                    input.position.xy(),
+                    point,
                     sprite.bounds,
                     sprite.corner_radii,
                     sprite.corner_smoothing,
@@ -339,7 +375,8 @@ pub mod polychrome_sprite {
                         superellipse_power: input.superellipse_power,
                     },
                 ))
-                * ContentMask::alpha(sprite.content_mask, input.position.xy()),
+                * ContentMask::alpha(sprite.content_mask, input.position.xy())
+                * clip_coverage(sprite.clip, input.position.xy()),
         )
     }
 }
@@ -358,7 +395,12 @@ pub mod subpixel_sprite {
         pub content_mask: ContentMask,
         pub color: Hsla,
         pub tile: AtlasTile,
+        /// A transformation of the sprite itself, applied before `transform`.
         pub transformation: TransformationMatrix,
+        /// The sprite's entry in the scene's transform table.
+        pub transform: u32,
+        /// The sprite's entry in the scene's clip table.
+        pub clip: u32,
     }
     storage!(group(1), binding(0), SUBPIXEL_SPRITES: RuntimeArray<SubpixelSprite>);
     texture!(group(1), binding(1), SPRITE_TEXTURE: Texture2D<f32>);
@@ -395,7 +437,14 @@ pub mod subpixel_sprite {
         #[builtin(instance_index)] instance_id: u32,
     ) -> SubpixelSpriteOutput {
         let sprite = get!(SUBPIXEL_SPRITES)[instance_id as usize];
-        let vertex = transformed_rectangle_vertex(vertex_id, sprite.bounds, sprite.transformation);
+        let vertex = transformed_rectangle_vertex(
+            vertex_id,
+            sprite.bounds,
+            compose_transformations(
+                scene_transformation(sprite.transform),
+                sprite.transformation,
+            ),
+        );
         SubpixelSpriteOutput {
             position: vertex.clip_position,
             tile_position: atlas_texture_coordinates(
@@ -431,7 +480,8 @@ pub mod subpixel_sprite {
             get!(FONT_RASTERIZATION).subpixel_enhanced_contrast,
             get!(FONT_RASTERIZATION).gamma_ratios,
         );
-        let mask_alpha = ContentMask::alpha(sprite.content_mask, input.position.xy());
+        let mask_alpha = ContentMask::alpha(sprite.content_mask, input.position.xy())
+            * clip_coverage(sprite.clip, input.position.xy());
         SubpixelSpriteFragmentOutput {
             foreground: vec4f(input.color.x, input.color.y, input.color.z, 1.0),
             alpha: vec4f(

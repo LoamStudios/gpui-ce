@@ -263,6 +263,70 @@ mod source {
         }
     }
 
+    /// An entry of the scene's transform table: from a primitive's own space,
+    /// where its bounds are, to the viewport, and back. Entry 0 is the
+    /// identity, which most primitives use.
+    #[derive(Clone, Copy, Wgsl)]
+    pub struct SceneTransform {
+        pub transformation: TransformationMatrix,
+        pub inverse: TransformationMatrix,
+    }
+
+    /// An entry of the scene's clip table: a rounded rectangle in the space of
+    /// a transform-table entry, and the clip it is nested in. Entry 0 clips
+    /// nothing and ends every chain. Clips aligned with the viewport fold into
+    /// a primitive's `content_mask` instead.
+    #[derive(Clone, Copy, Wgsl)]
+    pub struct SceneClip {
+        pub bounds: Bounds,
+        pub corner_radii: Corners,
+        pub transform: u32,
+        pub parent: u32,
+    }
+
+    storage!(group(0), binding(2), TRANSFORMS: RuntimeArray<SceneTransform>);
+    storage!(group(0), binding(3), CLIPS: RuntimeArray<SceneClip>);
+
+    /// How many clips a primitive's chain may hold; deeper nesting is clipped
+    /// to its innermost clips.
+    pub const MAX_CLIP_CHAIN: u32 = 4;
+
+    /// The transformation of a transform-table entry.
+    pub fn scene_transformation(transform: u32) -> TransformationMatrix {
+        get!(TRANSFORMS)[transform as usize].transformation
+    }
+
+    /// A viewport position in the space of a transform-table entry.
+    pub fn local_position(transform: u32, viewport_position: Vec2f) -> Vec2f {
+        if transform == 0u32 {
+            return viewport_position;
+        }
+        TransformationMatrix::transform_position(
+            get!(TRANSFORMS)[transform as usize].inverse,
+            viewport_position,
+        )
+    }
+
+    /// The antialiased coverage of a clip chain at a viewport position: 1
+    /// inside every clip of the chain, 0 outside any.
+    pub fn clip_coverage(clip: u32, viewport_position: Vec2f) -> f32 {
+        let mut coverage = 1.0;
+        let mut index = clip;
+        let mut depth = 0u32;
+        while index != 0u32 && depth < MAX_CLIP_CHAIN {
+            let entry = get!(CLIPS)[index as usize];
+            let point = local_position(entry.transform, viewport_position);
+            coverage *= antialiased_coverage(rounded_rectangle_signed_distance(
+                point,
+                entry.bounds,
+                entry.corner_radii,
+            ));
+            index = entry.parent;
+            depth += 1u32;
+        }
+        coverage
+    }
+
     #[derive(Clone, Copy, Wgsl)]
     pub struct RectangleVertex {
         pub unit_position: Vec2f,
@@ -397,6 +461,19 @@ mod source {
             unit_position,
             viewport_position,
             clip_position: viewport_to_clip_position(viewport_position),
+        }
+    }
+
+    /// The transformation that applies `inner`, then `outer`.
+    pub fn compose_transformations(
+        outer: TransformationMatrix,
+        inner: TransformationMatrix,
+    ) -> TransformationMatrix {
+        // `rotation_scale` is stored row-major and applied transposed, so the
+        // stored product of the composition runs inner, then outer.
+        TransformationMatrix {
+            rotation_scale: inner.rotation_scale * outer.rotation_scale,
+            translation: TransformationMatrix::transform_position(outer, inner.translation),
         }
     }
 

@@ -4536,6 +4536,8 @@ impl Window {
             }
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
             self.next_frame.scene.insert_primitive(Shadow {
+                transform: 0,
+                clip: 0,
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(shadow_bounds),
@@ -4594,6 +4596,8 @@ impl Window {
                 bottom_left: (corner_radii.bottom_left - shadow.spread_radius).max(zero),
             };
             self.next_frame.scene.insert_primitive(Shadow {
+                transform: 0,
+                clip: 0,
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(hole),
@@ -4786,6 +4790,8 @@ impl Window {
         let snapped_bounds = self.snap_bounds(quad.bounds);
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
         let quad = Quad {
+            transform: 0,
+            clip: 0,
             order: 0,
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
@@ -4894,6 +4900,8 @@ impl Window {
         let element_opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
+            transform: 0,
+            clip: 0,
             order: 0,
             padding: 0,
             bounds,
@@ -4928,6 +4936,8 @@ impl Window {
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
+            transform: 0,
+            clip: 0,
             order: 0,
             padding: 0,
             bounds,
@@ -5006,6 +5016,8 @@ impl Window {
         match entry.format {
             RasterizedGlyphFormat::AlphaMask => {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
+                    transform: 0,
+                    clip: 0,
                     order: 0,
                     padding: 0,
                     bounds,
@@ -5017,6 +5029,8 @@ impl Window {
             }
             RasterizedGlyphFormat::BgraSubpixelMask => {
                 self.next_frame.scene.insert_primitive(SubpixelSprite {
+                    transform: 0,
+                    clip: 0,
                     order: 0,
                     padding: 0,
                     bounds,
@@ -5028,6 +5042,8 @@ impl Window {
             }
             RasterizedGlyphFormat::BgraColor => {
                 self.next_frame.scene.insert_primitive(PolychromeSprite {
+                    transform: 0,
+                    clip: 0,
                     order: 0,
                     grayscale: false.into(),
                     corner_smoothing: 0.0,
@@ -5168,6 +5184,8 @@ impl Window {
             .map_size(|size| size.ceil());
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
+            transform: 0,
+            clip: 0,
             order: 0,
             padding: 0,
             bounds: final_bounds,
@@ -5296,6 +5314,8 @@ impl Window {
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
+            transform: 0,
+            clip: 0,
             order: 0,
             grayscale: grayscale.into(),
             corner_smoothing: corner_smoothing.clamp(0.0, 1.0),

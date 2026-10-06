@@ -2199,6 +2199,8 @@ mod tests {
         };
         let mut scene = Scene::default();
         scene.insert_primitive(MonochromeSprite {
+            transform: 0,
+            clip: 0,
             order: 0,
             padding: 0,
             bounds,
@@ -2432,6 +2434,8 @@ mod tests {
             ..Default::default()
         });
         underline.insert_primitive(Underline {
+            transform: 0,
+            clip: 0,
             order: 0,
             padding: 0,
             bounds: underline_bounds,
@@ -2461,6 +2465,8 @@ mod tests {
 
         let mut wavy = Scene::default();
         wavy.insert_primitive(Underline {
+            transform: 0,
+            clip: 0,
             order: 0,
             padding: 0,
             bounds: underline_bounds,
@@ -2626,6 +2632,8 @@ mod tests {
         };
         let mut shadow = Scene::default();
         shadow.insert_primitive(Shadow {
+            transform: 0,
+            clip: 0,
             order: 0,
             blur_radius: ScaledPixels(2.0),
             bounds: box_bounds,
@@ -2773,6 +2781,8 @@ mod tests {
         };
         let mut sprite = Scene::default();
         sprite.insert_primitive(PolychromeSprite {
+            transform: 0,
+            clip: 0,
             order: 0,
             grayscale: gpui::ShaderBool::Disabled,
             opacity: 0.75,

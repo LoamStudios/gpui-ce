@@ -54,6 +54,15 @@ pub const SCENE_BUFFER_LAYOUTS: &[SceneBufferLayout] = &[
         rotation_scale,
         translation
     ),
+    layout!(SceneTransform, "SceneTransform", transformation, inverse),
+    layout!(
+        SceneClip,
+        "SceneClip",
+        bounds,
+        corner_radii,
+        transform,
+        parent
+    ),
     layout!(
         Quad,
         "Quad",
@@ -68,7 +77,9 @@ pub const SCENE_BUFFER_LAYOUTS: &[SceneBufferLayout] = &[
         corner_radii,
         border_widths,
         corner_smoothing,
-        padding
+        padding,
+        transform,
+        clip
     ),
     layout!(
         Shadow,
@@ -82,7 +93,9 @@ pub const SCENE_BUFFER_LAYOUTS: &[SceneBufferLayout] = &[
         element_bounds,
         element_corner_radii,
         inset,
-        corner_smoothing
+        corner_smoothing,
+        transform,
+        clip
     ),
     layout!(
         Underline,
@@ -93,7 +106,9 @@ pub const SCENE_BUFFER_LAYOUTS: &[SceneBufferLayout] = &[
         content_mask,
         color,
         thickness,
-        wavy
+        wavy,
+        transform,
+        clip
     ),
     layout!(
         MonochromeSprite,
@@ -104,7 +119,9 @@ pub const SCENE_BUFFER_LAYOUTS: &[SceneBufferLayout] = &[
         content_mask,
         color,
         tile,
-        transformation
+        transformation,
+        transform,
+        clip
     ),
     layout!(
         SubpixelSprite,
@@ -115,7 +132,9 @@ pub const SCENE_BUFFER_LAYOUTS: &[SceneBufferLayout] = &[
         content_mask,
         color,
         tile,
-        transformation
+        transformation,
+        transform,
+        clip
     ),
     layout!(
         PolychromeSprite,
@@ -127,7 +146,9 @@ pub const SCENE_BUFFER_LAYOUTS: &[SceneBufferLayout] = &[
         bounds,
         content_mask,
         corner_radii,
-        tile
+        tile,
+        transform,
+        clip
     ),
 ];
 

@@ -16,6 +16,10 @@ pub mod shadow {
         pub element_corner_radii: Corners,
         pub inset: ShaderBool,
         pub corner_smoothing: f32,
+        /// The primitive's entry in the scene's transform table.
+        pub transform: u32,
+        /// The primitive's entry in the scene's clip table.
+        pub clip: u32,
     }
     storage!(group(1), binding(0), SHADOWS: RuntimeArray<Shadow>);
 
@@ -175,7 +179,11 @@ pub mod shadow {
         instance_id: u32,
         shadow: Shadow,
     ) -> ShadowVertexData {
-        let vertex = rectangle_vertex(vertex_id, shadow_geometry(shadow));
+        let vertex = transformed_rectangle_vertex(
+            vertex_id,
+            shadow_geometry(shadow),
+            scene_transformation(shadow.transform),
+        );
         ShadowVertexData {
             position: vertex.clip_position,
             paint: prepare_paint(shadow_paint(shadow)),
@@ -227,15 +235,17 @@ pub mod shadow {
             return transparent();
         }
         let shadow = get!(SHADOWS)[input.shadow_id as usize];
+        let point = local_position(shadow.transform, input.position.xy());
         let color = paint_color(
             shadow_paint(shadow),
-            input.position.xy(),
+            point,
             PreparedPaint::new(input.paint_solid, input.paint_color0, input.paint_color1),
         );
         blend_color(
             color,
-            shadow_coverage(shadow, input.position.xy())
-                * ContentMask::alpha(shadow.content_mask, input.position.xy()),
+            shadow_coverage(shadow, point)
+                * ContentMask::alpha(shadow.content_mask, input.position.xy())
+                * clip_coverage(shadow.clip, input.position.xy()),
         )
     }
 
@@ -315,9 +325,10 @@ pub mod shadow {
             return transparent();
         }
         let shadow = get!(SHADOWS)[input.shadow_id as usize];
+        let point = local_position(shadow.transform, input.position.xy());
         let coverage = smoothed_shadow_coverage(
             shadow,
-            input.position.xy(),
+            point,
             PreparedCorners {
                 horizontal_reaches: input.horizontal_corner_reaches,
                 vertical_reaches: input.vertical_corner_reaches,
@@ -333,12 +344,14 @@ pub mod shadow {
         );
         let color = paint_color(
             shadow_paint(shadow),
-            input.position.xy(),
+            point,
             PreparedPaint::new(input.paint_solid, input.paint_color0, input.paint_color1),
         );
         blend_color(
             color,
-            coverage * ContentMask::alpha(shadow.content_mask, input.position.xy()),
+            coverage
+                * ContentMask::alpha(shadow.content_mask, input.position.xy())
+                * clip_coverage(shadow.clip, input.position.xy()),
         )
     }
 }
