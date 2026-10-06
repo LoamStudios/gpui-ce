@@ -10,7 +10,7 @@ use palette::{Hsla, IntoColor, rgb::Rgba};
 use refineable::Refineable;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::{iter, mem, ops::Range};
+use std::{iter, mem, ops::Range, sync::Arc};
 
 /// Use this struct for interfacing with the 'debug_below' styling from your own elements.
 /// If a parent element has this style set on it, then this struct will be set as a global in
@@ -1105,9 +1105,12 @@ impl Style {
         // unit. A `filter` (CSS `filter`) wraps this whole unit so the renderer blurs the element
         // and its children together as one group; without a filter it paints directly.
         let paint_box = |window: &mut Window, cx: &mut App| {
-            let background_color = self.background.as_ref().and_then(Fill::color);
-            if background_color.is_some_and(|color| !color.is_transparent()) {
-                let background_color = background_color.unwrap_or_default();
+            if let Some(background) = self
+                .background
+                .as_ref()
+                .filter(|background| !background.is_transparent())
+            {
+                let background_color = background.background(bounds, window);
                 window.paint_quad_with_corner_smoothing(
                     quad(
                         bounds,
@@ -1291,6 +1294,10 @@ pub struct StrikethroughStyle {
 pub enum Fill {
     /// A solid color fill.
     Color(Background),
+    /// A gradient, whose geometry is relative to the origin of the element
+    /// it fills.
+    #[schemars(skip)]
+    Gradient(Arc<peniko::Gradient>),
 }
 
 impl Fill {
@@ -1300,7 +1307,43 @@ impl Fill {
     pub fn color(&self) -> Option<Background> {
         match self {
             Fill::Color(color) => Some(*color),
+            Fill::Gradient(_) => None,
         }
+    }
+
+    /// The background that paints this fill over `bounds`, for this frame.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn background(&self, bounds: Bounds<Pixels>, window: &mut Window) -> Background {
+        match self {
+            Fill::Color(color) => *color,
+            Fill::Gradient(gradient) => window.transformed_gradient(
+                gradient,
+                kurbo::Affine::translate((
+                    f64::from(bounds.origin.x.0),
+                    f64::from(bounds.origin.y.0),
+                )),
+            ),
+        }
+    }
+
+    /// Whether this fill paints nothing.
+    pub fn is_transparent(&self) -> bool {
+        match self {
+            Fill::Color(color) => color.is_transparent(),
+            Fill::Gradient(gradient) => gradient
+                .stops
+                .iter()
+                .all(|stop| stop.color.components[3] == 0.),
+        }
+    }
+}
+
+impl Fill {
+    /// A fill with `gradient`, whose geometry is relative to the origin of
+    /// the element it fills.
+    pub fn gradient(gradient: peniko::Gradient) -> Self {
+        Self::Gradient(Arc::new(gradient))
     }
 }
 

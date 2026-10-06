@@ -116,6 +116,7 @@ pub use gpui_macros::{
     Styled, VisualContext, bench, property_test, register_action, test,
 };
 pub use kurbo;
+pub use peniko;
 pub use spring::*;
 
 /// Defines a Criterion benchmark group for benchmarks annotated with [`gpui::bench`].

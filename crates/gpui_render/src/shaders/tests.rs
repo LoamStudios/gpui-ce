@@ -57,6 +57,11 @@ fn shader_interface_matches_generated_sources() {
     assert_eq!(common::TRANSFORMS.binding(), interface::TRANSFORMS_BINDING);
     assert_eq!(common::CLIPS.group(), interface::GLOBAL_BIND_GROUP);
     assert_eq!(common::CLIPS.binding(), interface::CLIPS_BINDING);
+    assert_eq!(common::PAINTS.binding(), interface::PAINTS_BINDING);
+    assert_eq!(
+        common::COLOR_STOPS.binding(),
+        interface::COLOR_STOPS_BINDING
+    );
 }
 
 #[test]
@@ -239,6 +244,10 @@ fn shader_discriminants_match_scene_types() {
         gpui::BackgroundTag::Checkerboard as u32
     );
     assert_eq!(
+        common::BackgroundTag::Paint as u32,
+        gpui::BackgroundTag::Paint as u32
+    );
+    assert_eq!(
         common::ColorSpace::Srgb as u32,
         gpui::ColorSpace::Srgb as u32
     );
@@ -290,8 +299,8 @@ fn linear_gradients_preserve_native_dithering() {
     };
     let paint = Paint::new(background, bounds);
     let prepared = prepare_paint(paint);
-    let first = paint_color(paint, vec2f(10.0, 10.0), prepared);
-    let second = paint_color(paint, vec2f(11.0, 10.0), prepared);
+    let first = paint_color(paint, vec2f(10.0, 10.0), vec2f(10.0, 10.0), prepared);
+    let second = paint_color(paint, vec2f(11.0, 10.0), vec2f(11.0, 10.0), prepared);
 
     assert_ne!(first.w, second.w);
 }

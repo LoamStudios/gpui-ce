@@ -254,6 +254,8 @@ pub enum BackgroundTag {
     PatternSlash = 2,
     /// Alternating colored and transparent squares.
     Checkerboard = 3,
+    /// An entry of the scene's paint table, faded by the solid color's alpha.
+    Paint = 4,
 }
 
 /// A color space for color interpolation.
@@ -311,6 +313,11 @@ impl std::fmt::Debug for Background {
                 f,
                 "Checkerboard({:?}, {})",
                 self.solid, self.gradient_angle_or_pattern_height
+            ),
+            BackgroundTag::Paint => write!(
+                f,
+                "Paint({}, {:?})",
+                self.gradient_angle_or_pattern_height, self.solid
             ),
         }
     }
@@ -447,6 +454,14 @@ pub enum BackgroundKind {
         /// The width and height of each square, in logical pixels.
         size: f32,
     },
+    /// An entry of the paint table of the scene it was made for, by
+    /// [`Window::gradient`](crate::Window::gradient).
+    Paint {
+        /// The entry's index.
+        index: u32,
+        /// The opacity it is drawn with.
+        opacity: f32,
+    },
 }
 
 impl Background {
@@ -484,6 +499,10 @@ impl Background {
                 color: self.solid.into(),
                 size: self.gradient_angle_or_pattern_height,
             },
+            BackgroundTag::Paint => BackgroundKind::Paint {
+                index: self.paint_index(),
+                opacity: self.solid.a,
+            },
         }
     }
 
@@ -519,7 +538,35 @@ impl Background {
             BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.a == 0.),
             BackgroundTag::PatternSlash => self.solid.a == 0.,
             BackgroundTag::Checkerboard => self.solid.a == 0.,
+            BackgroundTag::Paint => self.solid.a == 0.,
         }
+    }
+
+    /// A background that draws entry `index` of the scene's paint table.
+    pub(crate) fn paint(index: u32) -> Self {
+        Self {
+            tag: BackgroundTag::Paint,
+            solid: crate::white().into(),
+            // Kept as a float, which holds indices below 2^24 exactly.
+            gradient_angle_or_pattern_height: index as f32,
+            ..Default::default()
+        }
+    }
+
+    /// The paint-table entry a [`BackgroundTag::Paint`] background draws.
+    pub(crate) fn paint_index(&self) -> u32 {
+        self.gradient_angle_or_pattern_height as u32
+    }
+
+    /// Whether this background draws an entry of the scene's paint table.
+    pub(crate) fn is_paint(&self) -> bool {
+        self.tag == BackgroundTag::Paint
+    }
+
+    /// Points this background at entry `index` of the paint table, if it
+    /// draws one.
+    pub(crate) fn set_paint_index(&mut self, index: u32) {
+        self.gradient_angle_or_pattern_height = index as f32;
     }
 }
 

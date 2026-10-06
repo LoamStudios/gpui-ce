@@ -19,6 +19,8 @@ use std::{
 
 mod plan;
 pub use plan::*;
+mod paint;
+pub use paint::*;
 mod abi;
 #[doc(hidden)]
 pub use abi::{SCENE_BUFFER_LAYOUTS, SceneBufferLayout};
@@ -84,6 +86,10 @@ pub struct Scene {
     transforms: Vec<SceneTransform>,
     /// The clip table primitives refer to by index; see [`Self::clips`].
     clips: Vec<SceneClip>,
+    /// The paint table backgrounds refer to by index; see [`Self::paints`].
+    paints: Vec<ScenePaint>,
+    /// The colour stops of the paint table's gradients.
+    color_stops: Vec<SceneColorStop>,
     /// Scratch space for [`Self::replay_run_at`], kept to reuse its allocation.
     replay_run: Vec<ReplayOperation>,
 }
@@ -109,6 +115,8 @@ impl Scene {
         self.clip = None;
         self.transforms.clear();
         self.clips.clear();
+        self.paints.clear();
+        self.color_stops.clear();
         self.is_finished = false;
     }
 
@@ -285,7 +293,44 @@ impl Scene {
             rotation_scale: TransformationMatrix::UNIT.rotation_scale,
             translation: [offset.x.0, offset.y.0],
         };
+        self.adopt_paints(primitive, prev_scene, adopted, &placement);
         self.adopt_placed_entries(primitive, prev_scene, adopted, &placement);
+    }
+
+    /// Rewrites the paint-table entries `primitive`'s backgrounds draw, which
+    /// index `prev_scene`'s table, as entries of this scene's placed by
+    /// `placement`, with their stops.
+    fn adopt_paints(
+        &mut self,
+        primitive: &mut Primitive,
+        prev_scene: &Scene,
+        adopted: &mut AdoptedEntries,
+        placement: &TransformationMatrix,
+    ) {
+        for background in primitive.backgrounds_mut() {
+            if !background.is_paint() {
+                continue;
+            }
+            let paint = background.paint_index();
+            let index = match adopted.paints.get(&paint) {
+                Some(&index) => index,
+                None => {
+                    let mut entry = prev_scene.paints()[paint as usize];
+                    let stops =
+                        entry.first_stop as usize..(entry.first_stop + entry.stop_count) as usize;
+                    entry.first_stop = self.color_stops.len() as u32;
+                    self.color_stops
+                        .extend_from_slice(&prev_scene.color_stops()[stops]);
+                    entry.transformation = entry
+                        .transformation
+                        .compose(placement.inverse().unwrap_or(TransformationMatrix::UNIT));
+                    let index = self.push_paint(entry);
+                    adopted.paints.insert(paint, index);
+                    index
+                }
+            };
+            background.set_paint_index(index);
+        }
     }
 
     /// Rewrites `primitive`'s table entries, which index `prev_scene`'s
@@ -447,6 +492,7 @@ impl Scene {
         uniform: Option<&UniformPlacement>,
         content_mask: &ContentMask<ScaledPixels>,
     ) {
+        self.adopt_paints(primitive, prev_scene, adopted, placement);
         if let Some(uniform) = uniform.filter(|_| primitive.transform() == 0) {
             primitive.place_uniformly(uniform, content_mask);
             return;
@@ -577,6 +623,63 @@ impl Scene {
         }
         self.clips.push(clip);
         (self.clips.len() - 1) as u32
+    }
+
+    /// Adds `gradient`, placed by `to_gradient`, from viewport positions to
+    /// its space, to the paint table, and returns its index: `None` for a
+    /// gradient with no stops.
+    pub fn push_gradient(
+        &mut self,
+        gradient: &peniko::Gradient,
+        to_gradient: TransformationMatrix,
+    ) -> Option<u32> {
+        let paint = ScenePaint::gradient(gradient, to_gradient, &mut self.color_stops)?;
+        Some(self.push_paint(paint))
+    }
+
+    fn push_paint(&mut self, paint: ScenePaint) -> u32 {
+        if self.paints.is_empty() {
+            self.paints.push(ScenePaint::default());
+        }
+        self.paints.push(paint);
+        (self.paints.len() - 1) as u32
+    }
+
+    /// The paint table, for the renderer to upload: entry 0 is unused, so
+    /// the table is never empty.
+    pub fn paints(&self) -> &[ScenePaint] {
+        const NONE: ScenePaint = ScenePaint {
+            transformation: TransformationMatrix::UNIT,
+            kind: PaintKind::Linear,
+            extend: PaintExtend::Pad,
+            color_space: PaintColorSpace::Srgb,
+            first_stop: 0,
+            stop_count: 0,
+            padding: 0,
+            geometry: [0.; 4],
+            radii: [0.; 4],
+        };
+        if self.paints.is_empty() {
+            std::slice::from_ref(&NONE)
+        } else {
+            &self.paints
+        }
+    }
+
+    /// The stop table, for the renderer to upload; never empty.
+    pub fn color_stops(&self) -> &[SceneColorStop] {
+        const NONE: SceneColorStop = SceneColorStop {
+            color: [0.; 4],
+            offset: 0.,
+            padding0: 0,
+            padding1: 0,
+            padding2: 0,
+        };
+        if self.color_stops.is_empty() {
+            std::slice::from_ref(&NONE)
+        } else {
+            &self.color_stops
+        }
     }
 
     /// The transform table, for the renderer to upload: entry 0 is always the
@@ -1291,6 +1394,7 @@ struct PlacedEntry {
 struct AdoptedEntries {
     transforms: collections::FxHashMap<u32, u32>,
     clips: collections::FxHashMap<u32, u32>,
+    paints: collections::FxHashMap<u32, u32>,
 }
 
 /// A paint operation being replayed as part of a run, moved and clipped.
@@ -1496,6 +1600,18 @@ impl Primitive {
 
     /// The primitive's transform- and clip-table entries, to rewrite when it
     /// is replayed into another scene.
+    /// The backgrounds the primitive paints with.
+    fn backgrounds_mut(&mut self) -> SmallVec<[&mut Background; 2]> {
+        match self {
+            Primitive::Shadow(shadow) => smallvec::smallvec![&mut shadow.color],
+            Primitive::Quad(quad) => {
+                smallvec::smallvec![&mut quad.background, &mut quad.border_color]
+            }
+            Primitive::Path(path) => smallvec::smallvec![&mut path.color],
+            _ => SmallVec::new(),
+        }
+    }
+
     fn table_entries(&mut self) -> Option<(&mut u32, &mut u32)> {
         match self {
             Primitive::Shadow(shadow) => Some((&mut shadow.transform, &mut shadow.clip)),

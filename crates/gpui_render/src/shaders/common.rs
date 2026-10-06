@@ -75,6 +75,35 @@ mod source {
         LinearGradient = 1,
         PatternSlash = 2,
         Checkerboard = 3,
+        Paint = 4,
+    }
+
+    /// The shape of a paint-table gradient.
+    #[repr(u32)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Wgsl)]
+    pub enum PaintKind {
+        Linear = 0,
+        Radial = 1,
+        Sweep = 2,
+    }
+
+    /// How a paint-table gradient continues past its ends.
+    #[repr(u32)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Wgsl)]
+    pub enum PaintExtend {
+        Pad = 0,
+        Repeat = 1,
+        Reflect = 2,
+    }
+
+    /// The colour space a paint-table gradient's stops are interpolated in.
+    #[repr(u32)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Wgsl)]
+    pub enum PaintColorSpace {
+        Srgb = 0,
+        LinearSrgb = 1,
+        Oklab = 2,
+        Oklch = 3,
     }
 
     #[repr(u32)]
@@ -327,6 +356,176 @@ mod source {
 
     storage!(group(0), binding(2), TRANSFORMS: RuntimeArray<SceneTransform>);
     storage!(group(0), binding(3), CLIPS: RuntimeArray<SceneClip>);
+
+    /// An entry of the scene's paint table: a gradient, placed by the
+    /// transformation from viewport positions to its own space.
+    ///
+    /// Its geometry is, by kind: for linear, the start and end points; for
+    /// radial, the start and end centres, and in `radii` their radii; for
+    /// sweep, the centre, then the start and end angles in radians.
+    #[derive(Clone, Copy, Wgsl)]
+    pub struct ScenePaint {
+        pub transformation: TransformationMatrix,
+        pub kind: PaintKind,
+        pub extend: PaintExtend,
+        pub color_space: PaintColorSpace,
+        pub first_stop: u32,
+        pub stop_count: u32,
+        pub padding: u32,
+        pub geometry: Vec4f,
+        pub radii: Vec4f,
+    }
+
+    /// A colour stop of the scene's stop table: its colour in its gradient's
+    /// interpolation space, premultiplied except for hue, and its offset.
+    #[derive(Clone, Copy, Wgsl)]
+    pub struct SceneColorStop {
+        pub color: Vec4f,
+        pub offset: f32,
+        pub padding0: u32,
+        pub padding1: u32,
+        pub padding2: u32,
+    }
+
+    storage!(group(0), binding(4), PAINTS: RuntimeArray<ScenePaint>);
+    storage!(group(0), binding(5), COLOR_STOPS: RuntimeArray<SceneColorStop>);
+
+    /// Where a gradient is at a point in its own space, from 0 at its start to
+    /// 1 at its end, before it is extended; `x` is that offset, and `y` is 0
+    /// where the gradient is not defined, as outside a cone.
+    pub fn gradient_offset(paint: ScenePaint, point: Vec2f) -> Vec2f {
+        if paint.kind == PaintKind::Linear {
+            let start = paint.geometry.xy();
+            let direction = paint.geometry.zw() - start;
+            let length_squared = dot(direction, direction);
+            if length_squared == 0.0 {
+                return vec2f(0.0, 0.0);
+            }
+            return vec2f(dot(point - start, direction) / length_squared, 1.0);
+        }
+        if paint.kind == PaintKind::Sweep {
+            let relative = point - paint.geometry.xy();
+            let mut angle = atan2(relative.y, relative.x);
+            if angle < 0.0 {
+                angle += 2.0 * PI;
+            }
+            let span = paint.geometry.w - paint.geometry.z;
+            if span == 0.0 {
+                return vec2f(0.0, 0.0);
+            }
+            return vec2f((angle - paint.geometry.z) / span, 1.0);
+        }
+        // Two-point conical: the largest t whose circle, between the start
+        // and end circles, passes through the point, with a radius of zero or
+        // more.
+        let start = paint.geometry.xy();
+        let center_step = paint.geometry.zw() - start;
+        let radius = paint.radii.x;
+        let radius_step = paint.radii.y - radius;
+        let relative = point - start;
+        let a = dot(center_step, center_step) - radius_step * radius_step;
+        let b = dot(relative, center_step) + radius * radius_step;
+        let c = dot(relative, relative) - radius * radius;
+        if abs(a) < 1e-6 {
+            if b == 0.0 {
+                return vec2f(0.0, 0.0);
+            }
+            let t = c / (2.0 * b);
+            return vec2f(t, select(0.0, 1.0, radius + t * radius_step >= 0.0));
+        }
+        let discriminant = b * b - a * c;
+        if discriminant < 0.0 {
+            return vec2f(0.0, 0.0);
+        }
+        let root = sqrt(discriminant);
+        let larger = max((b + root) / a, (b - root) / a);
+        if radius + larger * radius_step >= 0.0 {
+            return vec2f(larger, 1.0);
+        }
+        let smaller = min((b + root) / a, (b - root) / a);
+        vec2f(
+            smaller,
+            select(0.0, 1.0, radius + smaller * radius_step >= 0.0),
+        )
+    }
+
+    /// A gradient offset continued past the ends by `extend`, into 0 to 1.
+    pub fn extend_offset(extend: PaintExtend, offset: f32) -> f32 {
+        if extend == PaintExtend::Repeat {
+            return offset - floor(offset);
+        }
+        if extend == PaintExtend::Reflect {
+            let period = offset - 2.0 * floor(offset / 2.0);
+            return select(period, 2.0 - period, period > 1.0);
+        }
+        saturate(offset)
+    }
+
+    /// The colour of a paint's stops at `offset`, interpolated in its space.
+    pub fn stops_color(paint: ScenePaint, offset: f32) -> Vec4f {
+        let first = get!(COLOR_STOPS)[paint.first_stop as usize];
+        if offset <= first.offset || paint.stop_count < 2u32 {
+            return first.color;
+        }
+        let mut previous = first;
+        let mut index = 1u32;
+        while index < paint.stop_count {
+            let stop_index = paint.first_stop + index;
+            let stop = get!(COLOR_STOPS)[stop_index as usize];
+            if offset <= stop.offset {
+                let span = stop.offset - previous.offset;
+                let mut t = 1.0;
+                if span > 0.0 {
+                    t = (offset - previous.offset) / span;
+                }
+                return mix(previous.color, stop.color, vec4f(t, t, t, t));
+            }
+            previous = stop;
+            index += 1u32;
+        }
+        previous.color
+    }
+
+    /// A colour in `space`, premultiplied except for hue, as unpremultiplied
+    /// sRGB-encoded RGBA, as paints are drawn.
+    pub fn paint_space_to_srgba(space: PaintColorSpace, color: Vec4f) -> Vec4f {
+        let alpha = color.w;
+        if alpha <= 0.0 {
+            return transparent();
+        }
+        let mut components = color.xyz();
+        if space == PaintColorSpace::Oklch {
+            let lightness = components.x / alpha;
+            let chroma = components.y / alpha;
+            let hue = components.z * PI / HALF_TURN_DEGREES;
+            components = vec3f(lightness, chroma * cos(hue), chroma * sin(hue));
+        } else {
+            components = components / alpha;
+        }
+        if space == PaintColorSpace::Srgb {
+            return vec4f(components.x, components.y, components.z, alpha);
+        }
+        let mut linear = components;
+        if space == PaintColorSpace::Oklab || space == PaintColorSpace::Oklch {
+            let cone_root = OKLAB_TO_CONE_RESPONSE * components;
+            linear = CONE_RESPONSE_TO_LINEAR_SRGB * (cone_root * cone_root * cone_root);
+        }
+        let encoded = linear_to_srgb(max(linear, vec3f(0.0, 0.0, 0.0)));
+        vec4f(encoded.x, encoded.y, encoded.z, alpha)
+    }
+
+    /// The colour of paint-table entry `index` at a viewport position.
+    pub fn table_paint_color(index: u32, viewport_position: Vec2f) -> Vec4f {
+        let paint = get!(PAINTS)[index as usize];
+        let point =
+            TransformationMatrix::transform_position(paint.transformation, viewport_position);
+        let offset = gradient_offset(paint, point);
+        if offset.y == 0.0 {
+            return transparent();
+        }
+        let color = stops_color(paint, extend_offset(paint.extend, offset.x));
+        paint_space_to_srgba(paint.color_space, color) + gradient_dither(viewport_position)
+    }
 
     /// How many clips a primitive's chain may hold; deeper nesting is clipped
     /// to its innermost clips.
@@ -853,7 +1052,14 @@ mod source {
         color
     }
 
-    pub fn paint_color(paint: Paint, position: Vec2f, prepared: PreparedPaint) -> Vec4f {
+    /// The colour `paint` draws at `position`, in the primitive's own space,
+    /// and at `viewport_position`, where paint-table entries are placed.
+    pub fn paint_color(
+        paint: Paint,
+        position: Vec2f,
+        viewport_position: Vec2f,
+        prepared: PreparedPaint,
+    ) -> Vec4f {
         let mut color = prepared.solid;
         #[wgsl_allow(non_literal_match_statement_patterns)]
         match paint.background.tag {
@@ -868,6 +1074,15 @@ mod source {
             }
             BackgroundTag::Checkerboard => {
                 color = checkerboard_color(paint, position, prepared.solid);
+            }
+            BackgroundTag::Paint => {
+                // The index is kept as a float, exactly, and the solid
+                // colour's alpha fades the paint.
+                color = table_paint_color(
+                    u32(paint.background.gradient_angle_or_pattern_height),
+                    viewport_position,
+                );
+                color.w *= prepared.solid.w;
             }
         }
         color

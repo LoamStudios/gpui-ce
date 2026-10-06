@@ -239,6 +239,7 @@ pub mod shadow {
         let color = paint_color(
             shadow_paint(shadow),
             point,
+            scene_position(input.position.xy()),
             PreparedPaint::new(input.paint_solid, input.paint_color0, input.paint_color1),
         );
         blend_color(
@@ -345,6 +346,7 @@ pub mod shadow {
         let color = paint_color(
             shadow_paint(shadow),
             point,
+            scene_position(input.position.xy()),
             PreparedPaint::new(input.paint_solid, input.paint_color0, input.paint_color1),
         );
         blend_color(

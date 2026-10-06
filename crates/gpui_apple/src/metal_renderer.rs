@@ -47,7 +47,7 @@ use std::{cell::Cell, mem, ptr, sync::Arc};
 const PATH_SAMPLE_COUNT: u32 = 4;
 
 // Buffer slots declared by the generated MSL: group 0 (globals, font rasterization, and the
-// scene's transform and clip tables), then the group 1 data binding, then Naga's runtime-array
+// scene's transform, clip, paint and colour-stop tables), then the group 1 data binding, then Naga's runtime-array
 // sizes buffer.
 const fn buffer_slot(group: u32, binding: u32) -> u64 {
     shader_interface::native_slot(group, binding) as u64
@@ -67,6 +67,14 @@ const TRANSFORMS_SLOT: u64 = buffer_slot(
 const CLIPS_SLOT: u64 = buffer_slot(
     shader_interface::GLOBAL_BIND_GROUP,
     shader_interface::CLIPS_BINDING,
+);
+const PAINTS_SLOT: u64 = buffer_slot(
+    shader_interface::GLOBAL_BIND_GROUP,
+    shader_interface::PAINTS_BINDING,
+);
+const COLOR_STOPS_SLOT: u64 = buffer_slot(
+    shader_interface::GLOBAL_BIND_GROUP,
+    shader_interface::COLOR_STOPS_BINDING,
 );
 const DATA_SLOT: u64 = buffer_slot(
     shader_interface::DATA_BIND_GROUP,
@@ -94,12 +102,15 @@ struct SceneUniforms {
     tables: SceneTables,
 }
 
-/// Where this frame's transform and clip tables live in its instance buffer.
+/// Where this frame's transform, clip, paint and colour-stop tables live in its instance
+/// buffer.
 #[derive(Clone)]
 struct SceneTables {
     buffer: metal::Buffer,
     transforms_offset: u64,
     clips_offset: u64,
+    paints_offset: u64,
+    color_stops_offset: u64,
 }
 
 impl SceneTables {
@@ -112,10 +123,15 @@ impl SceneTables {
     ) -> Option<Self> {
         let transforms_offset = write_table(scene.transforms(), instance_buffer, instance_offset)?;
         let clips_offset = write_table(scene.clips(), instance_buffer, instance_offset)?;
+        let paints_offset = write_table(scene.paints(), instance_buffer, instance_offset)?;
+        let color_stops_offset =
+            write_table(scene.color_stops(), instance_buffer, instance_offset)?;
         Some(Self {
             buffer: instance_buffer.metal_buffer.clone(),
             transforms_offset: transforms_offset as u64,
             clips_offset: clips_offset as u64,
+            paints_offset: paints_offset as u64,
+            color_stops_offset: color_stops_offset as u64,
         })
     }
 }
@@ -144,12 +160,14 @@ fn write_table<T: Copy>(
     Some(offset)
 }
 
-/// Bytes the scene's transform and clip tables take at the front of the instance buffer.
+/// Bytes the scene's tables take at the front of the instance buffer.
 fn scene_table_bytes(scene: &Scene) -> usize {
     let mut required = 0;
     for bytes in [
         mem::size_of_val(scene.transforms()),
         mem::size_of_val(scene.clips()),
+        mem::size_of_val(scene.paints()),
+        mem::size_of_val(scene.color_stops()),
     ] {
         align_offset(&mut required);
         required += bytes;
@@ -261,6 +279,8 @@ fn bind_scene_uniforms(encoder: &metal::RenderCommandEncoderRef, uniforms: &Scen
     for (slot, offset) in [
         (TRANSFORMS_SLOT, tables.transforms_offset),
         (CLIPS_SLOT, tables.clips_offset),
+        (PAINTS_SLOT, tables.paints_offset),
+        (COLOR_STOPS_SLOT, tables.color_stops_offset),
     ] {
         encoder.set_vertex_buffer(slot, Some(&tables.buffer), offset);
         encoder.set_fragment_buffer(slot, Some(&tables.buffer), offset);
@@ -1033,9 +1053,11 @@ impl MetalRenderer {
         let tables =
             SceneTables::upload(scene, instance_buffer, &mut instance_offset).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "scene too large: {} transforms, {} clips",
+                    "scene too large: {} transforms, {} clips, {} paints, {} colour stops",
                     scene.transforms().len(),
-                    scene.clips().len()
+                    scene.clips().len(),
+                    scene.paints().len(),
+                    scene.color_stops().len()
                 )
             })?;
         let scene_uniforms = SceneUniforms::new(viewport_size, tables);

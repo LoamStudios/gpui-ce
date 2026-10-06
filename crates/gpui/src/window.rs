@@ -5573,6 +5573,36 @@ impl Window {
         }
     }
 
+    /// A background that paints `gradient`, whose geometry is in the current
+    /// element's coordinates, for this frame: fill quads, borders and paths
+    /// with it. Gradients interpolate in any colour space, with any number
+    /// of stops, extended as `gradient.extend` says.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn gradient(&mut self, gradient: &peniko::Gradient) -> Background {
+        self.transformed_gradient(gradient, kurbo::Affine::IDENTITY)
+    }
+
+    /// A background that paints `gradient` moved into the current element's
+    /// coordinates by `transform`; see [`Self::gradient`].
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn transformed_gradient(
+        &mut self,
+        gradient: &peniko::Gradient,
+        transform: impl Into<kurbo::Affine>,
+    ) -> Background {
+        self.invalidator.debug_assert_paint();
+        let to_viewport = kurbo::Affine::scale(f64::from(self.scale_factor()))
+            * self.element_to_window()
+            * transform.into();
+        let to_gradient = TransformationMatrix::from(to_viewport.inverse());
+        match self.next_frame.scene.push_gradient(gradient, to_gradient) {
+            Some(index) => Background::paint(index),
+            None => transparent_black().into(),
+        }
+    }
+
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.

@@ -63,6 +63,7 @@ pub mod path_rasterization {
         let color = paint_color(
             paint,
             scene_position(input.position.xy()),
+            scene_position(input.position.xy()),
             prepare_paint(paint),
         );
         premultiply(color, coverage)

@@ -228,6 +228,14 @@ impl Lerp for Fill {
     fn lerp(&self, to: &Self, delta: f32) -> Self {
         match (self, to) {
             (Self::Color(from), Self::Color(to)) => Self::Color(from.lerp(to, delta)),
+            // Gradients don't blend: the fill switches halfway.
+            (from, to) => {
+                if delta < 0.5 {
+                    from.clone()
+                } else {
+                    to.clone()
+                }
+            }
         }
     }
 }
