@@ -548,97 +548,106 @@ impl<V: View> Element for ViewElement<V> {
                 window.with_element_state::<ViewElementState, _>(
                     global_id.unwrap(),
                     |element_state, window| {
-                        let content_mask = window.content_mask();
-                        let cache_key = ViewElementCacheKey {
-                            bounds,
-                            records_offset: Point::default(),
-                            unclipped: unclipped_by(bounds, &content_mask),
-                            content_mask,
-                            text_style: window.text_style(),
-                            direction: window.resolved_direction(),
-                            unicode_bidi: window.resolved_unicode_bidi(),
-                        };
-
-                        if request_layout.element.is_none()
-                            && let Some(mut element_state) = element_state
-                            && element_state.frame != window.next_frame.id
-                            && element_state.cache_key.text_style == cache_key.text_style
-                            && element_state.cache_key.direction == cache_key.direction
-                            && element_state.cache_key.unicode_bidi == cache_key.unicode_bidi
-                            && !window.dirty_views.contains(&entity_id)
-                            && !window.refreshing
-                            && let Some(offset) =
-                                element_state.reuse_offset(bounds, &content_mask, window)
-                        {
-                            let prepaint_start = window.prepaint_index();
-                            window.reuse_prepaint_at(element_state.prepaint_range.clone(), offset);
-                            cx.entities
-                                .extend_accessed(&element_state.accessed_entities);
-                            let prepaint_end = window.prepaint_index();
-                            element_state.frame = window.next_frame.id;
-                            element_state.prepaint_range = prepaint_start..prepaint_end;
-                            element_state.reuse_offset = offset;
-                            element_state.moved_since_render |= !offset.is_zero();
-                            // The records now describe the view here, clipped
-                            // by what clips it here.
-                            let records_origin = element_state.cache_key.bounds.origin
-                                + element_state.cache_key.records_offset
-                                + offset;
-                            element_state.cache_key = ViewElementCacheKey {
-                                records_offset: records_origin - bounds.origin,
-                                ..cache_key
+                        window.with_cached_view_recording(|window| {
+                            let content_mask = window.content_mask();
+                            let cache_key = ViewElementCacheKey {
+                                bounds,
+                                records_offset: Point::default(),
+                                unclipped: unclipped_by(bounds, &content_mask),
+                                content_mask,
+                                text_style: window.text_style(),
+                                direction: window.resolved_direction(),
+                                unicode_bidi: window.resolved_unicode_bidi(),
                             };
 
-                            return (None, element_state);
-                        }
+                            if request_layout.element.is_none()
+                                && let Some(mut element_state) = element_state
+                                && element_state.frame != window.next_frame.id
+                                && element_state.cache_key.text_style == cache_key.text_style
+                                && element_state.cache_key.direction == cache_key.direction
+                                && element_state.cache_key.unicode_bidi == cache_key.unicode_bidi
+                                && !window.dirty_views.contains(&entity_id)
+                                && !window.refreshing
+                                && let Some(offset) =
+                                    element_state.reuse_offset(bounds, &content_mask, window)
+                            {
+                                let prepaint_start = window.prepaint_index();
+                                window.reuse_prepaint_at(
+                                    element_state.prepaint_range.clone(),
+                                    offset,
+                                );
+                                cx.entities
+                                    .extend_accessed(&element_state.accessed_entities);
+                                let prepaint_end = window.prepaint_index();
+                                element_state.frame = window.next_frame.id;
+                                element_state.prepaint_range = prepaint_start..prepaint_end;
+                                element_state.reuse_offset = offset;
+                                element_state.moved_since_render |= !offset.is_zero();
+                                // The records now describe the view here, clipped
+                                // by what clips it here.
+                                let records_origin = element_state.cache_key.bounds.origin
+                                    + element_state.cache_key.records_offset
+                                    + offset;
+                                element_state.cache_key = ViewElementCacheKey {
+                                    records_offset: records_origin - bounds.origin,
+                                    ..cache_key
+                                };
 
-                        let refreshing = mem::replace(&mut window.refreshing, true);
-                        let prepaint_start = window.prepaint_index();
-                        let mut accessed_entities =
-                            mem::take(&mut request_layout.accessed_entities);
-                        let (element, additional_entities) = cx.detect_accessed_entities(|cx| {
-                            let mut element = request_layout.element.take().unwrap_or_else(|| {
-                                render_view(self.view.take().unwrap(), window, cx)
-                            });
-                            element.layout_as_root(bounds.size.into(), window, cx);
-                            element.prepaint_at(bounds.origin, window, cx);
+                                return (None, element_state);
+                            }
 
-                            element
-                        });
-                        accessed_entities.extend(additional_entities);
+                            let refreshing = mem::replace(&mut window.refreshing, true);
+                            let prepaint_start = window.prepaint_index();
+                            let mut accessed_entities =
+                                mem::take(&mut request_layout.accessed_entities);
+                            let (element, additional_entities) =
+                                cx.detect_accessed_entities(|cx| {
+                                    let mut element =
+                                        request_layout.element.take().unwrap_or_else(|| {
+                                            render_view(self.view.take().unwrap(), window, cx)
+                                        });
+                                    element.layout_as_root(bounds.size.into(), window, cx);
+                                    element.prepaint_at(bounds.origin, window, cx);
 
-                        if let Some(detached_layout_id) = request_layout.detached_layout_id.take() {
-                            let contribution =
-                                window.layout_auto_direction_contribution(detached_layout_id);
-                            window.with_element_state::<ViewDirectionState, _>(
-                                global_id.unwrap(),
-                                |_state, _window| {
-                                    (
-                                        (),
-                                        ViewDirectionState {
-                                            known: true,
-                                            contribution,
-                                        },
-                                    )
+                                    element
+                                });
+                            accessed_entities.extend(additional_entities);
+
+                            if let Some(detached_layout_id) =
+                                request_layout.detached_layout_id.take()
+                            {
+                                let contribution =
+                                    window.layout_auto_direction_contribution(detached_layout_id);
+                                window.with_element_state::<ViewDirectionState, _>(
+                                    global_id.unwrap(),
+                                    |_state, _window| {
+                                        (
+                                            (),
+                                            ViewDirectionState {
+                                                known: true,
+                                                contribution,
+                                            },
+                                        )
+                                    },
+                                );
+                            }
+
+                            let prepaint_end = window.prepaint_index();
+                            window.refreshing = refreshing;
+
+                            (
+                                Some(element),
+                                ViewElementState {
+                                    frame: window.next_frame.id,
+                                    accessed_entities,
+                                    prepaint_range: prepaint_start..prepaint_end,
+                                    paint_range: PaintIndex::default()..PaintIndex::default(),
+                                    cache_key,
+                                    reuse_offset: Point::default(),
+                                    moved_since_render: false,
                                 },
-                            );
-                        }
-
-                        let prepaint_end = window.prepaint_index();
-                        window.refreshing = refreshing;
-
-                        (
-                            Some(element),
-                            ViewElementState {
-                                frame: window.next_frame.id,
-                                accessed_entities,
-                                prepaint_range: prepaint_start..prepaint_end,
-                                paint_range: PaintIndex::default()..PaintIndex::default(),
-                                cache_key,
-                                reuse_offset: Point::default(),
-                                moved_since_render: false,
-                            },
-                        )
+                            )
+                        })
                     },
                 )
             })
@@ -678,21 +687,21 @@ impl<V: View> Element for ViewElement<V> {
                         |element_state, window| {
                             let mut element_state = element_state.unwrap();
 
-                            let paint_start = window.paint_index();
-
-                            if let Some(element) = element {
-                                let refreshing = mem::replace(&mut window.refreshing, true);
-                                element.paint(window, cx);
-                                window.refreshing = refreshing;
-                            } else {
-                                window.reuse_paint_at(
-                                    element_state.paint_range.clone(),
-                                    element_state.reuse_offset,
-                                );
-                            }
-
-                            let paint_end = window.paint_index();
-                            element_state.paint_range = paint_start..paint_end;
+                            window.with_cached_view_recording(|window| {
+                                let paint_start = window.paint_index();
+                                if let Some(element) = element {
+                                    let refreshing = mem::replace(&mut window.refreshing, true);
+                                    element.paint(window, cx);
+                                    window.refreshing = refreshing;
+                                } else {
+                                    window.reuse_paint_at(
+                                        element_state.paint_range.clone(),
+                                        element_state.reuse_offset,
+                                    );
+                                }
+                                let paint_end = window.paint_index();
+                                element_state.paint_range = paint_start..paint_end;
+                            });
 
                             if element_state.moved_since_render {
                                 // The moved records still answer mouse events

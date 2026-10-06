@@ -936,6 +936,10 @@ pub struct Hitbox {
     pub bounds: Bounds<Pixels>,
     /// The content mask when the hitbox was inserted.
     pub content_mask: ContentMask<Pixels>,
+    /// The content mask as recorded for reuse in a later frame: the same as
+    /// `content_mask`, except inside a cached view, which is recorded as if
+    /// nothing outside it clipped it (see [`Window::with_cached_view_recording`]).
+    pub(crate) recorded_content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
     /// Disjoint regions of an inline element. `bounds` is their union.
@@ -1083,6 +1087,11 @@ pub(crate) struct TooltipRequest {
     id: TooltipId,
     tooltip: AnyTooltip,
 }
+
+/// How far an unbounded content mask reaches from the window's origin, in
+/// each direction: far beyond any window, and well inside the range where
+/// `f32` keeps whole device pixels exact.
+const UNBOUNDED_EXTENT: f32 = 1_000_000.;
 
 pub(crate) struct DeferredDraw {
     current_view: EntityId,
@@ -1284,6 +1293,10 @@ pub struct Window {
     style_transition_containing_bounds: Option<Bounds<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    /// While a cached view is recorded, what clips it from outside: it is
+    /// recorded unclipped, and this applies only to what is drawn and hit
+    /// tested in this frame. See [`Window::with_cached_view_recording`].
+    recording_clip: Option<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
     /// window, so that only actual changes are forwarded (reconfiguring a live
@@ -2037,6 +2050,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             style_transition_containing_bounds: None,
             content_mask_stack: Vec::new(),
+            recording_clip: None,
             element_opacity: 1.0,
             requested_autoscroll: None,
             last_text_input_configuration: None,
@@ -3784,13 +3798,22 @@ impl Window {
     ) {
         let clip = self.content_mask();
         let moved_mask = |mask: ContentMask<Pixels>| mask.translate(offset).intersect(&clip);
+        let recording_clip = self.recording_clip;
+        let clipped_for_recording = |mask: ContentMask<Pixels>| match &recording_clip {
+            Some(clip) => mask.intersect(clip),
+            None => mask,
+        };
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
-                .map(|hitbox| Hitbox {
-                    bounds: hitbox.bounds + offset,
-                    content_mask: moved_mask(hitbox.content_mask),
-                    ..hitbox.clone()
+                .map(|hitbox| {
+                    let recorded_content_mask = moved_mask(hitbox.recorded_content_mask);
+                    Hitbox {
+                        bounds: hitbox.bounds + offset,
+                        content_mask: clipped_for_recording(recorded_content_mask),
+                        recorded_content_mask,
+                        ..hitbox.clone()
+                    }
                 }),
         );
         self.next_frame.tooltip_requests.extend(
@@ -4130,6 +4153,52 @@ impl Window {
     pub(crate) fn element_opacity(&self) -> f32 {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.element_opacity
+    }
+
+    /// Runs `f`, which renders or reuses a cached view, so that the view is
+    /// recorded whole even where something outside it clips it.
+    ///
+    /// A clipped recording is missing whatever was clipped away, so it could
+    /// not be reused anywhere else: a view at the edge of a scrolling list or
+    /// a panned canvas would be rendered again on every frame of the move. So
+    /// the outermost cached view is drawn under an unbounded content mask,
+    /// and the mask that applied is kept as the recording clip: primitives
+    /// and hitboxes are recorded under the unbounded mask, and only what this
+    /// frame draws and hit tests is cut down to the clip. Cached views inside
+    /// one being recorded are recorded relative to it, as everything else in
+    /// it is, so its recording keeps its own clips.
+    pub(crate) fn with_cached_view_recording<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        if self.recording_clip.is_some() {
+            return f(self);
+        }
+        let clip = self.content_mask();
+        let scene_clip = ContentMask {
+            bounds: self.cover_bounds(clip.bounds),
+            fade_out: clip.fade_out.scale(self.scale_factor()),
+        };
+        self.recording_clip = Some(clip);
+        let outer_scene_clip = self.next_frame.scene.set_clip(Some(scene_clip));
+        self.content_mask_stack.push(ContentMask {
+            bounds: Bounds::new(
+                point(px(-UNBOUNDED_EXTENT), px(-UNBOUNDED_EXTENT)),
+                size(px(2. * UNBOUNDED_EXTENT), px(2. * UNBOUNDED_EXTENT)),
+            ),
+            ..Default::default()
+        });
+        let result = f(self);
+        self.content_mask_stack.pop();
+        self.next_frame.scene.set_clip(outer_scene_clip);
+        self.recording_clip = None;
+        result
+    }
+
+    /// `mask` cut down to the recording clip, if a cached view is being
+    /// recorded: what applies in this frame to something recorded under it.
+    fn clipped_for_recording(&self, mask: ContentMask<Pixels>) -> ContentMask<Pixels> {
+        match &self.recording_clip {
+            Some(clip) => mask.intersect(clip),
+            None => mask,
+        }
     }
 
     /// Obtain the current content mask. This method should only be called during element drawing.
@@ -5592,13 +5661,14 @@ impl Window {
     ) -> &mut Hitbox {
         self.invalidator.debug_assert_prepaint();
 
-        let content_mask = self.content_mask();
+        let recorded_content_mask = self.content_mask();
         let hitbox_id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
         let hitbox = Hitbox {
             id: hitbox_id,
             bounds,
-            content_mask,
+            content_mask: self.clipped_for_recording(recorded_content_mask),
+            recorded_content_mask,
             behavior,
             fragments: self.current_inline_fragments.clone(),
             tags: Vec::default(),
@@ -8120,6 +8190,7 @@ mod tests {
                 bounds,
                 ..Default::default()
             },
+            recorded_content_mask: ContentMask::default(),
             behavior: HitboxBehavior::Normal,
             tags: vec!["background".into()],
             fragments: None,
@@ -8131,6 +8202,7 @@ mod tests {
                 bounds: Bounds::new(Point::default(), size(px(80.), px(80.))),
                 ..Default::default()
             },
+            recorded_content_mask: ContentMask::default(),
             behavior: HitboxBehavior::Normal,
             tags: vec!["inline".into()],
             fragments: Some(Arc::from([

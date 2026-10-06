@@ -77,6 +77,8 @@ pub struct Scene {
     pub filter_boundaries: Vec<FilterBoundary>,
     render_plan: ScenePlan,
     is_finished: bool,
+    /// Clips what is drawn, but not what is recorded; see [`Self::set_clip`].
+    clip: Option<ContentMask<ScaledPixels>>,
     /// Scratch space for [`Self::replay_run_at`], kept to reuse its allocation.
     replay_run: Vec<ReplayOperation>,
 }
@@ -99,6 +101,7 @@ impl Scene {
         self.backdrop_filters.clear();
         self.filter_boundaries.clear();
         self.render_plan.clear();
+        self.clip = None;
         self.is_finished = false;
     }
 
@@ -180,63 +183,40 @@ impl Scene {
         self.push_primitive(primitive, order, surface_opacity);
     }
 
-    /// Stores `primitive` at `order`, which has been assigned already.
+    /// Stores `primitive` at `order`, which has been assigned already: as
+    /// recorded, for a later frame to replay, and to be drawn in this one,
+    /// cut down to [`Self::clip`] if one is set.
     fn push_primitive(
         &mut self,
         mut primitive: Primitive,
         order: DrawOrder,
         surface_opacity: Option<f32>,
     ) {
-        match &mut primitive {
-            Primitive::Shadow(shadow) => {
-                shadow.order = order;
-                self.shadows.push(*shadow);
-            }
-            Primitive::Quad(quad) => {
-                quad.order = order;
-                self.quads.push(*quad);
-            }
-            Primitive::Path(path) => {
-                path.order = order;
-                path.id = PathId(self.paths.len());
-                self.paths.push(path.clone());
-            }
-            Primitive::Underline(underline) => {
-                underline.order = order;
-                self.underlines.push(*underline);
-            }
-            Primitive::MonochromeSprite(sprite) => {
-                sprite.order = order;
-                self.monochrome_sprites.push(*sprite);
-            }
-            Primitive::SubpixelSprite(sprite) => {
-                sprite.order = order;
-                self.subpixel_sprites.push(*sprite);
-            }
-            Primitive::PolychromeSprite(sprite) => {
-                sprite.order = order;
-                self.polychrome_sprites.push(*sprite);
-            }
-            Primitive::Surface(surface) => {
-                surface.order = order;
-                self.surfaces.push(surface.clone());
-                self.surface_opacities.push(surface_opacity.unwrap_or(1.0));
-            }
-            Primitive::BackdropFilter(filter) => {
-                filter.order = order;
-                self.backdrop_filters.push(filter.clone());
-            }
-            Primitive::FilterBoundary(boundary) => {
-                boundary.order = order;
-                if !boundary.is_start {
-                    // A closed content-filter group is a draw-order barrier: everything painted
-                    // afterwards must sort above the group's end marker so it can't fall back
-                    // inside the group's order range (subsequent non-overlapping content otherwise
-                    // reuses a low order). Mirrors the floor raised before deferred draws in
-                    // `raise_order_floor`.
-                    self.primitive_bounds.set_order_floor(order + 1);
+        primitive.set_order(order);
+        if let Primitive::FilterBoundary(boundary) = &primitive
+            && !boundary.is_start
+        {
+            // A closed content-filter group is a draw-order barrier: everything painted
+            // afterwards must sort above the group's end marker so it can't fall back
+            // inside the group's order range (subsequent non-overlapping content otherwise
+            // reuses a low order). Mirrors the floor raised before deferred draws in
+            // `raise_order_floor`.
+            self.primitive_bounds.set_order_floor(order + 1);
+        }
+        match self.clip {
+            None => self.draw_primitive(&primitive, surface_opacity),
+            Some(clip) => {
+                let mut drawn = primitive.clone();
+                drawn.translate(Point::default(), &clip);
+                // Content-filter boundaries are drawn in pairs, visible or not.
+                if matches!(drawn, Primitive::FilterBoundary(_))
+                    || !drawn
+                        .bounds()
+                        .intersect(&drawn.content_mask().bounds)
+                        .is_empty()
+                {
+                    self.draw_primitive(&drawn, surface_opacity);
                 }
-                self.filter_boundaries.push(boundary.clone());
             }
         }
         if let (Primitive::Surface(surface), Some(opacity)) = (&primitive, surface_opacity) {
@@ -248,6 +228,40 @@ impl Scene {
             self.paint_operations
                 .push(PaintOperation::Primitive(primitive));
         }
+    }
+
+    /// Adds `primitive` to what this frame draws.
+    fn draw_primitive(&mut self, primitive: &Primitive, surface_opacity: Option<f32>) {
+        match primitive {
+            Primitive::Shadow(shadow) => self.shadows.push(*shadow),
+            Primitive::Quad(quad) => self.quads.push(*quad),
+            Primitive::Path(path) => {
+                let mut path = path.clone();
+                path.id = PathId(self.paths.len());
+                self.paths.push(path);
+            }
+            Primitive::Underline(underline) => self.underlines.push(*underline),
+            Primitive::MonochromeSprite(sprite) => self.monochrome_sprites.push(*sprite),
+            Primitive::SubpixelSprite(sprite) => self.subpixel_sprites.push(*sprite),
+            Primitive::PolychromeSprite(sprite) => self.polychrome_sprites.push(*sprite),
+            Primitive::Surface(surface) => {
+                self.surfaces.push(surface.clone());
+                self.surface_opacities.push(surface_opacity.unwrap_or(1.0));
+            }
+            Primitive::BackdropFilter(filter) => self.backdrop_filters.push(filter.clone()),
+            Primitive::FilterBoundary(boundary) => self.filter_boundaries.push(boundary.clone()),
+        }
+    }
+
+    /// Sets the clip applied to what is drawn from here on, on top of each
+    /// primitive's own mask, and returns the one it replaces. Primitives are
+    /// still recorded, and ordered, as if unclipped: this is how a cached view
+    /// is recorded whole while only what is visible of it is drawn.
+    pub(crate) fn set_clip(
+        &mut self,
+        clip: Option<ContentMask<ScaledPixels>>,
+    ) -> Option<ContentMask<ScaledPixels>> {
+        mem::replace(&mut self.clip, clip)
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
@@ -590,6 +604,21 @@ impl Primitive {
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::BackdropFilter(filter) => &filter.content_mask,
             Primitive::FilterBoundary(boundary) => &boundary.content_mask,
+        }
+    }
+
+    fn set_order(&mut self, order: DrawOrder) {
+        match self {
+            Primitive::Shadow(shadow) => shadow.order = order,
+            Primitive::Quad(quad) => quad.order = order,
+            Primitive::Path(path) => path.order = order,
+            Primitive::Underline(underline) => underline.order = order,
+            Primitive::MonochromeSprite(sprite) => sprite.order = order,
+            Primitive::SubpixelSprite(sprite) => sprite.order = order,
+            Primitive::PolychromeSprite(sprite) => sprite.order = order,
+            Primitive::Surface(surface) => surface.order = order,
+            Primitive::BackdropFilter(filter) => filter.order = order,
+            Primitive::FilterBoundary(boundary) => boundary.order = order,
         }
     }
 

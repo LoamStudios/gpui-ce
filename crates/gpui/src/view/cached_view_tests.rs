@@ -313,31 +313,47 @@ fn cached_view_is_reused_where_it_moves_to(cx: &mut TestAppContext) {
         "the reused quads are clipped by the viewport where it now cuts them"
     );
 
-    // A recording made while clipped is missing what fell outside, so it is
-    // not reused anywhere else: moving back renders the card again.
-    scroll.set(0.);
-    draw(cx);
-    assert_eq!(renders.get(), 2, "a clipped recording is not moved");
-    assert_eq!(quads(cx, window), at_top);
-
-    // Notifying the entity always renders it again, wherever it is.
+    // Rendered again while the viewport cuts it off: the card is recorded
+    // whole all the same, and only drawn clipped.
     cx.update_window(window, |root, _, cx| {
         let card = root.downcast::<Viewport>().unwrap().read(cx).card.clone();
         card.update(cx, |_, cx| cx.notify());
     })
     .unwrap();
     draw(cx);
-    assert_eq!(renders.get(), 3);
+    assert_eq!(renders.get(), 2, "notifying the card renders it again");
+    assert_eq!(
+        quads(cx, window),
+        vec![(0., 150., 20., 20.), (0., 150., 100., 50.)],
+        "drawn clipped by the viewport"
+    );
+
+    // So it can be moved back into view without being rendered, whole.
+    scroll.set(20.);
+    draw(cx);
+    assert_eq!(renders.get(), 2, "a recording made while clipped is moved");
+    assert_eq!(
+        quads(cx, window),
+        vec![(0., 20., 20., 20.), (0., 20., 100., 100.)],
+        "what the viewport cut off when it was recorded is there"
+    );
+    assert_eq!(
+        hitboxes(cx, window),
+        hitboxes_at_top
+            .iter()
+            .map(|(y, h)| (y + 20., *h))
+            .collect::<Vec<_>>(),
+    );
 
     // The mask can change while the card stays put: a shorter viewport cuts
     // it at the same position. The records are reused in place, clipped by
-    // the new mask.
+    // the new mask, hitboxes included.
     height.set(60.);
     draw(cx);
-    assert_eq!(renders.get(), 3, "reused in place under a smaller mask");
+    assert_eq!(renders.get(), 2, "reused in place under a smaller mask");
     assert_eq!(
         quads(cx, window),
-        vec![(0., 0., 20., 20.), (0., 0., 100., 60.)],
+        vec![(0., 20., 20., 20.), (0., 20., 100., 40.)],
         "the reused quads are clipped by the shorter viewport"
     );
     let hitbox_mask_bottoms = cx
@@ -355,14 +371,14 @@ fn cached_view_is_reused_where_it_moves_to(cx: &mut TestAppContext) {
         "the reused hitboxes are clipped by the shorter viewport: {hitbox_mask_bottoms:?}"
     );
 
-    // Growing the viewport back does not restore what that recording lost:
-    // it is clipped, so the card is rendered again.
+    // Growing the viewport back shows the whole card again, still without
+    // rendering it.
     height.set(200.);
     draw(cx);
+    assert_eq!(renders.get(), 2, "reused under a larger mask");
     assert_eq!(
-        renders.get(),
-        4,
-        "a clipped recording is not reused under a larger mask"
+        quads(cx, window),
+        vec![(0., 20., 20., 20.), (0., 20., 100., 100.)],
     );
 
     // Closures the card registered during paint answer mouse events with the
@@ -693,5 +709,95 @@ fn panning_canvas_frame_cost(cx: &mut TestAppContext) {
         CANVAS_COLUMNS * CANVAS_ROWS,
         samples[samples.len() / 2].as_secs_f64() * 1e3,
         renders.get(),
+    );
+}
+
+/// A cached panel holding the cached card in a 60px-tall clipping well, 20px
+/// down: the well cuts the card's bottom 60px off.
+struct Panel {
+    card: Entity<Card>,
+}
+
+impl Render for Panel {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(100.)).child(
+            div()
+                .mt(px(20.))
+                .h(px(60.))
+                .overflow_hidden()
+                .child(self.card.clone().cached(card_style())),
+        )
+    }
+}
+
+/// The panel, cached, in a 200px viewport scrolled by `scroll`, 50px in from
+/// the left, away from the test pointer at the window's origin.
+struct PanelViewport {
+    panel: Entity<Panel>,
+    scroll: Rc<Cell<f32>>,
+}
+
+impl Render for PanelViewport {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(200.)).overflow_hidden().child(
+            div()
+                .mt(px(self.scroll.get()))
+                .ml(px(50.))
+                .child(self.panel.clone().cached(card_style())),
+        )
+    }
+}
+
+/// The outermost cached view is recorded whole, whatever clips it from
+/// outside; what clips a cached view inside it, from inside it, stays in the
+/// recording and moves with it.
+#[crate::test]
+fn cached_view_keeps_the_clips_inside_it_when_moved(cx: &mut TestAppContext) {
+    let renders = Rc::new(Cell::new(0));
+    let scroll = Rc::new(Cell::new(30.));
+    let window = cx.add_window({
+        let (renders, scroll) = (renders.clone(), scroll.clone());
+        move |_, cx| PanelViewport {
+            panel: cx.new(|cx| Panel {
+                card: cx.new(|_| Card { renders }),
+            }),
+            scroll,
+        }
+    });
+    let window = AnyWindowHandle::from(window);
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window, |root, window, cx| {
+            root.downcast::<PanelViewport>()
+                .unwrap()
+                .update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear(cx)
+        })
+        .unwrap();
+    };
+    // The well shows the card's top 60px, 20px into the panel.
+    assert_eq!(
+        quads(cx, window),
+        vec![(50., 50., 20., 20.), (50., 50., 100., 60.)]
+    );
+
+    // Most of the panel scrolled out of the viewport: the well is cut by
+    // the viewport too.
+    scroll.set(-60.);
+    draw(cx);
+    assert_eq!(
+        quads(cx, window),
+        vec![(50., 0., 100., 20.)],
+        "only the bottom of the well's view of the card is in the viewport"
+    );
+
+    // Back in view, the panel's recording still has the well cutting the
+    // card, and nothing the viewport cut.
+    scroll.set(40.);
+    draw(cx);
+    assert_eq!(renders.get(), 1, "the card was never rendered again");
+    assert_eq!(
+        quads(cx, window),
+        vec![(50., 60., 20., 20.), (50., 60., 100., 60.)],
+        "the well still cuts the card, where the panel now is"
     );
 }
