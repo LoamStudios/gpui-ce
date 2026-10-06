@@ -12,27 +12,38 @@
 //! no per-item elements, layout or hit regions and no labels: the floor that
 //! element overhead sits on.
 //!
+//! With `--cached`, each item is an entity drawn as a cached view
+//! (`Entity::cached`), so an item that has not changed size is reused from
+//! the previous frame rather than built again.
+//!
+//! With `--pan=<zoom>`, the camera holds that zoom and pans across the grid
+//! instead of zooming, so items move without changing: what a cached item is
+//! reused for.
+//!
 //! ```text
 //! cargo run -p gpui-ce --release --example canvas_scale                    # 100,000 items
 //! cargo run -p gpui-ce --release --example canvas_scale -- 20000           # a smaller grid
 //! cargo run -p gpui-ce --release --example canvas_scale -- 100000 --paint  # quads only
+//! cargo run -p gpui-ce --release --example canvas_scale -- --cached        # cached items
+//! cargo run -p gpui-ce --release --example canvas_scale -- --cached --pan=0.4
 //! ```
 //!
-//! The run lasts one zoom out and back, then prints frame times grouped by how
-//! many items were visible, and quits.
+//! The run lasts one zoom out and back (or one pan), then prints frame times
+//! grouped by how many items were visible, and quits.
 
 #[path = "../example_support/fonts.rs"]
 mod example_support;
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     rc::Rc,
     time::{Duration, Instant},
 };
 
 use gpui::{
-    App, BorderStyle, Bounds, Context, MouseButton, Render, SharedString, Window, WindowBounds,
-    WindowOptions, canvas, div, hsla, point, prelude::*, px, quad, size,
+    App, BorderStyle, Bounds, Context, Entity, MacActivationPolicy, MouseButton, Position, Render,
+    SharedString, StyleRefinement, Window, WindowBounds, WindowKind, WindowOptions, canvas, div,
+    hsla, point, prelude::*, px, quad, size,
 };
 use gpui_platform::application;
 
@@ -49,6 +60,61 @@ const ZOOM_OUT: f32 = 0.012;
 const RUN: Duration = Duration::from_secs(30);
 /// The smallest on-screen width at which an item shows its label.
 const LABEL_WIDTH: f32 = 48.;
+/// How fast a pan moves across the screen, in pixels per second.
+const PAN_SPEED: f32 = 600.;
+
+/// How a frame draws the items.
+#[derive(Clone, Copy, PartialEq)]
+enum Draw {
+    /// An element per item, built every frame.
+    Elements,
+    /// An entity per item, drawn as a cached view.
+    Cached,
+    /// Quads painted by one element.
+    Quads,
+}
+
+/// How the camera moves over the run.
+#[derive(Clone, Copy)]
+enum Motion {
+    /// Zoom out to the whole grid and back.
+    Zoom,
+    /// Hold this zoom and pan along the grid.
+    Pan(f32),
+}
+
+/// One grid item as an entity of its own, for `Draw::Cached`. It reads the
+/// zoom when it renders, which it does again whenever its size changes.
+struct Item {
+    index: usize,
+    zoom: Rc<Cell<f32>>,
+}
+
+impl Render for Item {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let zoom = self.zoom.get();
+        item(div(), self.index, zoom).size_full()
+    }
+}
+
+/// An item's look and behaviour, shared by the built and the cached items.
+fn item(element: gpui::Div, index: usize, zoom: f32) -> gpui::Stateful<gpui::Div> {
+    let hue = (index * 37 % 360) as f32 / 360.0;
+    element
+        .id(("item", index))
+        .bg(hsla(hue, 0.55, 0.62, 1.0))
+        .border_1()
+        .border_color(hsla(hue, 0.6, 0.32, 1.0))
+        .rounded(px((6.0 * zoom).max(1.0)))
+        .hover(move |style| style.bg(hsla(hue, 0.7, 0.8, 1.0)))
+        .on_mouse_down(MouseButton::Left, |_, _, _| {})
+        .when(ITEM_W * zoom >= LABEL_WIDTH, |item| {
+            item.p(px(4.0 * zoom))
+                .text_size(px(12.0 * zoom))
+                .text_color(hsla(0.0, 0.0, 0.1, 1.0))
+                .child(SharedString::from(format!("Item {index}")))
+        })
+}
 
 /// One frame's measurement: items built, CPU time, and the interval since the
 /// previous frame.
@@ -61,8 +127,11 @@ struct Sample {
 
 struct Stage {
     items: usize,
-    /// Paint quads from one element instead of building an element per item.
-    direct: bool,
+    draw: Draw,
+    motion: Motion,
+    /// The item entities made so far, for `Draw::Cached`.
+    entities: Vec<Option<Entity<Item>>>,
+    zoom: Rc<Cell<f32>>,
     started: Instant,
     last_frame: Option<Instant>,
     samples: Rc<RefCell<Vec<Sample>>>,
@@ -70,10 +139,13 @@ struct Stage {
 }
 
 impl Stage {
-    fn new(items: usize, direct: bool) -> Self {
+    fn new(items: usize, draw: Draw, motion: Motion) -> Self {
         Self {
             items,
-            direct,
+            draw,
+            motion,
+            entities: Vec::new(),
+            zoom: Rc::new(Cell::new(1.0)),
             started: Instant::now(),
             last_frame: None,
             samples: Rc::new(RefCell::new(Vec::new())),
@@ -85,7 +157,11 @@ impl Stage {
     /// `ZOOM_OUT` over the first half of the run, and back over the second.
     fn zoom(elapsed: Duration) -> f32 {
         let phase = (elapsed.as_secs_f32() / RUN.as_secs_f32()).min(1.0);
-        let out = if phase < 0.5 { phase * 2.0 } else { (1.0 - phase) * 2.0 };
+        let out = if phase < 0.5 {
+            phase * 2.0
+        } else {
+            (1.0 - phase) * 2.0
+        };
         let (near, far) = (ZOOM_IN.ln(), ZOOM_OUT.ln());
         (near + (far - near) * out).exp()
     }
@@ -102,9 +178,17 @@ impl Stage {
             (50_000, usize::MAX),
         ];
         println!(
-            "canvas_scale: {} items in the grid, {}, {} frames over {:.1}s",
+            "canvas_scale: {} items in the grid, {}, {}, {} frames over {:.1}s",
             self.items,
-            if self.direct { "painted as quads" } else { "one element each" },
+            match self.draw {
+                Draw::Elements => "one element each",
+                Draw::Cached => "one cached view each",
+                Draw::Quads => "painted as quads",
+            },
+            match self.motion {
+                Motion::Zoom => "zooming".to_string(),
+                Motion::Pan(zoom) => format!("panning at zoom {zoom}"),
+            },
             samples.len(),
             self.started.elapsed().as_secs_f32()
         );
@@ -118,8 +202,10 @@ impl Stage {
                 continue;
             }
             let mut cpu: Vec<f64> = in_bucket.iter().map(|s| millis(s.cpu)).collect();
-            let mut interval: Vec<f64> =
-                in_bucket.iter().filter_map(|s| s.interval.map(millis)).collect();
+            let mut interval: Vec<f64> = in_bucket
+                .iter()
+                .filter_map(|s| s.interval.map(millis))
+                .collect();
             let range = if high == usize::MAX {
                 format!("{low}+")
             } else {
@@ -139,7 +225,10 @@ impl Stage {
 impl Render for Stage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let frame_start = Instant::now();
-        let interval = self.last_frame.replace(frame_start).map(|last| frame_start - last);
+        let interval = self
+            .last_frame
+            .replace(frame_start)
+            .map(|last| frame_start - last);
         let elapsed = self.started.elapsed();
 
         if elapsed >= RUN {
@@ -153,13 +242,20 @@ impl Render for Stage {
             window.request_animation_frame();
         }
 
-        let zoom = Self::zoom(elapsed);
         let viewport = window.viewport_size();
         let (view_w, view_h) = (f32::from(viewport.width), f32::from(viewport.height));
         let rows = self.items.div_ceil(COLUMNS);
         let (pitch_x, pitch_y) = (ITEM_W + GAP, ITEM_H + GAP);
-        let page_center_x = COLUMNS as f32 * pitch_x / 2.0;
+        let (zoom, page_center_x) = match self.motion {
+            Motion::Zoom => (Self::zoom(elapsed), COLUMNS as f32 * pitch_x / 2.0),
+            // Start a screen in from the left edge and pan right.
+            Motion::Pan(zoom) => (
+                zoom,
+                view_w / zoom + elapsed.as_secs_f32() * PAN_SPEED / zoom,
+            ),
+        };
         let page_center_y = rows as f32 * pitch_y / 2.0;
+        self.zoom.set(zoom);
 
         // The page rectangle in view, and the grid cells it covers.
         let left = page_center_x - view_w / zoom / 2.0;
@@ -171,9 +267,8 @@ impl Render for Stage {
 
         let item_w = ITEM_W * zoom;
         let item_h = ITEM_H * zoom;
-        let labelled = item_w >= LABEL_WIDTH;
 
-        if self.direct {
+        if self.draw == Draw::Quads {
             let items = self.items;
             let samples = self.samples.clone();
             let painter = canvas(
@@ -227,27 +322,32 @@ impl Render for Stage {
                 }
                 let x = (column as f32 * pitch_x - left) * zoom;
                 let y = (row as f32 * pitch_y - top) * zoom;
-                let hue = (index * 37 % 360) as f32 / 360.0;
-                let item = div()
-                    .id(("item", index))
-                    .absolute()
-                    .left(px(x))
-                    .top(px(y))
-                    .w(px(item_w))
-                    .h(px(item_h))
-                    .bg(hsla(hue, 0.55, 0.62, 1.0))
-                    .border_1()
-                    .border_color(hsla(hue, 0.6, 0.32, 1.0))
-                    .rounded(px((6.0 * zoom).max(1.0)))
-                    .hover(|style| style.bg(hsla(hue, 0.7, 0.8, 1.0)))
-                    .on_mouse_down(MouseButton::Left, |_, _, _| {})
-                    .when(labelled, |item| {
-                        item.p(px(4.0 * zoom))
-                            .text_size(px(12.0 * zoom))
-                            .text_color(hsla(0.0, 0.0, 0.1, 1.0))
-                            .child(SharedString::from(format!("Item {index}")))
-                    });
-                children.push(item);
+                if self.draw == Draw::Cached {
+                    if self.entities.len() < self.items {
+                        self.entities.resize_with(self.items, || None);
+                    }
+                    let zoom = self.zoom.clone();
+                    let entity = self.entities[index]
+                        .get_or_insert_with(|| cx.new(|_| Item { index, zoom }))
+                        .clone();
+                    let mut style = StyleRefinement::default();
+                    style.position = Some(Position::Absolute);
+                    style.inset.left = Some(px(x).into());
+                    style.inset.top = Some(px(y).into());
+                    style.size.width = Some(px(item_w).into());
+                    style.size.height = Some(px(item_h).into());
+                    children.push(entity.cached(style).into_any_element());
+                } else {
+                    children.push(
+                        item(div(), index, zoom)
+                            .absolute()
+                            .left(px(x))
+                            .top(px(y))
+                            .w(px(item_w))
+                            .h(px(item_h))
+                            .into_any_element(),
+                    );
+                }
             }
         }
         let visible = children.len();
@@ -305,23 +405,41 @@ fn run_example() {
         .iter()
         .find_map(|arg| arg.parse().ok())
         .unwrap_or(100_000);
-    let direct = args.iter().any(|arg| arg == "--paint");
-    application().run(move |cx: &mut App| {
-        example_support::load_fonts(cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(1600.0), px(1000.0)),
-                    cx,
-                ))),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|_| Stage::new(items, direct)),
-        )
-        .unwrap();
-        cx.activate(true);
-    });
+    let draw = if args.iter().any(|arg| arg == "--paint") {
+        Draw::Quads
+    } else if args.iter().any(|arg| arg == "--cached") {
+        Draw::Cached
+    } else {
+        Draw::Elements
+    };
+    let motion = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--pan="))
+        .map_or(Motion::Zoom, |zoom| {
+            Motion::Pan(zoom.parse().expect("--pan=<zoom>, e.g. --pan=0.4"))
+        });
+    // A benchmark run never takes the keyboard: the process cannot be
+    // activated, and the window floats above others without focus, so it
+    // keeps drawing without being brought forward.
+    application()
+        .with_activation_policy(MacActivationPolicy::Prohibited)
+        .run(move |cx: &mut App| {
+            example_support::load_fonts(cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                        None,
+                        size(px(1600.0), px(1000.0)),
+                        cx,
+                    ))),
+                    kind: WindowKind::PopUp,
+                    focus: false,
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| Stage::new(items, draw, motion)),
+            )
+            .unwrap();
+        });
 }
 
 fn main() {
