@@ -180,81 +180,114 @@ impl Scene {
         let uniform = UniformPlacement::of(placement);
         let mut adopted = AdoptedEntries::default();
         let mut placed = PlacedEntry::default();
-        for operation in &prev_scene.paint_operations[range] {
-            match operation {
-                PaintOperation::Primitive(primitive) => {
-                    let mut primitive = primitive.clone();
-                    self.place(
-                        &mut primitive,
-                        prev_scene,
-                        &mut adopted,
-                        &mut placed,
-                        placement,
-                        uniform.as_ref(),
-                        content_mask,
-                    );
-                    self.insert_primitive(primitive);
-                }
-                PaintOperation::Raster(sprite, source) => {
-                    let mut sprite = sprite.clone();
-                    if let Some(uniform) = uniform.as_ref().filter(|_| sprite.transform() == 0) {
-                        let Some(raster) = rasterize(source.placed(uniform)) else {
-                            continue;
-                        };
-                        sprite.place_uniformly(uniform, content_mask);
-                        match &mut sprite {
-                            Primitive::MonochromeSprite(sprite) => {
-                                (sprite.bounds, sprite.tile) = (raster.bounds, raster.tile);
-                            }
-                            Primitive::SubpixelSprite(sprite) => {
-                                (sprite.bounds, sprite.tile) = (raster.bounds, raster.tile);
-                            }
-                            Primitive::PolychromeSprite(sprite) => {
-                                (sprite.bounds, sprite.tile) = (raster.bounds, raster.tile);
-                            }
-                            _ => {}
-                        }
-                        self.insert_raster(sprite, raster.source);
-                    } else {
-                        self.place(
-                            &mut sprite,
-                            prev_scene,
-                            &mut adopted,
-                            &mut placed,
-                            placement,
-                            uniform.as_ref(),
-                            content_mask,
-                        );
-                        self.insert_raster(sprite, (**source).clone());
-                    }
-                }
-                PaintOperation::Surface { surface, opacity } => {
-                    let mut primitive = Primitive::Surface(surface.clone());
-                    self.place(
-                        &mut primitive,
-                        prev_scene,
-                        &mut adopted,
-                        &mut placed,
-                        placement,
-                        uniform.as_ref(),
-                        content_mask,
-                    );
-                    let Primitive::Surface(surface) = primitive else {
-                        unreachable!()
-                    };
-                    self.insert_surface(surface, *opacity);
-                }
-                PaintOperation::StartLayer(bounds) => {
-                    let bounds = crate::window::transformed_bounds(
-                        placement,
-                        bounds.map(|value| px(value.0)),
-                    )
-                    .map(|value| ScaledPixels(value.0));
-                    self.push_layer(bounds)
-                }
-                PaintOperation::EndLayer => self.pop_layer(),
+        let mut place = |scene: &mut Scene, operation: &PaintOperation| {
+            scene.place_operation(
+                operation,
+                prev_scene,
+                &mut adopted,
+                &mut placed,
+                placement,
+                uniform.as_ref(),
+                content_mask,
+                rasterize,
+            )
+        };
+        self.replay_operations(
+            &prev_scene.paint_operations[range],
+            content_mask,
+            &mut place,
+        );
+    }
+
+    /// One recorded operation placed for [`Self::replay_placed`], or `None`
+    /// for a sprite that is out of view, or whose raster is now empty.
+    #[allow(clippy::too_many_arguments)]
+    fn place_operation(
+        &mut self,
+        operation: &PaintOperation,
+        prev_scene: &Scene,
+        adopted: &mut AdoptedEntries,
+        placed: &mut PlacedEntry,
+        placement: &TransformationMatrix,
+        uniform: Option<&UniformPlacement>,
+        content_mask: &ContentMask<ScaledPixels>,
+        rasterize: &mut dyn FnMut(RasterSource) -> Option<PlacedRaster>,
+    ) -> Option<ReplayOperation> {
+        Some(match operation {
+            PaintOperation::Primitive(primitive) => {
+                let mut primitive = primitive.clone();
+                self.place(
+                    &mut primitive,
+                    prev_scene,
+                    adopted,
+                    placed,
+                    placement,
+                    uniform,
+                    content_mask,
+                );
+                ReplayOperation::Primitive(primitive, None, None)
             }
-        }
+            PaintOperation::Raster(sprite, source) => {
+                let mut sprite = sprite.clone();
+                let Some(uniform) = uniform.filter(|_| sprite.transform() == 0) else {
+                    self.place(
+                        &mut sprite,
+                        prev_scene,
+                        adopted,
+                        placed,
+                        placement,
+                        uniform,
+                        content_mask,
+                    );
+                    return Some(ReplayOperation::Primitive(
+                        sprite,
+                        None,
+                        Some(source.clone()),
+                    ));
+                };
+                // Rasterized again only once it is known to be in view.
+                sprite.place_uniformly(uniform, content_mask);
+                if sprite
+                    .bounds()
+                    .intersect(&sprite.content_mask().bounds)
+                    .is_empty()
+                {
+                    return None;
+                }
+                let raster = rasterize(source.placed(uniform))?;
+                match &mut sprite {
+                    Primitive::MonochromeSprite(sprite) => {
+                        (sprite.bounds, sprite.tile) = (raster.bounds, raster.tile);
+                    }
+                    Primitive::SubpixelSprite(sprite) => {
+                        (sprite.bounds, sprite.tile) = (raster.bounds, raster.tile);
+                    }
+                    Primitive::PolychromeSprite(sprite) => {
+                        (sprite.bounds, sprite.tile) = (raster.bounds, raster.tile);
+                    }
+                    _ => {}
+                }
+                ReplayOperation::Primitive(sprite, None, Some(Box::new(raster.source)))
+            }
+            PaintOperation::Surface { surface, opacity } => {
+                let mut primitive = Primitive::Surface(surface.clone());
+                self.place(
+                    &mut primitive,
+                    prev_scene,
+                    adopted,
+                    placed,
+                    placement,
+                    uniform,
+                    content_mask,
+                );
+                ReplayOperation::Primitive(primitive, Some(*opacity), None)
+            }
+            PaintOperation::StartLayer(bounds) => ReplayOperation::StartLayer(
+                crate::window::transformed_bounds(placement, bounds.map(|value| px(value.0)))
+                    .map(|value| ScaledPixels(value.0)),
+            ),
+            PaintOperation::EndLayer => ReplayOperation::EndLayer,
+        })
     }
 
     /// Places one replayed primitive; see [`Self::replay_placed`].
@@ -667,55 +700,77 @@ impl Scene {
         offset: Point<ScaledPixels>,
         content_mask: &ContentMask<ScaledPixels>,
     ) {
-        let operations = &prev_scene.paint_operations[range];
         let mut adopted = AdoptedEntries::default();
-        if self.replay_run_at(operations, prev_scene, &mut adopted, offset, content_mask) {
-            return;
-        }
-        for operation in operations {
-            match operation {
+        let mut moved = |scene: &mut Scene, operation: &PaintOperation| {
+            Some(match operation {
                 PaintOperation::Primitive(primitive) => {
                     let mut primitive = primitive.clone();
                     primitive.translate(offset, content_mask);
-                    self.adopt_table_entries(&mut primitive, prev_scene, &mut adopted, offset);
-                    self.insert_primitive(primitive);
+                    scene.adopt_table_entries(&mut primitive, prev_scene, &mut adopted, offset);
+                    ReplayOperation::Primitive(primitive, None, None)
                 }
                 PaintOperation::Raster(primitive, source) => {
                     let mut primitive = primitive.clone();
                     primitive.translate(offset, content_mask);
-                    self.adopt_table_entries(&mut primitive, prev_scene, &mut adopted, offset);
-                    let source = source.moved_by(offset, &primitive);
-                    self.insert_raster(primitive, source);
+                    scene.adopt_table_entries(&mut primitive, prev_scene, &mut adopted, offset);
+                    let source = Box::new(source.moved_by(offset, &primitive));
+                    ReplayOperation::Primitive(primitive, None, Some(source))
                 }
                 PaintOperation::Surface { surface, opacity } => {
                     let mut primitive = Primitive::Surface(surface.clone());
                     primitive.translate(offset, content_mask);
-                    let Primitive::Surface(surface) = primitive else {
-                        unreachable!()
-                    };
-                    self.insert_surface(surface, *opacity);
+                    ReplayOperation::Primitive(primitive, Some(*opacity), None)
                 }
-                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds + offset),
-                PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::StartLayer(bounds) => ReplayOperation::StartLayer(*bounds + offset),
+                PaintOperation::EndLayer => ReplayOperation::EndLayer,
+            })
+        };
+        self.replay_operations(
+            &prev_scene.paint_operations[range],
+            content_mask,
+            &mut moved,
+        );
+    }
+
+    /// Replays `operations`, each moved by `replayed`, as one run if it can
+    /// (see [`Self::replay_run`]) and one by one if not.
+    fn replay_operations(
+        &mut self,
+        operations: &[PaintOperation],
+        content_mask: &ContentMask<ScaledPixels>,
+        replayed: &mut dyn FnMut(&mut Scene, &PaintOperation) -> Option<ReplayOperation>,
+    ) {
+        if self.replay_run(operations, content_mask, replayed) {
+            return;
+        }
+        for operation in operations {
+            match replayed(self, operation) {
+                Some(ReplayOperation::Primitive(primitive, surface_opacity, raster_source)) => self
+                    .insert_primitive_with_surface_opacity(
+                        primitive,
+                        surface_opacity,
+                        raster_source,
+                    ),
+                Some(ReplayOperation::StartLayer(bounds)) => self.push_layer(bounds),
+                Some(ReplayOperation::EndLayer) => self.pop_layer(),
+                None => {}
             }
         }
     }
 
-    /// Replays `operations` as [`Self::replay_at`] does, but orders them with
-    /// one search of the bounds tree instead of one per primitive: they keep
-    /// the orders they had among themselves, shifted together above whatever
-    /// they now overlap. A layer's primitives already carry the layer's order,
-    /// so layers are replayed as they are. Returns `false`, having done
-    /// nothing, when this cannot keep the stacking — inside a layer, whose
-    /// order every primitive must take, or for content-filter groups, which
-    /// are ordered above everything — so the caller replays one by one.
-    fn replay_run_at(
+    /// Replays `operations`, each moved by `replayed`, ordering them with one
+    /// search of the bounds tree instead of one per primitive: they keep the
+    /// orders they had among themselves, shifted together above whatever they
+    /// now overlap. A layer's primitives already carry the layer's order, so
+    /// layers are replayed as they are. Returns `false`, having done nothing,
+    /// when this cannot keep the stacking — inside a layer, whose order every
+    /// primitive must take, or for content-filter groups, which are ordered
+    /// above everything — so the caller replays one by one.
+    fn replay_run(
         &mut self,
         operations: &[PaintOperation],
-        prev_scene: &Scene,
-        adopted: &mut AdoptedEntries,
-        offset: Point<ScaledPixels>,
         content_mask: &ContentMask<ScaledPixels>,
+        replayed: &mut dyn FnMut(&mut Scene, &PaintOperation) -> Option<ReplayOperation>,
     ) -> bool {
         if !self.layer_stack.is_empty()
             || operations.iter().any(|operation| {
@@ -736,44 +791,31 @@ impl Scene {
         };
         let (mut first, mut last) = (DrawOrder::MAX, DrawOrder::MIN);
         for operation in operations {
-            let (mut primitive, surface_opacity, raster_source) = match operation {
-                PaintOperation::Primitive(primitive) => (primitive.clone(), None, None),
-                PaintOperation::Raster(primitive, source) => {
-                    (primitive.clone(), None, Some(source))
+            match replayed(self, operation) {
+                Some(ReplayOperation::Primitive(primitive, surface_opacity, raster_source)) => {
+                    let clipped = self
+                        .viewport_bounds(&primitive)
+                        .intersect(&primitive.content_mask().bounds);
+                    if clipped.is_empty() {
+                        continue;
+                    }
+                    let order = primitive.order();
+                    first = first.min(order);
+                    last = last.max(order);
+                    cover(clipped);
+                    run.push(ReplayOperation::Primitive(
+                        primitive,
+                        surface_opacity,
+                        raster_source,
+                    ));
                 }
-                PaintOperation::Surface { surface, opacity } => {
-                    (Primitive::Surface(surface.clone()), Some(*opacity), None)
-                }
-                PaintOperation::StartLayer(layer) => {
-                    let layer = *layer + offset;
+                Some(ReplayOperation::StartLayer(layer)) => {
                     cover(layer.intersect(&content_mask.bounds));
                     run.push(ReplayOperation::StartLayer(layer));
-                    continue;
                 }
-                PaintOperation::EndLayer => {
-                    run.push(ReplayOperation::EndLayer);
-                    continue;
-                }
-            };
-            primitive.translate(offset, content_mask);
-            self.adopt_table_entries(&mut primitive, prev_scene, adopted, offset);
-            let clipped = self
-                .viewport_bounds(&primitive)
-                .intersect(&primitive.content_mask().bounds);
-            if clipped.is_empty() {
-                continue;
+                Some(ReplayOperation::EndLayer) => run.push(ReplayOperation::EndLayer),
+                None => {}
             }
-            let order = primitive.order();
-            first = first.min(order);
-            last = last.max(order);
-            cover(clipped);
-            let raster_source =
-                raster_source.map(|source| Box::new(source.moved_by(offset, &primitive)));
-            run.push(ReplayOperation::Primitive(
-                primitive,
-                surface_opacity,
-                raster_source,
-            ));
         }
 
         self.is_finished = false;
@@ -2410,10 +2452,10 @@ mod tests {
     use crate::{AtlasTextureKind, DevicePixels, Point, ShaderBool, Size, SurfaceSource, TileId};
 
     /// Replaying a recording as one run, with one search of the bounds tree,
-    /// stacks it as replaying it primitive by primitive does: every pair of
-    /// overlapping primitives — within the recording, between it and what it
-    /// is replayed over, and with what is painted after it — keeps its order,
-    /// and primitives sharing a layer keep sharing an order.
+    /// stacks it as replaying it primitive by primitive does, moved or zoomed:
+    /// every pair of overlapping primitives — within the recording, between it
+    /// and what it is replayed over, and with what is painted after it — keeps
+    /// its order, and primitives sharing a layer keep sharing an order.
     #[test]
     fn a_replayed_run_keeps_the_stacking_of_a_primitive_by_primitive_replay() {
         use rand::{Rng as _, SeedableRng as _};
@@ -2506,13 +2548,43 @@ mod tests {
             }
             let range = start..rendered.len();
 
-            let replay = |as_run: bool| {
+            // Replayed moved, and zoomed about the offset.
+            let zoom = UniformPlacement {
+                scale: rng.random_range(0.5..2.0),
+                translation: offset,
+            };
+            let replay = |as_run: bool, zoomed: bool| {
                 let mut scene = Scene::default();
                 for quad in &beneath {
                     scene.insert_primitive(*quad);
                 }
-                if as_run {
+                if as_run && zoomed {
+                    scene.replay_placed(
+                        range.clone(),
+                        &rendered,
+                        &zoom.matrix(),
+                        &clip,
+                        &mut |_| unreachable!(),
+                    );
+                } else if as_run {
                     scene.replay_at(range.clone(), &rendered, offset, &clip);
+                } else if zoomed {
+                    for operation in &rendered.paint_operations[range.clone()] {
+                        match operation {
+                            PaintOperation::Primitive(primitive) => {
+                                let mut primitive = primitive.clone();
+                                primitive.place_uniformly(&zoom, &clip);
+                                scene.insert_primitive(primitive);
+                            }
+                            PaintOperation::StartLayer(bounds) => {
+                                scene.push_layer(zoom.bounds(*bounds).intersect(&clip.bounds))
+                            }
+                            PaintOperation::EndLayer => scene.pop_layer(),
+                            PaintOperation::Surface { .. } | PaintOperation::Raster(..) => {
+                                unreachable!()
+                            }
+                        }
+                    }
                 } else {
                     for operation in &rendered.paint_operations[range.clone()] {
                         match operation {
@@ -2536,21 +2608,23 @@ mod tests {
                 }
                 scene.quads
             };
-            let (run, one_by_one) = (replay(true), replay(false));
-            assert_eq!(run.len(), one_by_one.len(), "seed {seed}");
-            for (i, a) in one_by_one.iter().enumerate() {
-                assert_eq!(run[i].bounds, a.bounds, "seed {seed}");
-                for (j, b) in one_by_one.iter().enumerate().skip(i + 1) {
-                    let overlap = a
-                        .bounds
-                        .intersect(&a.content_mask.bounds)
-                        .intersects(&b.bounds.intersect(&b.content_mask.bounds));
-                    if overlap {
-                        assert_eq!(
-                            run[i].order.cmp(&run[j].order),
-                            a.order.cmp(&b.order),
-                            "seed {seed}: quads {i} and {j} overlap and changed places"
-                        );
+            for zoomed in [false, true] {
+                let (run, one_by_one) = (replay(true, zoomed), replay(false, zoomed));
+                assert_eq!(run.len(), one_by_one.len(), "seed {seed}");
+                for (i, a) in one_by_one.iter().enumerate() {
+                    assert_eq!(run[i].bounds, a.bounds, "seed {seed}");
+                    for (j, b) in one_by_one.iter().enumerate().skip(i + 1) {
+                        let overlap = a
+                            .bounds
+                            .intersect(&a.content_mask.bounds)
+                            .intersects(&b.bounds.intersect(&b.content_mask.bounds));
+                        if overlap {
+                            assert_eq!(
+                                run[i].order.cmp(&run[j].order),
+                                a.order.cmp(&b.order),
+                                "seed {seed}: quads {i} and {j} overlap and changed places"
+                            );
+                        }
                     }
                 }
             }
