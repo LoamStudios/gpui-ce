@@ -505,6 +505,58 @@ impl PhotoResidency {
     }
 }
 
+/// Test support: a window's photo tiles, for renderer tests that draw a
+/// [`Scene`] without a window, decoding each tile its photo paints ask for
+/// inline, before the frame is drawn, rather than in the background.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[derive(Default)]
+pub struct SynchronousPhotoResidency(PhotoResidency);
+
+#[cfg(any(test, feature = "test-support"))]
+impl SynchronousPhotoResidency {
+    /// Adds a paint of `photo` to `scene`'s paint table, as
+    /// `Window::transformed_photo` does, placed by `to_photo`, from viewport
+    /// positions to pixels of its level 0; only the tiles within `region` of
+    /// level 0 are loaded, if it is given. Returns its index.
+    pub fn push_photo(
+        scene: &mut Scene,
+        photo: &Photo,
+        to_photo: crate::TransformationMatrix,
+        sampler: &peniko::ImageSampler,
+        region: Option<kurbo::Rect>,
+    ) -> u32 {
+        scene.push_photo(photo, to_photo, sampler, region)
+    }
+
+    /// Prepares `scene`'s photo paints as a window does before it draws a
+    /// frame, for a viewport `viewport_size`, with every tile they ask for
+    /// decoded and placed first, so the frame draws each from its own level.
+    pub fn prepare(&mut self, scene: &mut Scene, viewport_size: Size<DevicePixels>) {
+        let residency = &mut self.0;
+        loop {
+            residency.frame += 1;
+            let backlog = residency.place_decoded();
+            scene.photo_uploads = Some(residency.uploads.clone());
+            let mut requests = Vec::new();
+            for paint in scene.photo_paints().to_vec() {
+                residency.resolve(scene, &paint, viewport_size, &mut requests);
+            }
+            let mut decoded = residency.decoded.lock();
+            let mut decoding = false;
+            for Request { key, photo } in requests {
+                if residency.pending.insert(key, 0).is_none() {
+                    decoded.push((key, photo.decode_tile(key.level, key.x, key.y)));
+                    decoding = true;
+                }
+            }
+            if !decoding && !backlog {
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,6 +20,9 @@ use std::{
 mod residency;
 
 pub(crate) use residency::PhotoResidency;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use residency::SynchronousPhotoResidency;
 pub use residency::{PHOTO_MEMORY_BUDGET, PhotoStats, PhotoTileUpload, PhotoUploads};
 
 /// The side of a photo tile, in pixels of its level.

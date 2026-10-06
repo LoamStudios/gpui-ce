@@ -22,6 +22,12 @@ pub(super) struct SceneTableBindings<'a> {
     pub(super) paints: wgpu::BindingResource<'a>,
 }
 
+/// The window's photo tile array and the sampler that filters it, bound in group 0.
+pub(super) struct PhotoBindings<'a> {
+    pub(super) tiles: &'a wgpu::TextureView,
+    pub(super) sampler: &'a wgpu::Sampler,
+}
+
 /// Group-1 payload: a storage buffer on modern tiers, a data texture plus per-batch
 /// range uniform on downlevel.
 pub(super) enum InstanceBindingSource<'a> {
@@ -226,8 +232,9 @@ impl WgpuBindGroupLayouts {
         }
     }
 
-    /// Creates the group-0 bind group: frame uniforms and the scene's transform, clip,
-    /// paint and colour-stop tables, as storage buffers or, downlevel, data textures.
+    /// Creates the group-0 bind group: frame uniforms, the scene's transform, clip,
+    /// paint and colour-stop tables, as storage buffers or, downlevel, data textures, and
+    /// the photo tile array.
     pub(super) fn create_globals(
         &self,
         device: &wgpu::Device,
@@ -235,6 +242,7 @@ impl WgpuBindGroupLayouts {
         globals: wgpu::BufferBinding,
         font_rasterization: wgpu::BufferBinding,
         tables: SceneTableBindings<'_>,
+        photos: PhotoBindings<'_>,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
@@ -259,6 +267,14 @@ impl WgpuBindGroupLayouts {
                 wgpu::BindGroupEntry {
                     binding: shader::PAINTS_BINDING,
                     resource: tables.paints,
+                },
+                wgpu::BindGroupEntry {
+                    binding: shader::PHOTO_TILES_BINDING,
+                    resource: wgpu::BindingResource::TextureView(photos.tiles),
+                },
+                wgpu::BindGroupEntry {
+                    binding: shader::PHOTO_SAMPLER_BINDING,
+                    resource: wgpu::BindingResource::Sampler(photos.sampler),
                 },
             ],
         })
@@ -829,6 +845,7 @@ mod tests {
             size: NonZeroU64::new(256),
         };
 
+        let photo_tiles = super::super::photos::PhotoTiles::new(device, tier);
         let _globals = layouts.create_globals(
             device,
             "test_globals",
@@ -838,6 +855,10 @@ mod tests {
                 transforms: wgpu::BindingResource::Buffer(binding()),
                 clips: wgpu::BindingResource::Buffer(binding()),
                 paints: wgpu::BindingResource::Buffer(binding()),
+            },
+            PhotoBindings {
+                tiles: photo_tiles.view(),
+                sampler: photo_tiles.sampler(),
             },
         );
         let _instances = layouts.create_instances(device, InstanceBindingSource::Buffer(binding()));
@@ -914,6 +935,7 @@ mod tests {
             offset: 0,
             size: NonZeroU64::new(256),
         };
+        let photo_tiles = super::super::photos::PhotoTiles::new(device, tier);
         let _globals = layouts.create_globals(
             device,
             "downlevel_test_globals",
@@ -923,6 +945,10 @@ mod tests {
                 transforms: transforms.binding(),
                 clips: clips.binding(),
                 paints: paints.binding(),
+            },
+            PhotoBindings {
+                tiles: photo_tiles.view(),
+                sampler: photo_tiles.sampler(),
             },
         );
 

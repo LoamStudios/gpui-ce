@@ -18,7 +18,8 @@ use super::{
     WgpuRenderer,
     buffers::{DynamicUniformBuffer, InstanceBufferArena, InstanceTransport, SceneTable},
     filters::FrameUniformRequirements,
-    pipelines::{SceneTableBindings, WgpuBindGroupLayouts, WgpuPipelines},
+    photos::PhotoTiles,
+    pipelines::{PhotoBindings, SceneTableBindings, WgpuBindGroupLayouts, WgpuPipelines},
     settings::RenderingParameters,
     surfaces::SurfaceCache,
     target_pool::TexturePool,
@@ -61,6 +62,8 @@ pub(super) struct WgpuResources {
     pub(super) target_globals: DynamicUniformBuffer<GlobalUniforms>,
     pub(super) font_rasterization_buffer: wgpu::Buffer,
     scene_tables: SceneTables,
+    /// The window's resident photo tiles, bound in group 0.
+    photo_tiles: PhotoTiles,
     /// Group 0, whose global uniforms are chosen per target by dynamic offset.
     pub(super) globals_bind_group: wgpu::BindGroup,
     /// The `target_globals` generation `globals_bind_group` was made for.
@@ -189,12 +192,14 @@ impl WgpuResources {
             mapped_at_creation: false,
         });
         let scene_tables = SceneTables::new(&device, InstanceTransport::from_tier(renderer_tier));
+        let photo_tiles = PhotoTiles::new(&device, renderer_tier);
         let globals_bind_group = create_globals_bind_group(
             &device,
             &bind_group_layouts,
             &target_globals,
             &font_rasterization_buffer,
             &scene_tables,
+            &photo_tiles,
         );
         let globals_bind_group_generation = target_globals.generation();
         let last_error = context.uncaptured_error_slot();
@@ -225,6 +230,7 @@ impl WgpuResources {
             target_globals,
             font_rasterization_buffer,
             scene_tables,
+            photo_tiles,
             globals_bind_group,
             globals_bind_group_generation,
             path_intermediate_texture: None,
@@ -280,6 +286,16 @@ impl WgpuResources {
         true
     }
 
+    /// Copies the tiles the scene's photos placed since the last frame into the photo
+    /// tile array, growing it, and rebuilding the group-0 bind group that holds it, as
+    /// needed. Called before anything else of the frame is uploaded, as growing the array
+    /// submits a copy of what it held.
+    pub(super) fn upload_photo_tiles(&mut self, scene: &gpui::Scene) {
+        if self.photo_tiles.upload(&self.device, &self.queue, scene) {
+            self.rebuild_globals_bind_group();
+        }
+    }
+
     fn rebuild_globals_bind_group(&mut self) {
         self.globals_bind_group = create_globals_bind_group(
             &self.device,
@@ -287,6 +303,7 @@ impl WgpuResources {
             &self.target_globals,
             &self.font_rasterization_buffer,
             &self.scene_tables,
+            &self.photo_tiles,
         );
         self.globals_bind_group_generation = self.target_globals.generation();
     }
@@ -375,6 +392,7 @@ fn create_globals_bind_group(
     target_globals: &DynamicUniformBuffer<GlobalUniforms>,
     font_rasterization_buffer: &wgpu::Buffer,
     tables: &SceneTables,
+    photo_tiles: &PhotoTiles,
 ) -> wgpu::BindGroup {
     layouts.create_globals(
         device,
@@ -390,6 +408,10 @@ fn create_globals_bind_group(
             size: NonZeroU64::new(std::mem::size_of::<FontRasterizationUniforms>() as u64),
         },
         tables.bindings(),
+        PhotoBindings {
+            tiles: photo_tiles.view(),
+            sampler: photo_tiles.sampler(),
+        },
     )
 }
 
