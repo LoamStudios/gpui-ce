@@ -78,6 +78,8 @@ const BUFFER_SIZES: [u8; shader_interface::MSL_BUFFER_SIZES_BYTES as usize] =
     [0; shader_interface::MSL_BUFFER_SIZES_BYTES as usize];
 const PRIMARY_TEXTURE_SLOT: u64 = 0;
 const SECONDARY_TEXTURE_SLOT: u64 = 1;
+/// The group composite's mask texture: its binding 4, less one.
+const MASK_TEXTURE_SLOT: u64 = 3;
 const SAMPLER_SLOT: u64 = 0;
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
@@ -202,6 +204,8 @@ struct FrameTarget {
     /// The viewport rectangle the texture covers.
     bounds: Bounds<DevicePixels>,
     uniforms: SceneUniforms,
+    /// A masked group's mask, once drawn: its target, and how it masks.
+    mask: Option<(metal::Texture, Bounds<DevicePixels>, gpui::MaskMode)>,
 }
 
 impl FrameTarget {
@@ -1056,9 +1060,13 @@ impl MetalRenderer {
             texture: scene_color,
             bounds: window_bounds,
             uniforms: scene_uniforms.clone(),
+            mask: None,
         }];
         // Whether each group being drawn has a target of its own.
         let mut isolated = SmallVec::<[bool; 8]>::new();
+        // How many of the groups being drawn are hidden: a mask, or a masked
+        // group, that got no target is not drawn at all, nor is what it holds.
+        let mut hidden = 0usize;
 
         let mut command_encoder = targets[0].encoder(
             command_buffer,
@@ -1066,6 +1074,14 @@ impl MetalRenderer {
         );
 
         for command in scene.render_commands() {
+            if hidden > 0 {
+                match command {
+                    RenderCommand::BeginGroup { .. } => hidden += 1,
+                    RenderCommand::EndGroup { .. } => hidden -= 1,
+                    RenderCommand::Batch(_) => {}
+                }
+                continue;
+            }
             let ok = match command {
                 RenderCommand::Batch(PrimitiveBatch::Shadows { range, smoothed }) => self
                     .draw_shadows(
@@ -1173,7 +1189,10 @@ impl MetalRenderer {
                     command_encoder = targets.last().unwrap().encoder(command_buffer, None);
                     true
                 }
-                RenderCommand::BeginGroup { target, .. } => {
+                RenderCommand::BeginGroup {
+                    boundary_index,
+                    target,
+                } => {
                     let bounds = match target {
                         GroupTarget::Isolated { region } => {
                             group_target_bounds(*region, viewport_size)
@@ -1183,6 +1202,11 @@ impl MetalRenderer {
                     let texture = bounds.and_then(|bounds| {
                         Some((bounds, self.target_pool.take(&self.device, bounds.size)?))
                     });
+                    let boundary = &scene.group_boundaries[*boundary_index];
+                    if texture.is_none() && (boundary.masked || boundary.mask_mode.is_some()) {
+                        hidden = 1;
+                        continue;
+                    }
                     isolated.push(texture.is_some());
                     if let Some((bounds, texture)) = texture {
                         command_encoder.end_encoding();
@@ -1191,6 +1215,7 @@ impl MetalRenderer {
                             texture,
                             bounds,
                             uniforms,
+                            mask: None,
                         });
                         command_encoder = targets.last().unwrap().encoder(
                             command_buffer,
@@ -1205,14 +1230,20 @@ impl MetalRenderer {
                         let group = targets
                             .pop()
                             .expect("an isolated group's target is on the stack");
-                        let parent = targets.last().unwrap();
-                        self.composite_group(
-                            command_buffer,
-                            &scene.group_boundaries[*boundary_index],
-                            group,
-                            parent,
-                        );
-                        command_encoder = parent.encoder(command_buffer, None);
+                        let boundary = &scene.group_boundaries[*boundary_index];
+                        if let Some(mode) = boundary.mask_mode {
+                            // A mask is not composited: the group it masks
+                            // samples it.
+                            let parent = targets.last_mut().unwrap();
+                            parent.mask = Some((group.texture, group.bounds, mode));
+                        } else if boundary.masked && group.mask.is_none() {
+                            // Its mask is out of view: so is all of it.
+                            self.target_pool.give_back(group.texture);
+                        } else {
+                            let parent = targets.last().unwrap();
+                            self.composite_group(command_buffer, boundary, group, parent);
+                        }
+                        command_encoder = targets.last().unwrap().encoder(command_buffer, None);
                     }
                     true
                 }
@@ -1520,6 +1551,10 @@ impl MetalRenderer {
             boundary.opacity,
             boundary.blend_mode,
             backdrop.as_ref().map(|_| group.bounds),
+            group
+                .mask
+                .as_ref()
+                .map(|(_, bounds, mode)| (*bounds, *mode)),
         );
         let encoder = parent.encoder(command_buffer, None);
         encoder.set_render_pipeline_state(&self.group_composite_pipeline_state);
@@ -1539,6 +1574,10 @@ impl MetalRenderer {
             SECONDARY_TEXTURE_SLOT,
             Some(backdrop.as_deref().unwrap_or(&source)),
         );
+        encoder.set_fragment_texture(
+            MASK_TEXTURE_SLOT,
+            Some(group.mask.as_ref().map_or(&*source, |(mask, _, _)| mask)),
+        );
         encoder.set_fragment_sampler_state(SAMPLER_SLOT, Some(&self.sampler));
         encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
         encoder.end_encoding();
@@ -1547,6 +1586,7 @@ impl MetalRenderer {
             spare.push(source);
         }
         spare.extend(backdrop);
+        spare.extend(group.mask.map(|(mask, _, _)| mask));
         for texture in spare {
             self.target_pool.give_back(texture);
         }

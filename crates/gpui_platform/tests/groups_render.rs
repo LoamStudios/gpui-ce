@@ -1,15 +1,17 @@
 //! Renders groups through the platform renderer and checks their pixels: a
 //! group faded as one picture, against an element faded piece by piece; a
 //! group multiplied into what is beneath it; groups faded three deep; a
-//! rotated group; and a blurred group.
+//! rotated group; a blurred group; overflow clipped to rounded corners; a
+//! group clipped to a circle; and a group masked by luminance.
 //!
 //! Runs only with `GPUI_RUN_RENDERING_TESTS` set, in an offscreen window;
 //! `GPUI_RENDERING_TEST_OUTPUT=<path.png>` saves the image.
 
 #[cfg(target_os = "macos")]
 use gpui::{
-    AppContext as _, BlendMode, Context, IntoElement, ParentElement as _, Render, Styled as _,
-    VisualTestAppContext, Window, div, px, radians, rgb,
+    AppContext as _, BlendMode, Bounds, Context, IntoElement, MaskMode, ParentElement as _, Render,
+    Styled as _, VisualTestAppContext, Window, canvas, div, fill, kurbo, point, px, radians, rgb,
+    size,
 };
 
 #[cfg(target_os = "macos")]
@@ -96,6 +98,62 @@ impl Render for GroupsFixture {
                     .bg(rgb(0x000000))
                     .blur(px(10.)),
             )
+            // At (650, 50): a black square in a box with 50px corners that
+            // clips its overflow to them.
+            .child(
+                div()
+                    .absolute()
+                    .left(px(650.))
+                    .top(px(50.))
+                    .size(px(150.))
+                    .rounded(px(50.))
+                    .overflow_hidden()
+                    .clip_overflow_to_corners()
+                    .child(div().size(px(150.)).bg(rgb(0x000000))),
+            )
+            // At (650, 300): a red square clipped to a circle of radius 60
+            // about its center.
+            .child(
+                div()
+                    .absolute()
+                    .left(px(650.))
+                    .top(px(300.))
+                    .size(px(150.))
+                    .bg(rgb(0xff0000))
+                    .clip_path(kurbo::Shape::to_path(
+                        &kurbo::Circle::new((75., 75.), 60.),
+                        0.1,
+                    )),
+            )
+            // At (850, 50): a blue square masked by white on its left half
+            // and black on its right: only the left half shows.
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    |_, _, window, _| {
+                        let square =
+                            Bounds::new(point(px(850.), px(50.)), size(px(150.), px(150.)));
+                        let half = size(px(75.), px(150.));
+                        window.with_mask(
+                            square,
+                            MaskMode::Luminance,
+                            |window| {
+                                window.paint_quad(fill(
+                                    Bounds::new(point(px(850.), px(50.)), half),
+                                    rgb(0xffffff),
+                                ));
+                                window.paint_quad(fill(
+                                    Bounds::new(point(px(925.), px(50.)), half),
+                                    rgb(0x000000),
+                                ));
+                            },
+                            |window| window.paint_quad(fill(square, rgb(0x0000ff))),
+                        );
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
     }
 }
 
@@ -159,6 +217,18 @@ fn render() {
         305.,
         [255, 255, 255],
     );
+
+    expect("rounded overflow, corner", 655., 55., [255, 255, 255]);
+    expect("rounded overflow, middle", 725., 125., [0, 0, 0]);
+    expect("rounded overflow, edge", 725., 52., [0, 0, 0]);
+
+    expect("clip path, inside", 725., 375., [255, 0, 0]);
+    expect("clip path, corner", 655., 305., [255, 255, 255]);
+    expect("clip path, just outside", 725., 312., [255, 255, 255]);
+    expect("clip path, just inside", 725., 320., [255, 0, 0]);
+
+    expect("luminance mask, white", 880., 125., [0, 0, 255]);
+    expect("luminance mask, black", 970., 125., [255, 255, 255]);
 
     // The blurred square: solid in the middle, fading across its edge.
     expect("blur, middle", 500., 350., [0, 0, 0]);

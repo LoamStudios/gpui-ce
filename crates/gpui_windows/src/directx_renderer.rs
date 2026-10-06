@@ -1567,6 +1567,7 @@ impl DirectXRenderer {
             boundary.opacity,
             boundary.blend_mode,
             backdrop.as_ref().map(|_| group.bounds),
+            None,
         );
         // Normal blending never reads the backdrop; bind the source in its place.
         let backdrop_srv = backdrop.as_ref().map_or(&source, |backdrop| &backdrop.srv);

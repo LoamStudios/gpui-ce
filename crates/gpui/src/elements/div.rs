@@ -2949,8 +2949,9 @@ impl Interactivity {
                 }
 
                 window.with_text_style(style.text_style().cloned(), |window| {
-                    window.with_content_mask(
+                    window.with_rounded_content_mask(
                         style.overflow_mask(bounds, window.rem_size()),
+                        style.overflow_corner_radii(bounds, window.rem_size()),
                         |window| {
                             let hitbox = if self.should_insert_hitbox(&style, window, cx) {
                                 let hitbox = window.insert_hitbox_mut(bounds, self.hitbox_behavior);
@@ -3120,8 +3121,9 @@ impl Interactivity {
                 window.with_element_opacity(style.opacity, |window| {
                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
-                            window.with_content_mask(
+                            window.with_rounded_content_mask(
                                 style.overflow_mask(bounds, window.rem_size()),
+                                style.overflow_corner_radii(bounds, window.rem_size()),
                                 |window| {
                                     window.with_tab_group(tab_group, |window| {
                                         // Register the container's own focus handle *inside* its

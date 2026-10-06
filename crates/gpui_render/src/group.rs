@@ -1,12 +1,12 @@
 //! What the renderers share to render a group into a target of its own and
 //! composite it into its parent.
 
-use crate::shaders::common::{Bounds as ShaderBounds, Corners as ShaderCorners};
+use crate::shaders::common::Bounds as ShaderBounds;
 pub use crate::shaders::{
-    common::{GroupBlendMode, GroupClip},
+    common::{GroupBlendMode, GroupMask},
     group::GroupUniforms,
 };
-use gpui::{BlendMode, Bounds, DevicePixels, ScaledPixels, Size, point, size};
+use gpui::{BlendMode, Bounds, DevicePixels, MaskMode, ScaledPixels, Size, point, size};
 use wgsl_rs::std::vec2f;
 
 /// Group targets are sized in steps of this many device pixels, so that a
@@ -77,34 +77,37 @@ impl GroupUniforms {
     /// or a blurred copy of it, which covers the same viewport rectangle —
     /// clipped to `content_mask`, faded to `opacity`, and mixed by
     /// `blend_mode` with `backdrop`, a copy of the parent's pixels under
-    /// `target`, which blend modes other than normal need.
+    /// `target`, which blend modes other than normal need. A masked group
+    /// passes its mask's target and mode in `mask`, and shows only within
+    /// that target, by its mask.
     pub fn composite(
         target: Bounds<DevicePixels>,
         content_mask: Bounds<ScaledPixels>,
         opacity: f32,
         blend_mode: BlendMode,
         backdrop: Option<Bounds<DevicePixels>>,
+        mask: Option<(Bounds<DevicePixels>, MaskMode)>,
     ) -> Self {
         let target_bounds = shader_bounds(target);
         let backdrop = backdrop.map_or(target_bounds, shader_bounds);
+        let mask_bounds = mask.map_or(target_bounds, |(bounds, _)| shader_bounds(bounds));
         Self {
             bounds: target_bounds,
             content_mask: content_mask.into(),
-            clip_bounds: target_bounds,
-            corner_radii: ShaderCorners {
-                top_left: 0.0,
-                top_right: 0.0,
-                bottom_right: 0.0,
-                bottom_left: 0.0,
-            },
             source_origin: target_bounds.origin,
             source_size: target_bounds.size,
             backdrop_origin: backdrop.origin,
             backdrop_size: backdrop.size,
+            mask_origin: mask_bounds.origin,
+            mask_size: mask_bounds.size,
             opacity,
             blend_mode: shader_blend_mode(blend_mode),
-            clip: GroupClip::None,
-            transform: 0,
+            mask: match mask {
+                None => GroupMask::None,
+                Some((_, MaskMode::Alpha)) => GroupMask::Alpha,
+                Some((_, MaskMode::Luminance)) => GroupMask::Luminance,
+            },
+            padding: 0,
         }
     }
 }

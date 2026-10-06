@@ -987,6 +987,20 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Clips hidden overflow to this element's rounded corners, inside its
+    /// border, as CSS does, rather than to its rectangle.
+    fn clip_overflow_to_corners(mut self) -> Self {
+        self.style().clip_overflow_to_corners = Some(true);
+        self
+    }
+
+    /// Clips this element and its children to `path`, relative to the
+    /// element's origin, antialiased, like CSS `clip-path`.
+    fn clip_path(mut self, path: impl Into<kurbo::BezPath>) -> Self {
+        self.style().clip_path = Some(path.into());
+        self
+    }
+
     /// Transforms this element and its children about the element's center,
     /// after any transform already set, without affecting layout.
     fn transform(mut self, transform: impl Into<kurbo::Affine>) -> Self {

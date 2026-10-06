@@ -11,10 +11,6 @@ pub mod group {
         pub bounds: Bounds,
         /// The viewport rectangle it is clipped to.
         pub content_mask: Bounds,
-        /// The rounded rectangle the group is clipped to, in the space of its
-        /// transform-table entry, when `clip` asks for one.
-        pub clip_bounds: Bounds,
-        pub corner_radii: Corners,
         /// Where the group's texture sits in the viewport, and its size there.
         pub source_origin: Vec2f,
         pub source_size: Vec2f,
@@ -22,15 +18,20 @@ pub mod group {
         /// viewport, and its size there, for blend modes other than normal.
         pub backdrop_origin: Vec2f,
         pub backdrop_size: Vec2f,
+        /// Where the group's mask target sits in the viewport, and its size
+        /// there, when `mask` asks for one: outside it, nothing shows.
+        pub mask_origin: Vec2f,
+        pub mask_size: Vec2f,
         pub opacity: f32,
         pub blend_mode: GroupBlendMode,
-        pub clip: GroupClip,
-        pub transform: u32,
+        pub mask: GroupMask,
+        pub padding: u32,
     }
     uniform!(group(1), binding(0), GROUP_LOCALS: GroupUniforms);
     texture!(group(1), binding(1), GROUP_TEXTURE: Texture2D<f32>);
     texture!(group(1), binding(2), BACKDROP_TEXTURE: Texture2D<f32>);
     sampler!(group(1), binding(3), GROUP_SAMPLER: Sampler);
+    texture!(group(1), binding(4), MASK_TEXTURE: Texture2D<f32>);
 
     #[derive(Wgsl)]
     pub struct GroupVarying {
@@ -222,12 +223,23 @@ pub mod group {
         let locals = get!(GROUP_LOCALS);
         let position = scene_position(input.position.xy());
         let mut coverage = locals.opacity;
-        if locals.clip == GroupClip::RoundedBounds {
-            coverage *= antialiased_coverage(rounded_rectangle_signed_distance(
-                local_position(locals.transform, position),
-                locals.clip_bounds,
-                locals.corner_radii,
-            ));
+        if locals.mask != GroupMask::None {
+            let mask_position = (position - locals.mask_origin) / locals.mask_size;
+            if mask_position.x < 0.0
+                || mask_position.y < 0.0
+                || mask_position.x > 1.0
+                || mask_position.y > 1.0
+            {
+                return transparent();
+            }
+            let mask = texture_sample_level(MASK_TEXTURE, GROUP_SAMPLER, mask_position, 0.0);
+            if locals.mask == GroupMask::Alpha {
+                coverage *= mask.w;
+            } else {
+                // The luminance of the premultiplied colour: the mask's
+                // luminance times its coverage.
+                coverage *= dot(mask.xyz(), vec3f(0.2125, 0.7154, 0.0721));
+            }
         }
         let source = texture_sample_level(
             GROUP_TEXTURE,

@@ -268,16 +268,16 @@ pub const RENDER_BUFFER_LAYOUTS: &[gpui::SceneBufferLayout] = &[
         "GroupUniforms",
         bounds,
         content_mask,
-        clip_bounds,
-        corner_radii,
         source_origin,
         source_size,
         backdrop_origin,
         backdrop_size,
+        mask_origin,
+        mask_size,
         opacity,
         blend_mode,
-        clip,
-        transform
+        mask,
+        padding
     ),
     render_layout!(crate::path_types::PathSprite, "PathSprite", bounds),
     render_layout!(

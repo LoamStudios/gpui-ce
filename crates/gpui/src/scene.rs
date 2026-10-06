@@ -2010,6 +2010,12 @@ pub struct GroupBoundary {
     pub opacity: f32,
     /// How the group's colours mix with what is beneath it.
     pub blend_mode: BlendMode,
+    /// Whether the group's first child group is its mask: a group whose
+    /// [`Self::mask_mode`] is set, painted before the group's contents.
+    pub masked: bool,
+    /// Set on a mask group: what it paints is not shown, but masks the group
+    /// it is the first child of, by this mode.
+    pub mask_mode: Option<MaskMode>,
     /// `true` for the start marker (opens the group), `false` for the end marker (closes it).
     pub is_start: bool,
 }
@@ -2027,10 +2033,28 @@ impl GroupBoundary {
     }
 
     /// Whether the group has to be rendered on its own and composited: it
-    /// is filtered, faded or blended. Otherwise it draws in place.
+    /// is filtered, faded, blended or masked, or it is a mask. Otherwise it
+    /// draws in place.
     pub fn isolates(&self) -> bool {
-        self.opacity < 1.0 || self.blend_mode != BlendMode::Normal || self.max_blur_radius() > 0.0
+        self.opacity < 1.0
+            || self.blend_mode != BlendMode::Normal
+            || self.max_blur_radius() > 0.0
+            || self.masked
+            || self.mask_mode.is_some()
     }
+}
+
+/// How a mask group's pixels mask the group it belongs to, as CSS's
+/// `mask-mode` names them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[repr(u32)]
+pub enum MaskMode {
+    /// By the mask's coverage: where it is opaque, the group shows.
+    #[default]
+    Alpha,
+    /// By the mask's luminance, times its coverage: where it is white, the
+    /// group shows.
+    Luminance,
 }
 
 /// How a group's colours mix with the colours beneath it: the blend modes of
@@ -3053,6 +3077,8 @@ mod tests {
             filters: smallvec::smallvec![ScaledFilter::Blur(sp(8.0))],
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
+            masked: false,
+            mask_mode: None,
             is_start,
         }
     }
@@ -3308,6 +3334,8 @@ mod tests {
             filters: SmallVec::new(),
             opacity,
             blend_mode,
+            masked: false,
+            mask_mode: None,
             is_start,
         };
         let quad_at = |bounds: Bounds<ScaledPixels>| Quad {
@@ -3364,6 +3392,79 @@ mod tests {
             !faded.requires_offscreen_rendering(),
             "a faded group does not read what is beneath it"
         );
+    }
+
+    /// A masked group shows only within its mask: its target is cut to the
+    /// mask's region, the mask draws nothing into it, and a group whose mask
+    /// draws nothing has no commands at all.
+    #[test]
+    fn a_masked_group_is_cut_to_its_mask() {
+        let rect = |x: f32, y: f32, width: f32, height: f32| Bounds {
+            origin: point(sp(x), sp(y)),
+            size: Size {
+                width: sp(width),
+                height: sp(height),
+            },
+        };
+        let wide_mask = ContentMask {
+            bounds: rect(0., 0., 1000., 1000.),
+            ..Default::default()
+        };
+        let group = |is_start: bool, masked: bool, mask_mode: Option<MaskMode>| GroupBoundary {
+            order: 0,
+            bounds: rect(0., 0., 1000., 1000.),
+            content_mask: wide_mask,
+            filters: SmallVec::new(),
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+            masked,
+            mask_mode,
+            is_start,
+        };
+        let quad_at = |bounds: Bounds<ScaledPixels>| Quad {
+            bounds,
+            content_mask: wide_mask,
+            ..Default::default()
+        };
+        let masked_scene = |mask: Option<Bounds<ScaledPixels>>| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(group(true, true, None));
+            scene.insert_primitive(group(true, false, Some(MaskMode::Alpha)));
+            if let Some(mask) = mask {
+                scene.insert_primitive(quad_at(mask));
+            }
+            scene.insert_primitive(group(false, false, Some(MaskMode::Alpha)));
+            scene.insert_primitive(quad_at(rect(0., 0., 100., 100.)));
+            scene.insert_primitive(group(false, true, None));
+            scene.finish();
+            scene
+        };
+
+        let scene = masked_scene(Some(rect(50., 50., 200., 200.)));
+        let targets: Vec<GroupTarget> = scene
+            .render_commands()
+            .iter()
+            .filter_map(|command| match command {
+                RenderCommand::BeginGroup { target, .. } => Some(*target),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                GroupTarget::Isolated {
+                    region: rect(50., 50., 50., 50.)
+                },
+                GroupTarget::Isolated {
+                    region: rect(50., 50., 200., 200.)
+                },
+            ]
+        );
+
+        let scene = masked_scene(None);
+        assert!(scene.render_commands().is_empty());
+        let scene = masked_scene(Some(rect(500., 500., 10., 10.)));
+        assert!(scene.render_commands().is_empty());
     }
 
     #[test]

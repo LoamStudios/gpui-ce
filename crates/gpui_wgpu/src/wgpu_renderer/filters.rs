@@ -28,7 +28,7 @@ pub(super) struct FrameUniformRequirements {
 }
 
 const _: () = assert!(std::mem::size_of::<BlurUniforms>() == 112);
-const _: () = assert!(std::mem::size_of::<GroupUniforms>() == 112);
+const _: () = assert!(std::mem::size_of::<GroupUniforms>() == 96);
 
 impl WgpuRenderer {
     fn make_blur_bind_group(
@@ -264,6 +264,7 @@ impl WgpuRenderer {
             boundary.opacity,
             boundary.blend_mode,
             backdrop.as_ref().map(|_| group.bounds),
+            None,
         );
         {
             let resources = self.resources();

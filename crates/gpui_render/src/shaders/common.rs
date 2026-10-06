@@ -121,12 +121,14 @@ mod source {
         Luminosity = 15,
     }
 
-    /// Whether a group's composite is clipped to its rounded bounds.
+    /// How a group's composite is masked: not at all, or by its mask
+    /// target's coverage or luminance.
     #[repr(u32)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Wgsl)]
-    pub enum GroupClip {
+    pub enum GroupMask {
         None = 0,
-        RoundedBounds = 1,
+        Alpha = 1,
+        Luminance = 2,
     }
 
     #[repr(u32)]

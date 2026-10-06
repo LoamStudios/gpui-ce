@@ -65,6 +65,8 @@ fn group(
         filters: filters.iter().copied().collect(),
         opacity,
         blend_mode,
+        masked: false,
+        mask_mode: None,
         is_start: true,
     };
     scene.insert_primitive(start.clone());

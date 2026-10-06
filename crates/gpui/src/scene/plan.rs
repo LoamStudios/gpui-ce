@@ -13,6 +13,10 @@ pub enum GroupTarget {
     /// which it is composited into its parent. The region holds everything
     /// the group draws, spread by its filters, and clipped to its mask; it
     /// is not yet clipped to the viewport.
+    ///
+    /// A mask group is not composited: its parent's composite samples its
+    /// target, and shows only within its region. A masked group whose mask
+    /// draws nothing has no commands at all.
     Isolated {
         /// The viewport rectangle the group's target covers.
         region: Bounds<ScaledPixels>,
@@ -70,6 +74,8 @@ impl ScenePlan {
             command: usize,
             boundary_index: usize,
             region: Option<Bounds<ScaledPixels>>,
+            /// The region of its mask group, once drawn, for a masked group.
+            mask_region: Option<Bounds<ScaledPixels>>,
         }
         let union = |region: &mut Option<Bounds<ScaledPixels>>, bounds: Bounds<ScaledPixels>| {
             *region = Some(region.map_or(bounds, |region| region.union(&bounds)));
@@ -86,6 +92,7 @@ impl ScenePlan {
                             command: commands.len(),
                             boundary_index,
                             region: None,
+                            mask_region: None,
                         });
                         commands.push(RenderCommand::BeginGroup {
                             boundary_index,
@@ -93,18 +100,32 @@ impl ScenePlan {
                         });
                     } else if let Some(group) = open.pop() {
                         let start = &scene.group_boundaries[group.boundary_index];
-                        let target = match group.region {
-                            Some(region)
-                                if matched_starts[group.boundary_index] && start.isolates() =>
-                            {
-                                let region = region
-                                    .dilate(ScaledPixels(start.filter_extent()))
-                                    .intersect(&start.content_mask.bounds);
-                                if region.is_empty() {
-                                    GroupTarget::Inline
-                                } else {
-                                    GroupTarget::Isolated { region }
-                                }
+                        let matched = matched_starts[group.boundary_index];
+                        let region = group.region.map(|region| {
+                            region
+                                .dilate(ScaledPixels(start.filter_extent()))
+                                .intersect(&start.content_mask.bounds)
+                        });
+                        let target = match region {
+                            Some(region) if matched && start.masked => {
+                                // Nothing of a masked group shows outside its
+                                // mask, nor anything at all without one.
+                                let region = group
+                                    .mask_region
+                                    .map(|mask| region.intersect(&mask))
+                                    .filter(|region| !region.is_empty());
+                                let Some(region) = region else {
+                                    commands.truncate(group.command);
+                                    continue;
+                                };
+                                GroupTarget::Isolated { region }
+                            }
+                            Some(region) if matched && start.isolates() && !region.is_empty() => {
+                                GroupTarget::Isolated { region }
+                            }
+                            None if matched && start.masked => {
+                                commands.truncate(group.command);
+                                continue;
                             }
                             _ => GroupTarget::Inline,
                         };
@@ -117,8 +138,16 @@ impl ScenePlan {
                             }
                             GroupTarget::Inline => group.region,
                         };
-                        if let (Some(parent), Some(drawn)) = (open.last_mut(), drawn) {
-                            union(&mut parent.region, drawn);
+                        if let Some(parent) = open.last_mut() {
+                            if start.mask_mode.is_some() {
+                                // A mask draws nothing into its parent: it is
+                                // where its parent shows.
+                                if let GroupTarget::Isolated { region } = target {
+                                    parent.mask_region = Some(region);
+                                }
+                            } else if let Some(drawn) = drawn {
+                                union(&mut parent.region, drawn);
+                            }
                         }
                         commands[group.command] = RenderCommand::BeginGroup {
                             boundary_index: group.boundary_index,

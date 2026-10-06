@@ -6,8 +6,8 @@ use crate::{
     DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, Filter, FontId,
     Global, GlobalElementId, GlyphId, GlyphRenderMode, GpuSpecs, GroupBoundary, InputHandler,
     IntoElement, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent,
-    LayoutId, Lerp, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, Motion,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    LayoutId, Lerp, LineLayoutIndex, MaskMode, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    Motion, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, RasterizedGlyphFormat, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedDirection,
@@ -4407,6 +4407,38 @@ impl Window {
         id
     }
 
+    /// Invoke the given function with the given content mask, its bounds
+    /// rounded by `corner_radii`, after intersecting it with the current
+    /// mask: what is painted is clipped to the rounded rectangle,
+    /// antialiased, as CSS clips an element's overflow to its rounded
+    /// corners. This method should only be called during element drawing.
+    pub fn with_rounded_content_mask<R>(
+        &mut self,
+        mask: Option<ContentMask<Pixels>>,
+        corner_radii: Corners<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(mask) = mask else {
+            return f(self);
+        };
+        if corner_radii == Corners::default() {
+            return self.with_content_mask(Some(mask), f);
+        }
+        // The content mask holds the rectangle; the clip table rounds it.
+        self.with_content_mask(Some(mask), |window| {
+            window.transformed_clips.push(TransformedClip {
+                bounds: mask.bounds,
+                corner_radii,
+                space: window.element_spaces.len().checked_sub(1),
+                parent: window.transformed_clips.len().checked_sub(1),
+                scene_clip: None,
+            });
+            let result = f(window);
+            window.transformed_clips.pop();
+            result
+        })
+    }
+
     /// Invoke the given function with the given content mask after intersecting it
     /// with the current mask. This method should only be called during element drawing.
     // This function is called in a highly recursive manner in editor
@@ -4447,7 +4479,8 @@ impl Window {
         if transformed {
             self.transformed_clips.push(TransformedClip {
                 bounds: mask.bounds,
-                space: self.element_spaces.len() - 1,
+                corner_radii: Corners::default(),
+                space: Some(self.element_spaces.len() - 1),
                 parent: self.transformed_clips.len().checked_sub(1),
                 scene_clip: None,
             });
@@ -5234,6 +5267,115 @@ impl Window {
         filters: &[Filter],
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        self.composite(
+            bounds,
+            opacity,
+            blend_mode,
+            filters,
+            None::<(MaskMode, fn(&mut Self))>,
+            f,
+        )
+    }
+
+    /// Paints what `f` paints as one picture, as [`Self::with_compositing`]
+    /// does, shown only where what `paint_mask` paints is: by its coverage,
+    /// or by its luminance, as `mode` says. This is CSS's `mask` on an
+    /// element, whose bounds are `bounds`, and its children, along with
+    /// `filter`, `opacity` and `mix-blend-mode`.
+    ///
+    /// `paint_mask` paints in the current element's coordinates, as `f`
+    /// does, and what it paints is not shown itself. Nothing shows outside
+    /// it.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_masked_compositing<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        opacity: f32,
+        blend_mode: BlendMode,
+        filters: &[Filter],
+        mode: MaskMode,
+        paint_mask: impl FnOnce(&mut Self),
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.composite(
+            bounds,
+            opacity,
+            blend_mode,
+            filters,
+            Some((mode, paint_mask)),
+            f,
+        )
+    }
+
+    /// Paints what `f` paints shown only where what `paint_mask` paints is,
+    /// by `mode`; see [`Self::with_masked_compositing`].
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_mask<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        mode: MaskMode,
+        paint_mask: impl FnOnce(&mut Self),
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_masked_compositing(bounds, 1.0, BlendMode::Normal, &[], mode, paint_mask, f)
+    }
+
+    /// Paints what `f` paints clipped to `path`, in the current element's
+    /// coordinates, antialiased: CSS's `clip-path`. The path is filled by
+    /// the non-zero rule.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_clip_path<R>(
+        &mut self,
+        path: &kurbo::BezPath,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_mask(
+            path_bounds(path),
+            MaskMode::Alpha,
+            |window| window.paint_clip_path(path),
+            f,
+        )
+    }
+
+    /// Fills `path` opaquely, as the mask of a clip path.
+    pub(crate) fn paint_clip_path(&mut self, path: &kurbo::BezPath) {
+        let to_point = |point: kurbo::Point| crate::point(px(point.x as f32), px(point.y as f32));
+        // Flattened to within a quarter of a device pixel where it is drawn.
+        let tolerance = 0.25 / self.paint_scale();
+        let mut builder = crate::PathBuilder::fill().with_style(crate::PathStyle::Fill(
+            crate::FillOptions::non_zero().with_tolerance(tolerance),
+        ));
+        for element in path.elements() {
+            match *element {
+                kurbo::PathEl::MoveTo(to) => builder.move_to(to_point(to)),
+                kurbo::PathEl::LineTo(to) => builder.line_to(to_point(to)),
+                kurbo::PathEl::QuadTo(control, to) => {
+                    builder.curve_to(to_point(to), to_point(control))
+                }
+                kurbo::PathEl::CurveTo(first, second, to) => {
+                    builder.cubic_bezier_to(to_point(to), to_point(first), to_point(second))
+                }
+                kurbo::PathEl::ClosePath => builder.close(),
+            }
+        }
+        if let Ok(path) = builder.build() {
+            self.paint_path(path, white());
+        }
+    }
+
+    fn composite<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        opacity: f32,
+        blend_mode: BlendMode,
+        filters: &[Filter],
+        mask: Option<(MaskMode, impl FnOnce(&mut Self))>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.paint_scale();
@@ -5243,7 +5385,8 @@ impl Window {
             .map(|filter| filter.scale(scale_factor))
             .collect();
         let opacity = opacity.clamp(0.0, 1.0);
-        if filters.is_empty() && opacity >= 1.0 && blend_mode == BlendMode::Normal {
+        if filters.is_empty() && opacity >= 1.0 && blend_mode == BlendMode::Normal && mask.is_none()
+        {
             return f(self);
         }
 
@@ -5259,10 +5402,35 @@ impl Window {
             filters,
             opacity,
             blend_mode,
+            masked: mask.is_some(),
+            mask_mode: None,
             is_start: true,
         };
 
         self.next_frame.scene.insert_primitive(boundary.clone());
+        if let Some((mode, paint_mask)) = mask {
+            // The mask is the group's first child group. It is painted at
+            // full strength: the element's opacity already fades what it
+            // masks.
+            let mask_boundary = GroupBoundary {
+                filters: SmallVec::new(),
+                opacity: 1.0,
+                blend_mode: BlendMode::Normal,
+                masked: false,
+                mask_mode: Some(mode),
+                ..boundary
+            };
+            self.next_frame
+                .scene
+                .insert_primitive(mask_boundary.clone());
+            let element_opacity = std::mem::replace(&mut self.element_opacity, 1.0);
+            paint_mask(self);
+            self.element_opacity = element_opacity;
+            self.next_frame.scene.insert_primitive(GroupBoundary {
+                is_start: false,
+                ..mask_boundary
+            });
+        }
         let result = f(self);
         self.next_frame.scene.insert_primitive(GroupBoundary {
             is_start: false,
@@ -10257,4 +10425,14 @@ mod tests {
             })
             .unwrap();
     }
+}
+
+/// The bounds of `path`'s points, control points included, in logical pixels.
+fn path_bounds(path: &kurbo::BezPath) -> Bounds<Pixels> {
+    use kurbo::Shape as _;
+    let rect = path.bounding_box();
+    Bounds::from_corners(
+        point(px(rect.x0 as f32), px(rect.y0 as f32)),
+        point(px(rect.x1 as f32), px(rect.y1 as f32)),
+    )
 }

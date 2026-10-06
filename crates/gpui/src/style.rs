@@ -405,6 +405,14 @@ pub struct Style {
     /// one picture (CSS `mix-blend-mode`).
     pub mix_blend_mode: Option<crate::BlendMode>,
 
+    /// Whether hidden overflow is clipped to the element's rounded corners,
+    /// inside its border, as CSS clips it, rather than to its rectangle.
+    pub clip_overflow_to_corners: bool,
+
+    /// The path this element and its children are clipped to, relative to
+    /// the element's origin, antialiased (CSS `clip-path`).
+    pub clip_path: Option<kurbo::BezPath>,
+
     /// A transform of this element and its children about the element's
     /// center, in logical pixels: rotation, scale, skew or translation. It
     /// does not affect layout; painting, hit testing and mouse events follow
@@ -968,6 +976,42 @@ impl Style {
         }
     }
 
+    /// The corner radii hidden overflow is clipped to, inside the border:
+    /// zero unless [`Self::clip_overflow_to_corners`] is set and overflow is
+    /// hidden on both axes.
+    pub fn overflow_corner_radii(
+        &self,
+        bounds: Bounds<Pixels>,
+        rem_size: Pixels,
+    ) -> Corners<Pixels> {
+        if !self.clip_overflow_to_corners
+            || self.overflow.x == Overflow::Visible
+            || self.overflow.y == Overflow::Visible
+        {
+            return Corners::default();
+        }
+        let radii = self
+            .corner_radii
+            .to_pixels(rem_size)
+            .clamp_radii_for_quad_size(bounds.size);
+        if !self
+            .border_color
+            .is_some_and(|color| !color.is_transparent())
+        {
+            return radii;
+        }
+        let widths = self.border_widths.to_pixels(rem_size);
+        let inside = |radius: Pixels, horizontal: Pixels, vertical: Pixels| {
+            (radius - horizontal.max(vertical)).max(Pixels::ZERO)
+        };
+        Corners {
+            top_left: inside(radii.top_left, widths.left, widths.top),
+            top_right: inside(radii.top_right, widths.right, widths.top),
+            bottom_right: inside(radii.bottom_right, widths.right, widths.bottom),
+            bottom_left: inside(radii.bottom_left, widths.left, widths.bottom),
+        }
+    }
+
     /// Get the content mask for a container that always clips and scrolls
     /// vertically, like [`List`](crate::List) and
     /// [`UniformList`](crate::UniformList): the vertical axis always clips,
@@ -1113,13 +1157,28 @@ impl Style {
             }
         };
 
-        window.with_compositing(
-            bounds,
-            self.group_opacity.unwrap_or(1.0),
-            self.mix_blend_mode.unwrap_or_default(),
-            &self.filter,
-            |window| paint_box(window, cx),
-        );
+        let opacity = self.group_opacity.unwrap_or(1.0);
+        let blend_mode = self.mix_blend_mode.unwrap_or_default();
+        match &self.clip_path {
+            Some(clip_path) => {
+                let clip_path = kurbo::Affine::translate((
+                    f64::from(bounds.origin.x.0),
+                    f64::from(bounds.origin.y.0),
+                )) * clip_path;
+                window.with_masked_compositing(
+                    bounds,
+                    opacity,
+                    blend_mode,
+                    &self.filter,
+                    crate::MaskMode::Alpha,
+                    |window| window.paint_clip_path(&clip_path),
+                    |window| paint_box(window, cx),
+                )
+            }
+            None => window.with_compositing(bounds, opacity, blend_mode, &self.filter, |window| {
+                paint_box(window, cx)
+            }),
+        }
 
         #[cfg(debug_assertions)]
         if self.debug_below {
@@ -1189,6 +1248,8 @@ impl Default for Style {
             opacity: None,
             group_opacity: None,
             mix_blend_mode: None,
+            clip_overflow_to_corners: false,
+            clip_path: None,
             transform: None,
             grid_rows: None,
             grid_cols: None,

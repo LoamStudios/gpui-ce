@@ -210,14 +210,17 @@ impl Placement {
     }
 }
 
-/// A clip set in a space not aligned with the window: an entry of the
-/// window's transformed-clip stack.
+/// A clip set in a space not aligned with the window, or with rounded
+/// corners: an entry of the window's transformed-clip stack.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TransformedClip {
     /// The clip in its element space.
     pub(crate) bounds: Bounds<Pixels>,
-    /// That element space's position in the window's transform stack.
-    pub(crate) space: usize,
+    /// Its corner radii, in its element space.
+    pub(crate) corner_radii: Corners<Pixels>,
+    /// That element space's position in the window's transform stack:
+    /// `None` for the window's own space.
+    pub(crate) space: Option<usize>,
     /// The clip this one is nested in, by position in the stack.
     pub(crate) parent: Option<usize>,
     /// The clip's entry in the scene's clip table, once a primitive has used it.
@@ -349,13 +352,24 @@ impl Window {
         let parent = clip
             .parent
             .map_or(0, |parent| self.ensure_scene_clip(parent));
-        let space = &mut self.element_spaces[clip.space];
-        let paint_bounds = space.paint_bounds(clip.bounds);
-        let transform = Self::space_scene_transform(space, &mut self.next_frame.scene);
+        let (paint_bounds, paint_scale, transform) = match clip.space {
+            Some(space) => {
+                let space = &mut self.element_spaces[space];
+                (
+                    space.paint_bounds(clip.bounds),
+                    space.scale,
+                    Self::space_scene_transform(space, &mut self.next_frame.scene),
+                )
+            }
+            None => (clip.bounds, 1., 0),
+        };
         let scale_factor = self.scale_factor;
         let scene_clip = self.next_frame.scene.push_clip(SceneClip {
             bounds: paint_bounds.scale(scale_factor),
-            corner_radii: Corners::default(),
+            corner_radii: clip
+                .corner_radii
+                .map(|radius| *radius * paint_scale)
+                .scale(scale_factor),
             transform,
             parent,
         });
@@ -371,7 +385,12 @@ impl Window {
         Some(
             self.transformed_clips
                 .iter()
-                .map(|clip| (clip.bounds, self.element_spaces[clip.space].to_element))
+                .map(|clip| {
+                    let to_element = clip.space.map_or(TransformationMatrix::UNIT, |space| {
+                        self.element_spaces[space].to_element
+                    });
+                    (clip.bounds, to_element)
+                })
                 .collect(),
         )
     }
