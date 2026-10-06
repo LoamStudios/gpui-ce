@@ -5,14 +5,16 @@ use super::{
     path_types,
 };
 use gpui::{
-    FilterRenderTarget, MAX_FILTER_GROUP_DEPTH, MonochromeSprite, PolychromeSprite, PrimitiveBatch,
-    Quad, RenderCommand, Scene, Shadow, SubpixelSprite, Underline,
+    Bounds, DevicePixels, GroupTarget, MonochromeSprite, PolychromeSprite, PrimitiveBatch, Quad,
+    RenderCommand, Scene, Shadow, SubpixelSprite, Underline, point,
 };
-use gpui_render::blur::{FilterCompositeClip, FilterCompositeParameters};
+use gpui_render::group::group_target_bounds;
 use gpui_render::shaders::{
     common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool},
     interface as shader_interface,
 };
+use smallvec::SmallVec;
+use wgsl_rs::std::vec2f;
 
 pub(super) fn render_to_view(
     renderer: &mut WgpuRenderer,
@@ -27,7 +29,9 @@ pub(super) fn render_to_view(
     // texture that reappears after an intervening primitive and recreate its platform view.
     renderer.retain_surface_cache(&scene.surfaces);
 
-    match FrameEncoder::new(renderer, scene, targets).encode(readback) {
+    let encoded = FrameEncoder::new(renderer, scene, targets).encode(readback);
+    renderer.resources_mut().end_target_pool_frame();
+    match encoded {
         Ok(command_buffers) => Some(renderer.resources().queue.submit(command_buffers)),
         Err(DrawError::ExternalSurface) => None,
         Err(DrawError::CapacityPlanningInvariant) => {
@@ -53,7 +57,10 @@ struct PreparedTargets {
     active: wgpu::TextureView,
     presentation: wgpu::TextureView,
     offscreen: Option<wgpu::TextureView>,
+    /// The texture behind `offscreen`, which blended groups copy what is beneath them from.
+    offscreen_texture: Option<wgpu::Texture>,
     instances: InstanceUpload,
+    globals: FrameGlobals,
 }
 
 impl PreparedTargets {
@@ -98,29 +105,33 @@ impl PreparedTargets {
             renderer.ensure_path_textures();
         }
         if requirements.uses_offscreen_target {
-            renderer.ensure_filter_textures(requirements.isolated_target_count);
+            renderer.ensure_scene_color_texture();
         }
-        write_shader_globals(renderer);
+        let globals = write_shader_globals(renderer);
 
         if requirements.uses_offscreen_target {
             let resources = renderer.resources();
             let offscreen = resources
                 .scene_color_view
                 .as_ref()
-                .expect("blur texture preparation must create a scene target")
+                .expect("offscreen preparation must create a scene target")
                 .clone();
             Some(Self {
                 active: offscreen.clone(),
                 presentation: frame_view.clone(),
                 offscreen: Some(offscreen),
+                offscreen_texture: resources.scene_color_texture.clone(),
                 instances,
+                globals,
             })
         } else {
             Some(Self {
                 active: frame_view.clone(),
                 presentation: frame_view.clone(),
                 offscreen: None,
+                offscreen_texture: None,
                 instances,
+                globals,
             })
         }
     }
@@ -155,14 +166,19 @@ fn begin_frame(renderer: &mut WgpuRenderer) -> bool {
     true
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub(super) struct GlobalUniformState {
-    globals: GlobalUniforms,
-    path_globals: GlobalUniforms,
-    font_rasterization: FontRasterizationUniforms,
+/// Where this frame's global uniforms are, by dynamic offset into the target globals.
+#[derive(Clone, Copy)]
+struct FrameGlobals {
+    /// The window target's globals, which an isolated group's are made from.
+    window: GlobalUniforms,
+    window_offset: u32,
+    /// The path intermediate's globals: it covers the viewport, as the window does.
+    paths_offset: u32,
 }
 
-fn write_shader_globals(renderer: &mut WgpuRenderer) {
+/// Uploads the font rasterization uniforms if they changed, and writes the window's and
+/// the path intermediate's globals into the first two target slots.
+fn write_shader_globals(renderer: &mut WgpuRenderer) -> FrameGlobals {
     let font = renderer.rendering_params.font_rasterization;
     let font_rasterization = FontRasterizationUniforms {
         gamma_ratios: wgsl_rs::std::vec4f(
@@ -178,60 +194,43 @@ fn write_shader_globals(renderer: &mut WgpuRenderer) {
         ),
         padding: 0,
     };
-    let globals = GlobalUniforms {
-        viewport_size: wgsl_rs::std::vec2f(
-            renderer.target.width() as f32,
-            renderer.target.height() as f32,
-        ),
+    let viewport_size = vec2f(
+        renderer.target.width() as f32,
+        renderer.target.height() as f32,
+    );
+    let window = GlobalUniforms {
+        viewport_size,
+        target_origin: vec2f(0.0, 0.0),
+        target_size: viewport_size,
         premultiplied_alpha: ShaderBool::from(
             renderer.target.alpha_mode() == wgpu::CompositeAlphaMode::PreMultiplied,
         ),
         padding: 0,
     };
-    let path_globals = GlobalUniforms {
+    let paths = GlobalUniforms {
         premultiplied_alpha: ShaderBool::Disabled,
-        ..globals
+        ..window
     };
-    let state = GlobalUniformState {
-        globals,
-        path_globals,
-        font_rasterization,
-    };
-    if renderer.uploaded_globals == Some(state) {
-        return;
+    if renderer.uploaded_font_rasterization != Some(font_rasterization) {
+        let resources = renderer.resources();
+        resources.queue.write_buffer(
+            &resources.font_rasterization_buffer,
+            0,
+            shader_interface::bytes_of(&font_rasterization),
+        );
+        renderer.uploaded_font_rasterization = Some(font_rasterization);
     }
 
-    let resources = renderer.resources();
-    let globals_size = std::mem::size_of::<GlobalUniforms>();
-    let font_size = std::mem::size_of::<FontRasterizationUniforms>();
-    let upload_size = renderer.globals.font_offset + font_size as u64;
-    let mut upload = resources
-        .queue
-        .write_buffer_with(
-            &resources.globals_buffer,
-            0,
-            std::num::NonZeroU64::new(upload_size).expect("global uniforms are non-empty"),
-        )
-        .expect("global uniform upload must fit its buffer");
-    upload.slice(..).fill(0);
-    upload
-        .slice(..globals_size)
-        .copy_from_slice(shader_interface::bytes_of(&globals));
-    upload
-        .slice(
-            renderer.globals.path_offset as usize
-                ..renderer.globals.path_offset as usize + globals_size,
-        )
-        .copy_from_slice(shader_interface::bytes_of(&path_globals));
-    upload
-        .slice(
-            renderer.globals.font_offset as usize
-                ..renderer.globals.font_offset as usize + font_size,
-        )
-        .copy_from_slice(shader_interface::bytes_of(&font_rasterization));
-    drop(upload);
-    renderer.uploaded_globals = Some(state);
+    let target_globals = &renderer.resources().target_globals;
+    FrameGlobals {
+        window,
+        window_offset: target_globals.write(&window),
+        paths_offset: target_globals.write(&paths),
+    }
 }
+
+/// The window's target and the path intermediate have globals every frame.
+const FRAME_TARGET_GLOBALS: u64 = 2;
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct FrameRequirements {
@@ -239,7 +238,6 @@ pub(super) struct FrameRequirements {
     /// Instance batches this frame; one downlevel range-uniform slot per batch.
     instance_batches: u64,
     pub(super) uniforms: FrameUniformRequirements,
-    isolated_target_count: usize,
     uses_path_target: bool,
     uses_offscreen_target: bool,
 }
@@ -295,7 +293,7 @@ impl FrameRequirements {
                 PrimitiveBatch::Paths { .. }
                 | PrimitiveBatch::Surfaces(_)
                 | PrimitiveBatch::BackdropFilters(_)
-                | PrimitiveBatch::FilterBoundary(_) => {}
+                | PrimitiveBatch::GroupBoundary(_) => {}
             }
         }
         debug_assert_eq!(instance_batches as usize, planned.instance_batch_count);
@@ -304,26 +302,66 @@ impl FrameRequirements {
             storage_bytes,
             instance_batches,
             uniforms: FrameUniformRequirements {
+                // A blurred group takes the three blur passes of a backdrop filter, and no
+                // blur composite: the group's composite has uniforms of its own.
                 filter_count: FILTER_UNIFORMS_PER_COMPOSITE
-                    * (planned.backdrop_filter_count + planned.isolated_filter_count) as u64
+                    * (planned.backdrop_filter_count + planned.isolated_group_count) as u64
                     + u64::from(planned.uses_offscreen_target),
                 surface_count: planned.surface_count as u64,
+                group_count: planned.isolated_group_count as u64,
+                target_count: FRAME_TARGET_GLOBALS + planned.isolated_group_count as u64,
             },
-            isolated_target_count: planned.isolated_target_count,
             uses_path_target: planned.uses_path_target,
             uses_offscreen_target: planned.uses_offscreen_target,
         }
     }
 }
 
+/// A texture a frame draws into: the window's, or an isolated group's.
+pub(super) struct FrameTarget {
+    pub(super) view: wgpu::TextureView,
+    /// The texture behind `view`, when it can be copied from: the scene's offscreen
+    /// target, or a group's target, which was taken from the pool and goes back to it.
+    pub(super) texture: Option<wgpu::Texture>,
+    /// The viewport rectangle the texture covers.
+    pub(super) bounds: Bounds<DevicePixels>,
+    /// Where the globals describing this target are in the target globals.
+    pub(super) globals_offset: u32,
+}
+
+/// A target of its own for a group covering `bounds` of the viewport, taken from the
+/// pool, with globals placing it there; `None` if the pool has no room.
+fn group_target(
+    renderer: &WgpuRenderer,
+    window: GlobalUniforms,
+    bounds: Bounds<DevicePixels>,
+) -> Option<FrameTarget> {
+    let pooled = renderer.take_pooled_texture(bounds.size)?;
+    let globals = GlobalUniforms {
+        target_origin: vec2f(bounds.origin.x.0 as f32, bounds.origin.y.0 as f32),
+        target_size: vec2f(bounds.size.width.0 as f32, bounds.size.height.0 as f32),
+        ..window
+    };
+    Some(FrameTarget {
+        view: pooled.view,
+        texture: Some(pooled.texture),
+        bounds,
+        globals_offset: renderer.resources().target_globals.write(&globals),
+    })
+}
+
 struct FrameEncoder<'a> {
     renderer: &'a WgpuRenderer,
     scene: &'a Scene,
     encoder: wgpu::CommandEncoder,
-    targets: TargetStack,
+    /// The window's target, then one for each isolated group being drawn.
+    targets: SmallVec<[FrameTarget; 4]>,
+    /// Whether each group being drawn has a target of its own.
+    isolated: SmallVec<[bool; 8]>,
     offscreen: Option<wgpu::TextureView>,
     presentation: wgpu::TextureView,
     instances: InstanceUpload,
+    globals: FrameGlobals,
 }
 
 impl<'a> FrameEncoder<'a> {
@@ -335,14 +373,25 @@ impl<'a> FrameEncoder<'a> {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("gpui_frame"),
                 });
+        let window = FrameTarget {
+            view: targets.active,
+            texture: targets.offscreen_texture,
+            bounds: Bounds {
+                origin: point(DevicePixels(0), DevicePixels(0)),
+                size: renderer.target.viewport_size(),
+            },
+            globals_offset: targets.globals.window_offset,
+        };
         Self {
             renderer,
             scene,
             encoder,
-            targets: TargetStack::new(targets.active),
+            targets: smallvec::smallvec![window],
+            isolated: SmallVec::new(),
             offscreen: targets.offscreen,
             presentation: targets.presentation,
             instances: targets.instances,
+            globals: targets.globals,
         }
     }
 
@@ -356,8 +405,12 @@ impl<'a> FrameEncoder<'a> {
         let result = self.encode_commands();
         if result.is_ok() {
             if let Some(offscreen) = &self.offscreen {
-                self.renderer
-                    .blit_to_frame(&mut self.encoder, offscreen, &self.presentation);
+                self.renderer.blit_to_frame(
+                    &mut self.encoder,
+                    offscreen,
+                    &self.presentation,
+                    self.globals.window_offset,
+                );
             }
             if let Some(readback) = readback {
                 self.encoder.copy_texture_to_buffer(
@@ -394,7 +447,7 @@ impl<'a> FrameEncoder<'a> {
             self.renderer,
             &mut self.encoder,
             "main_pass",
-            self.targets.current(),
+            self.targets.last().expect("the window's target is first"),
             wgpu::LoadOp::Clear(self.renderer.target.clear_color()),
         );
 
@@ -414,12 +467,13 @@ impl<'a> FrameEncoder<'a> {
                         &mut self.encoder,
                         paths,
                         &mut self.instances,
+                        self.globals.paths_offset,
                     );
                     pass = begin_scene_render_pass(
                         self.renderer,
                         &mut self.encoder,
                         "after_paths",
-                        self.targets.current(),
+                        self.targets.last().expect("a target is on the stack"),
                         wgpu::LoadOp::Load,
                     );
                     rasterized?;
@@ -431,23 +485,21 @@ impl<'a> FrameEncoder<'a> {
                 }
                 RenderCommand::Batch(PrimitiveBatch::BackdropFilters(range)) => {
                     drop(pass);
+                    let target = self.targets.last().expect("a target is on the stack");
                     for filter in &self.scene.backdrop_filters[range.clone()] {
-                        self.renderer.draw_backdrop_filter(
-                            &mut self.encoder,
-                            filter,
-                            self.targets.current(),
-                        );
+                        self.renderer
+                            .draw_backdrop_filter(&mut self.encoder, filter, target);
                     }
                     pass = begin_scene_render_pass(
                         self.renderer,
                         &mut self.encoder,
                         "after_backdrop_filter",
-                        self.targets.current(),
+                        self.targets.last().expect("a target is on the stack"),
                         wgpu::LoadOp::Load,
                     );
                 }
-                RenderCommand::Batch(PrimitiveBatch::FilterBoundary(_)) => {
-                    unreachable!("filter boundaries must be compiled into render commands")
+                RenderCommand::Batch(PrimitiveBatch::GroupBoundary(_)) => {
+                    unreachable!("group boundaries must be compiled into render commands")
                 }
                 RenderCommand::Batch(batch) => encode_inline_batch(
                     self.renderer,
@@ -456,64 +508,64 @@ impl<'a> FrameEncoder<'a> {
                     &mut self.instances,
                     &mut pass,
                 )?,
-                RenderCommand::BeginFilter {
-                    target: FilterRenderTarget::Isolated(index),
-                    ..
-                } => {
-                    drop(pass);
-                    let target =
-                        self.renderer.resources().filter_group_views[index.as_usize()].clone();
-                    self.targets.enter(target);
-                    pass = begin_scene_render_pass(
-                        self.renderer,
-                        &mut self.encoder,
-                        "filter_group",
-                        self.targets.current(),
-                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    );
+                RenderCommand::BeginGroup { target, .. } => {
+                    // A group the plan isolates is drawn in place when it is out of view or
+                    // the pool has no room for its target.
+                    let group = match target {
+                        GroupTarget::Isolated { region } => {
+                            group_target_bounds(*region, self.renderer.target.viewport_size())
+                        }
+                        GroupTarget::Inline => None,
+                    }
+                    .and_then(|bounds| group_target(self.renderer, self.globals.window, bounds));
+                    self.isolated.push(group.is_some());
+                    if let Some(group) = group {
+                        drop(pass);
+                        self.targets.push(group);
+                        pass = begin_scene_render_pass(
+                            self.renderer,
+                            &mut self.encoder,
+                            "group",
+                            self.targets
+                                .last()
+                                .expect("the group's target was just pushed"),
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        );
+                    }
                 }
-                RenderCommand::EndFilter {
-                    boundary_index,
-                    target: FilterRenderTarget::Isolated(_),
-                    ..
-                } => {
-                    drop(pass);
-                    let (filtered, parent) = self.targets.exit();
-                    let boundary = &self.scene.filter_boundaries[*boundary_index];
-                    self.renderer.blur_and_composite(
-                        &mut self.encoder,
-                        &filtered,
-                        parent,
-                        FilterCompositeParameters {
-                            bounds: boundary.bounds,
-                            content_mask: boundary.content_mask.bounds,
-                            corner_radii: boundary.corner_radii,
-                            corner_smoothing: boundary.corner_smoothing,
-                            blur_radius: boundary.max_blur_radius(),
-                            opacity: boundary.opacity,
-                            clip: FilterCompositeClip::ContentShape,
-                        },
-                    );
-                    pass = begin_scene_render_pass(
-                        self.renderer,
-                        &mut self.encoder,
-                        "after_content_filter",
-                        self.targets.current(),
-                        wgpu::LoadOp::Load,
-                    );
+                RenderCommand::EndGroup { boundary_index, .. } => {
+                    if self.isolated.pop() == Some(true) {
+                        drop(pass);
+                        let group = self
+                            .targets
+                            .pop()
+                            .expect("an isolated group's target is on the stack");
+                        let parent = self
+                            .targets
+                            .last()
+                            .expect("the window's target is under every group's");
+                        self.renderer.composite_group(
+                            &mut self.encoder,
+                            &self.scene.group_boundaries[*boundary_index],
+                            group,
+                            parent,
+                        );
+                        pass = begin_scene_render_pass(
+                            self.renderer,
+                            &mut self.encoder,
+                            "after_group",
+                            self.targets.last().expect("a target is on the stack"),
+                            wgpu::LoadOp::Load,
+                        );
+                    }
                 }
-                RenderCommand::BeginFilter {
-                    target: FilterRenderTarget::Inline,
-                    ..
-                }
-                | RenderCommand::EndFilter {
-                    target: FilterRenderTarget::Inline,
-                    ..
-                } => {}
             }
         }
         drop(pass);
-        self.targets.assert_balanced();
+        assert!(
+            self.targets.len() == 1 && self.isolated.is_empty(),
+            "render plan left a group open"
+        );
         Ok(())
     }
 }
@@ -522,55 +574,16 @@ fn begin_scene_render_pass<'a>(
     renderer: &'a WgpuRenderer,
     encoder: &'a mut wgpu::CommandEncoder,
     label: &'a str,
-    target: &'a wgpu::TextureView,
+    target: &'a FrameTarget,
     load: wgpu::LoadOp<wgpu::Color>,
 ) -> wgpu::RenderPass<'a> {
-    let mut pass = begin_color_render_pass(encoder, label, target, load);
+    let mut pass = begin_color_render_pass(encoder, label, &target.view, load);
     pass.set_bind_group(
         shader_interface::GLOBAL_BIND_GROUP,
         &renderer.resources().globals_bind_group,
-        &[],
+        &[target.globals_offset],
     );
     pass
-}
-
-struct TargetStack {
-    current: wgpu::TextureView,
-    parents: smallvec::SmallVec<[wgpu::TextureView; MAX_FILTER_GROUP_DEPTH]>,
-}
-
-impl TargetStack {
-    fn new(root: wgpu::TextureView) -> Self {
-        Self {
-            current: root,
-            parents: smallvec::SmallVec::new(),
-        }
-    }
-
-    fn current(&self) -> &wgpu::TextureView {
-        &self.current
-    }
-
-    fn enter(&mut self, next: wgpu::TextureView) {
-        self.parents
-            .push(std::mem::replace(&mut self.current, next));
-    }
-
-    fn exit(&mut self) -> (wgpu::TextureView, &wgpu::TextureView) {
-        let parent = self
-            .parents
-            .pop()
-            .expect("render plan ended an isolated filter without beginning one");
-        let filtered = std::mem::replace(&mut self.current, parent);
-        (filtered, &self.current)
-    }
-
-    fn assert_balanced(&self) {
-        assert!(
-            self.parents.is_empty(),
-            "render plan left an isolated filter group open"
-        );
-    }
 }
 
 #[derive(Debug)]
@@ -630,7 +643,7 @@ fn encode_inline_batch(
         ),
         PrimitiveBatch::Paths { .. }
         | PrimitiveBatch::BackdropFilters(_)
-        | PrimitiveBatch::FilterBoundary(_) => {
+        | PrimitiveBatch::GroupBoundary(_) => {
             unreachable!("pass-interrupting batches are handled by FrameEncoder")
         }
     }

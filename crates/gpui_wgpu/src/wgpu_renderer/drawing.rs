@@ -210,11 +210,14 @@ impl WgpuRenderer {
         Ok(())
     }
 
+    /// Rasterizes `paths` into the viewport-sized intermediate texture, drawn with the
+    /// globals at `globals_offset`, which describe that texture.
     pub(super) fn draw_paths_to_intermediate(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         paths: &[Path<ScaledPixels>],
         instances: &mut InstanceUpload,
+        globals_offset: u32,
     ) -> frame::DrawResult {
         let vertex_count = path_types::rasterization_vertex_count(paths);
         if vertex_count == 0 {
@@ -259,8 +262,8 @@ impl WgpuRenderer {
         pass.set_pipeline(&resources.pipelines.path_rasterization);
         pass.set_bind_group(
             shader_interface::GLOBAL_BIND_GROUP,
-            &resources.path_globals_bind_group,
-            &[],
+            &resources.globals_bind_group,
+            &[globals_offset],
         );
         vertex_slice.set_data_bind_group(&mut pass, resources.instances.bind_group());
         pass.draw(vertex_slice.range(), 0..1);

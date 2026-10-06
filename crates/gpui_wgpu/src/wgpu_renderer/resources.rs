@@ -7,10 +7,10 @@ use std::{
 use collections::FxHashMap;
 
 use crate::WgpuContext;
-use gpui_render::blur::downsampled_dimension;
 use gpui_render::shaders::{
     blur::BlurUniforms,
     common::{FontRasterizationUniforms, GlobalUniforms},
+    group::GroupUniforms,
     surface::SurfaceUniforms,
 };
 
@@ -21,10 +21,14 @@ use super::{
     pipelines::{WgpuBindGroupLayouts, WgpuPipelines},
     settings::RenderingParameters,
     surfaces::SurfaceCache,
+    target_pool::TexturePool,
 };
 
 const INITIAL_FILTER_UNIFORM_CAPACITY: u64 = 16;
 const INITIAL_SURFACE_UNIFORM_CAPACITY: u64 = 8;
+const INITIAL_GROUP_UNIFORM_CAPACITY: u64 = 4;
+/// The window's target, the path intermediate, and a few isolated groups.
+const INITIAL_TARGET_GLOBALS_CAPACITY: u64 = 8;
 
 /// Device-owned state that is replaced atomically during GPU recovery.
 pub(super) struct WgpuResources {
@@ -50,11 +54,17 @@ pub(super) struct WgpuResources {
     pub(super) surface_cache: RefCell<SurfaceCache>,
     pub(super) filter_uniforms: DynamicUniformBuffer<BlurUniforms>,
     blur_bind_groups: RefCell<BlurBindGroups>,
-    pub(super) globals_buffer: wgpu::Buffer,
-    globals_offsets: GlobalOffsets,
+    pub(super) group_uniforms: DynamicUniformBuffer<GroupUniforms>,
+    group_bind_groups: RefCell<GroupBindGroups>,
+    /// The global uniforms of each target a frame draws into, bound by dynamic offset:
+    /// the window's, the path intermediate's, and each isolated group's.
+    pub(super) target_globals: DynamicUniformBuffer<GlobalUniforms>,
+    pub(super) font_rasterization_buffer: wgpu::Buffer,
     scene_tables: SceneTables,
+    /// Group 0, whose global uniforms are chosen per target by dynamic offset.
     pub(super) globals_bind_group: wgpu::BindGroup,
-    pub(super) path_globals_bind_group: wgpu::BindGroup,
+    /// The `target_globals` generation `globals_bind_group` was made for.
+    globals_bind_group_generation: u64,
     pub(super) instances: InstanceBufferArena,
     pub(super) path_intermediate_texture: Option<wgpu::Texture>,
     pub(super) path_intermediate_view: Option<wgpu::TextureView>,
@@ -62,19 +72,9 @@ pub(super) struct WgpuResources {
     pub(super) path_msaa_view: Option<wgpu::TextureView>,
     pub(super) scene_color_texture: Option<wgpu::Texture>,
     pub(super) scene_color_view: Option<wgpu::TextureView>,
-    pub(super) blur_ping_texture: Option<wgpu::Texture>,
-    pub(super) blur_ping_view: Option<wgpu::TextureView>,
-    pub(super) blur_pong_texture: Option<wgpu::Texture>,
-    pub(super) blur_pong_view: Option<wgpu::TextureView>,
-    pub(super) filter_group_textures: Vec<wgpu::Texture>,
-    pub(super) filter_group_views: Vec<wgpu::TextureView>,
-}
-
-/// Where each group-0 uniform lives in `globals_buffer`.
-#[derive(Clone, Copy)]
-struct GlobalOffsets {
-    path_globals: u64,
-    font_rasterization: u64,
+    /// Targets for isolated groups, the blurs of groups and backdrops, and copies of what
+    /// is beneath a blended group.
+    pub(super) target_pool: RefCell<TexturePool>,
 }
 
 /// The scene's transform and clip tables, bound in group 0 beside the frame uniforms.
@@ -98,14 +98,19 @@ struct BlurBindGroups {
     groups: FxHashMap<wgpu::TextureView, wgpu::BindGroup>,
 }
 
+/// Group-composite bind groups, by the group's texture and the backdrop's.
+#[derive(Default)]
+struct GroupBindGroups {
+    uniform_generation: u64,
+    groups: FxHashMap<(wgpu::TextureView, wgpu::TextureView), wgpu::BindGroup>,
+}
+
 pub(super) struct ResourceMetadata {
     pub(super) globals: GlobalBufferLayout,
     pub(super) last_error: Arc<Mutex<Option<String>>>,
 }
 
 pub(super) struct GlobalBufferLayout {
-    pub(super) path_offset: u64,
-    pub(super) font_offset: u64,
     pub(super) maximum_uniform_buffer_size: u64,
 }
 
@@ -154,35 +159,38 @@ impl WgpuResources {
             INITIAL_FILTER_UNIFORM_CAPACITY,
             uniform_alignment,
         );
-        let globals_size = std::mem::size_of::<GlobalUniforms>() as u64;
-        let gamma_size = std::mem::size_of::<FontRasterizationUniforms>() as u64;
-        let path_globals_offset = globals_size.next_multiple_of(uniform_alignment);
-        let gamma_offset = (path_globals_offset + globals_size).next_multiple_of(uniform_alignment);
-        let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("globals_buffer"),
-            size: gamma_offset + gamma_size,
+        let group_uniforms = DynamicUniformBuffer::new(
+            &device,
+            "group_uniforms",
+            INITIAL_GROUP_UNIFORM_CAPACITY,
+            uniform_alignment,
+        );
+        let target_globals = DynamicUniformBuffer::new(
+            &device,
+            "target_globals",
+            INITIAL_TARGET_GLOBALS_CAPACITY,
+            uniform_alignment,
+        );
+        let font_rasterization_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("font_rasterization_buffer"),
+            size: std::mem::size_of::<FontRasterizationUniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let globals_offsets = GlobalOffsets {
-            path_globals: path_globals_offset,
-            font_rasterization: gamma_offset,
-        };
         let scene_tables = SceneTables::new(&device, InstanceTransport::from_tier(renderer_tier));
-        let (globals_bind_group, path_globals_bind_group) = create_globals_bind_groups(
+        let globals_bind_group = create_globals_bind_group(
             &device,
             &bind_group_layouts,
-            &globals_buffer,
-            globals_offsets,
+            &target_globals,
+            &font_rasterization_buffer,
             &scene_tables,
         );
+        let globals_bind_group_generation = target_globals.generation();
         let last_error = context.uncaptured_error_slot();
         let surface_cache = SurfaceCache::new(&device)?;
 
         let metadata = ResourceMetadata {
             globals: GlobalBufferLayout {
-                path_offset: path_globals_offset,
-                font_offset: gamma_offset,
                 maximum_uniform_buffer_size: device.limits().max_buffer_size.min(u32::MAX as u64),
             },
             last_error,
@@ -201,23 +209,20 @@ impl WgpuResources {
             surface_cache: RefCell::new(surface_cache),
             filter_uniforms,
             blur_bind_groups: RefCell::default(),
-            globals_buffer,
-            globals_offsets,
+            group_uniforms,
+            group_bind_groups: RefCell::default(),
+            target_globals,
+            font_rasterization_buffer,
             scene_tables,
             globals_bind_group,
-            path_globals_bind_group,
+            globals_bind_group_generation,
             path_intermediate_texture: None,
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
             scene_color_texture: None,
             scene_color_view: None,
-            blur_ping_texture: None,
-            blur_ping_view: None,
-            blur_pong_texture: None,
-            blur_pong_view: None,
-            filter_group_textures: Vec::new(),
-            filter_group_views: Vec::new(),
+            target_pool: RefCell::new(TexturePool::new()),
         };
         Ok((resources, metadata))
     }
@@ -225,18 +230,14 @@ impl WgpuResources {
     pub(super) fn invalidate_intermediate_textures(&mut self) {
         self.instances.invalidate_texture_bindings();
         self.blur_bind_groups.get_mut().groups.clear();
+        self.group_bind_groups.get_mut().groups.clear();
+        self.target_pool.get_mut().clear();
         self.path_intermediate_texture = None;
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
         self.scene_color_texture = None;
         self.scene_color_view = None;
-        self.blur_ping_texture = None;
-        self.blur_ping_view = None;
-        self.blur_pong_texture = None;
-        self.blur_pong_view = None;
-        self.filter_group_textures.clear();
-        self.filter_group_views.clear();
     }
 
     /// Uploads the scene's transform and clip tables, growing them, and rebuilding the
@@ -256,22 +257,70 @@ impl WgpuResources {
             return false;
         };
         if transforms_grew || clips_grew {
-            (self.globals_bind_group, self.path_globals_bind_group) = create_globals_bind_groups(
-                &self.device,
-                &self.bind_group_layouts,
-                &self.globals_buffer,
-                self.globals_offsets,
-                &self.scene_tables,
-            );
+            self.rebuild_globals_bind_group();
         }
         self.scene_tables.transforms.write(&self.queue, transforms);
         self.scene_tables.clips.write(&self.queue, clips);
         true
     }
 
+    fn rebuild_globals_bind_group(&mut self) {
+        self.globals_bind_group = create_globals_bind_group(
+            &self.device,
+            &self.bind_group_layouts,
+            &self.target_globals,
+            &self.font_rasterization_buffer,
+            &self.scene_tables,
+        );
+        self.globals_bind_group_generation = self.target_globals.generation();
+    }
+
     pub(super) fn finish_frame_uploads(&self) {
         self.filter_uniforms.finish_upload();
         self.surface_uniforms.finish_upload();
+        self.group_uniforms.finish_upload();
+        self.target_globals.finish_upload();
+    }
+
+    /// Ends a frame's use of the target pool, letting go of the bind groups that hold
+    /// textures it lets go of.
+    pub(super) fn end_target_pool_frame(&mut self) {
+        if self.target_pool.get_mut().end_frame() {
+            self.blur_bind_groups.get_mut().groups.clear();
+            self.group_bind_groups.get_mut().groups.clear();
+        }
+    }
+
+    /// The bind group compositing a group from `source`, mixed, for a blend mode other
+    /// than normal, with `backdrop`.
+    pub(super) fn group_bind_group(
+        &self,
+        source: &wgpu::TextureView,
+        backdrop: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        let mut cache = self.group_bind_groups.borrow_mut();
+        let uniform_generation = self.group_uniforms.generation();
+        if cache.uniform_generation != uniform_generation {
+            cache.groups.clear();
+            cache.uniform_generation = uniform_generation;
+        }
+        cache
+            .groups
+            .entry((source.clone(), backdrop.clone()))
+            .or_insert_with(|| {
+                self.bind_group_layouts.create_group(
+                    &self.device,
+                    wgpu::BufferBinding {
+                        buffer: &self.group_uniforms.buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(std::mem::size_of::<GroupUniforms>() as u64),
+                    },
+                    source,
+                    backdrop,
+                    &self.surface_sampler,
+                )
+            })
+            .clone()
     }
 
     pub(super) fn blur_bind_group(&self, source: &wgpu::TextureView) -> wgpu::BindGroup {
@@ -300,37 +349,30 @@ impl WgpuResources {
     }
 }
 
-/// Creates the scene and path group-0 bind groups, which differ only in their globals.
-fn create_globals_bind_groups(
+/// Creates the group-0 bind group. Its global uniforms are bound by dynamic offset, to
+/// the slot of the target being drawn into.
+fn create_globals_bind_group(
     device: &wgpu::Device,
     layouts: &WgpuBindGroupLayouts,
-    globals_buffer: &wgpu::Buffer,
-    offsets: GlobalOffsets,
+    target_globals: &DynamicUniformBuffer<GlobalUniforms>,
+    font_rasterization_buffer: &wgpu::Buffer,
     tables: &SceneTables,
-) -> (wgpu::BindGroup, wgpu::BindGroup) {
-    let globals_size = NonZeroU64::new(std::mem::size_of::<GlobalUniforms>() as u64);
-    let font_size = NonZeroU64::new(std::mem::size_of::<FontRasterizationUniforms>() as u64);
-    let create = |label, offset| {
-        layouts.create_globals(
-            device,
-            label,
-            wgpu::BufferBinding {
-                buffer: globals_buffer,
-                offset,
-                size: globals_size,
-            },
-            wgpu::BufferBinding {
-                buffer: globals_buffer,
-                offset: offsets.font_rasterization,
-                size: font_size,
-            },
-            tables.transforms.binding(),
-            tables.clips.binding(),
-        )
-    };
-    (
-        create("globals_bind_group", 0),
-        create("path_globals_bind_group", offsets.path_globals),
+) -> wgpu::BindGroup {
+    layouts.create_globals(
+        device,
+        "globals_bind_group",
+        wgpu::BufferBinding {
+            buffer: &target_globals.buffer,
+            offset: 0,
+            size: NonZeroU64::new(std::mem::size_of::<GlobalUniforms>() as u64),
+        },
+        wgpu::BufferBinding {
+            buffer: font_rasterization_buffer,
+            offset: 0,
+            size: NonZeroU64::new(std::mem::size_of::<FontRasterizationUniforms>() as u64),
+        },
+        tables.transforms.binding(),
+        tables.clips.binding(),
     )
 }
 
@@ -355,32 +397,17 @@ impl WgpuRenderer {
         }
     }
 
-    pub(super) fn ensure_filter_textures(&mut self, isolated_target_count: usize) {
+    /// Creates the offscreen target the scene is drawn into when backdrop filters or blend
+    /// modes read what is already painted.
+    pub(super) fn ensure_scene_color_texture(&mut self) {
         let format = self.target.format();
         let width = self.target.width();
         let height = self.target.height();
-        let blur_width = downsampled_dimension(width);
-        let blur_height = downsampled_dimension(height);
         let resources = self.resources_mut();
-
         if resources.scene_color_texture.is_none() {
             let (texture, view) = sampled_render_texture(&resources.device, format, width, height);
             resources.scene_color_texture = Some(texture);
             resources.scene_color_view = Some(view);
-            let (texture, view) =
-                sampled_render_texture(&resources.device, format, blur_width, blur_height);
-            resources.blur_ping_texture = Some(texture);
-            resources.blur_ping_view = Some(view);
-            let (texture, view) =
-                sampled_render_texture(&resources.device, format, blur_width, blur_height);
-            resources.blur_pong_texture = Some(texture);
-            resources.blur_pong_view = Some(view);
-        }
-
-        while resources.filter_group_views.len() < isolated_target_count {
-            let (texture, view) = sampled_render_texture(&resources.device, format, width, height);
-            resources.filter_group_textures.push(texture);
-            resources.filter_group_views.push(view);
         }
     }
 
@@ -400,14 +427,29 @@ impl WgpuRenderer {
             requirements.surface_count,
             maximum_buffer_size,
         );
-        let capacity_available = filters && surfaces;
+        let groups = resources.group_uniforms.ensure_capacity(
+            &resources.device,
+            requirements.group_count,
+            maximum_buffer_size,
+        );
+        let targets = resources.target_globals.ensure_capacity(
+            &resources.device,
+            requirements.target_count,
+            maximum_buffer_size,
+        );
+        let capacity_available = filters && surfaces && groups && targets;
         if !capacity_available {
             log::error!(
-                "scene uniform data exceeds the GPU buffer limit: {} filter uniforms and {} surface uniforms",
+                "scene uniform data exceeds the GPU buffer limit: {} filter uniforms, {} surface uniforms, {} group uniforms and {} target globals",
                 requirements.filter_count,
                 requirements.surface_count,
+                requirements.group_count,
+                requirements.target_count,
             );
             return false;
+        }
+        if resources.globals_bind_group_generation != resources.target_globals.generation() {
+            resources.rebuild_globals_bind_group();
         }
         let filters = resources
             .filter_uniforms
@@ -415,7 +457,13 @@ impl WgpuRenderer {
         let surfaces = resources
             .surface_uniforms
             .begin_upload(&resources.queue, requirements.surface_count);
-        if !(filters && surfaces) {
+        let groups = resources
+            .group_uniforms
+            .begin_upload(&resources.queue, requirements.group_count);
+        let targets = resources
+            .target_globals
+            .begin_upload(&resources.queue, requirements.target_count);
+        if !(filters && surfaces && groups && targets) {
             resources.finish_frame_uploads();
             log::error!("failed to map frame uniform staging memory");
             return false;
@@ -441,7 +489,11 @@ fn sampled_render_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        // The scene's offscreen target is copied from when a blended group reads what is
+        // beneath it.
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());

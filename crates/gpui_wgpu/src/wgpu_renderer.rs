@@ -27,6 +27,7 @@ mod resources;
 mod settings;
 mod surfaces;
 mod target;
+mod target_pool;
 
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 pub use headless::WgpuHeadlessRenderer;
@@ -65,7 +66,8 @@ pub struct WgpuRenderer {
     subpixel_order: SubpixelOrder,
     dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
-    uploaded_globals: Option<frame::GlobalUniformState>,
+    /// The font rasterization uniforms last uploaded, which change only with settings.
+    uploaded_font_rasterization: Option<gpui_render::shaders::common::FontRasterizationUniforms>,
     faults: GpuFaultState,
 }
 
@@ -124,7 +126,7 @@ impl WgpuRenderer {
             subpixel_order: SubpixelOrder::RedGreenBlue,
             dual_source_blending,
             adapter_info,
-            uploaded_globals: None,
+            uploaded_font_rasterization: None,
             faults: GpuFaultState {
                 pending_error: last_error,
                 consecutive_failed_frames: 0,
@@ -423,6 +425,8 @@ mod tests {
             FrameUniformRequirements {
                 filter_count: 401,
                 surface_count: 0,
+                group_count: 0,
+                target_count: 2,
             }
         );
     }
@@ -435,17 +439,24 @@ mod tests {
         assert!(kernel.sample_step > 4.0);
     }
 
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    /// A group's target starts transparent, so its alpha must be the coverage of what is
+    /// drawn into it: alpha blends source-over, as Metal's pipelines do.
     #[test]
-    fn desktop_blending_preserves_native_alpha_accumulation() {
-        let straight = pipelines::desktop_scene_blend_state(wgpu::CompositeAlphaMode::Opaque);
+    fn scene_blending_composites_alpha_source_over() {
+        let straight = pipelines::test_scene_blend_state(wgpu::CompositeAlphaMode::Opaque);
         assert_eq!(straight.color.src_factor, wgpu::BlendFactor::SrcAlpha);
-        assert_eq!(straight.alpha.dst_factor, wgpu::BlendFactor::One);
+        assert_eq!(
+            straight.alpha.dst_factor,
+            wgpu::BlendFactor::OneMinusSrcAlpha
+        );
 
         let premultiplied =
-            pipelines::desktop_scene_blend_state(wgpu::CompositeAlphaMode::PreMultiplied);
+            pipelines::test_scene_blend_state(wgpu::CompositeAlphaMode::PreMultiplied);
         assert_eq!(premultiplied.color.src_factor, wgpu::BlendFactor::One);
-        assert_eq!(premultiplied.alpha.dst_factor, wgpu::BlendFactor::One);
+        assert_eq!(
+            premultiplied.alpha.dst_factor,
+            wgpu::BlendFactor::OneMinusSrcAlpha
+        );
     }
 
     #[cfg(all(feature = "test-support", not(target_family = "wasm")))]

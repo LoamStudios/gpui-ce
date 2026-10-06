@@ -2,11 +2,11 @@ use crate::RendererTier;
 use gpui_render::{
     artifacts::{
         BASE_DOWNLEVEL_WGSL, BASE_WGSL, BLUR_BINDINGS, DOWNLEVEL_BLUR_BINDINGS,
-        DOWNLEVEL_GLOBAL_BINDINGS, DOWNLEVEL_INSTANCE_BINDINGS, DOWNLEVEL_RANGE_BINDING,
-        DOWNLEVEL_SURFACE_BINDINGS, DOWNLEVEL_TEXTURED_INSTANCE_BINDINGS, GLOBAL_BINDINGS,
-        GeneratedBinding, GeneratedBindingKind, INSTANCE_BINDINGS, MONOCHROME_INSTANCE_BINDINGS,
-        SUBPIXEL_DUAL_SOURCE_WGSL, SUBPIXEL_INSTANCE_BINDINGS, SURFACE_BINDINGS,
-        TEXTURED_INSTANCE_BINDINGS,
+        DOWNLEVEL_GLOBAL_BINDINGS, DOWNLEVEL_GROUP_BINDINGS, DOWNLEVEL_INSTANCE_BINDINGS,
+        DOWNLEVEL_RANGE_BINDING, DOWNLEVEL_SURFACE_BINDINGS, DOWNLEVEL_TEXTURED_INSTANCE_BINDINGS,
+        GLOBAL_BINDINGS, GROUP_BINDINGS, GeneratedBinding, GeneratedBindingKind, INSTANCE_BINDINGS,
+        MONOCHROME_INSTANCE_BINDINGS, SUBPIXEL_DUAL_SOURCE_WGSL, SUBPIXEL_INSTANCE_BINDINGS,
+        SURFACE_BINDINGS, TEXTURED_INSTANCE_BINDINGS,
     },
     shaders::interface as shader,
 };
@@ -75,6 +75,8 @@ pub(super) struct WgpuPipelines {
     pub(super) blur: WgpuRenderPipeline,
     pub(super) blur_composite: WgpuRenderPipeline,
     pub(super) smoothed_blur_composite: WgpuRenderPipeline,
+    /// Composites an isolated group into its parent (premultiplied).
+    pub(super) group_composite: WgpuRenderPipeline,
 }
 
 pub(super) struct WgpuRenderPipeline {
@@ -113,6 +115,7 @@ pub(super) struct WgpuBindGroupLayouts {
     textured_instances: wgpu::BindGroupLayout,
     pub(super) surfaces: wgpu::BindGroupLayout,
     pub(super) blur: wgpu::BindGroupLayout,
+    group: wgpu::BindGroupLayout,
 }
 
 impl WgpuBindGroupLayouts {
@@ -125,6 +128,7 @@ impl WgpuBindGroupLayouts {
             textured_table,
             surface_table,
             blur_table,
+            group_table,
             instance_dynamic,
         ) = match tier {
             RendererTier::Modern => (
@@ -135,6 +139,7 @@ impl WgpuBindGroupLayouts {
                 TEXTURED_INSTANCE_BINDINGS,
                 SURFACE_BINDINGS,
                 BLUR_BINDINGS,
+                GROUP_BINDINGS,
                 None,
             ),
             RendererTier::WebGl2 => (
@@ -145,10 +150,18 @@ impl WgpuBindGroupLayouts {
                 DOWNLEVEL_TEXTURED_INSTANCE_BINDINGS,
                 DOWNLEVEL_SURFACE_BINDINGS,
                 DOWNLEVEL_BLUR_BINDINGS,
+                DOWNLEVEL_GROUP_BINDINGS,
                 Some(DOWNLEVEL_RANGE_BINDING),
             ),
         };
-        let globals = generated_bind_group_layout(device, "globals_layout", global_table, None);
+        // Each target a frame draws into has global uniforms of its own, where it sits in
+        // the viewport, chosen by dynamic offset.
+        let globals = generated_bind_group_layout(
+            device,
+            "globals_layout",
+            global_table,
+            Some(shader::GLOBAL_UNIFORMS_BINDING),
+        );
         let instances = generated_bind_group_layout(
             device,
             "instances_layout",
@@ -185,6 +198,12 @@ impl WgpuBindGroupLayouts {
             blur_table,
             Some(shader::DATA_BUFFER_BINDING),
         );
+        let group = generated_bind_group_layout(
+            device,
+            "group_layout",
+            group_table,
+            Some(shader::DATA_BUFFER_BINDING),
+        );
         Self {
             globals,
             instances,
@@ -193,6 +212,7 @@ impl WgpuBindGroupLayouts {
             textured_instances,
             surfaces,
             blur,
+            group,
         }
     }
 
@@ -339,6 +359,39 @@ impl WgpuBindGroupLayouts {
             ],
         })
     }
+
+    /// Creates the bind group compositing a group from `source`, mixed with `backdrop`.
+    pub(super) fn create_group(
+        &self,
+        device: &wgpu::Device,
+        uniforms: wgpu::BufferBinding,
+        source: &wgpu::TextureView,
+        backdrop: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("group"),
+            layout: &self.group,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: shader::DATA_BUFFER_BINDING,
+                    resource: wgpu::BindingResource::Buffer(uniforms),
+                },
+                wgpu::BindGroupEntry {
+                    binding: shader::PRIMARY_TEXTURE_BINDING,
+                    resource: wgpu::BindingResource::TextureView(source),
+                },
+                wgpu::BindGroupEntry {
+                    binding: shader::SECONDARY_TEXTURE_BINDING,
+                    resource: wgpu::BindingResource::TextureView(backdrop),
+                },
+                wgpu::BindGroupEntry {
+                    binding: shader::SURFACE_SAMPLER_BINDING,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        })
+    }
 }
 
 impl WgpuPipelines {
@@ -404,13 +457,19 @@ impl WgpuPipelines {
             bind_group_layouts,
             &bind_group_layouts.blur,
         );
+        let group_layout = create_pipeline_layout(
+            device,
+            "group_pipeline_layout",
+            bind_group_layouts,
+            &bind_group_layouts.group,
+        );
 
         let scene_target = color_target(surface_format, Some(scene_blend_state(alpha_mode)));
         let path_rasterization_target = color_target(
             surface_format,
             Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
         );
-        let path_target = color_target(surface_format, Some(path_blend_state()));
+        let path_target = color_target(surface_format, Some(premultiplied_composite_blend_state()));
         let overwrite_target = color_target(surface_format, None);
         let composite_target =
             color_target(surface_format, Some(premultiplied_composite_blend_state()));
@@ -425,6 +484,7 @@ impl WgpuPipelines {
             }
             shader::DataLayout::Surface => &surface_layout,
             shader::DataLayout::Blur => &blur_layout,
+            shader::DataLayout::Group => &group_layout,
         };
         let create =
             |specification: shader::Pipeline, target: &wgpu::ColorTargetState, samples, module| {
@@ -491,6 +551,12 @@ impl WgpuPipelines {
             blur_composite: create(shader::BLUR_COMPOSITE, &composite_target, 1, &shader_module),
             smoothed_blur_composite: create(
                 shader::SMOOTHED_BLUR_COMPOSITE,
+                &composite_target,
+                1,
+                &shader_module,
+            ),
+            group_composite: create(
+                shader::GROUP_COMPOSITE,
                 &composite_target,
                 1,
                 &shader_module,
@@ -656,35 +722,16 @@ fn premultiplied_composite_blend_state() -> wgpu::BlendState {
 }
 
 fn source_over_blend_state(source_color_factor: wgpu::BlendFactor) -> wgpu::BlendState {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    let destination_alpha_factor = wgpu::BlendFactor::One;
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let destination_alpha_factor = wgpu::BlendFactor::OneMinusSrcAlpha;
-
     wgpu::BlendState {
         color: wgpu::BlendComponent {
             src_factor: source_color_factor,
             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
             operation: wgpu::BlendOperation::Add,
         },
+        // Source-over alpha, so that a group's target holds the coverage of what it draws.
         alpha: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::One,
-            dst_factor: destination_alpha_factor,
-            operation: wgpu::BlendOperation::Add,
-        },
-    }
-}
-
-fn path_blend_state() -> wgpu::BlendState {
-    wgpu::BlendState {
-        color: wgpu::BlendComponent {
             src_factor: wgpu::BlendFactor::One,
             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-            operation: wgpu::BlendOperation::Add,
-        },
-        alpha: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::One,
-            dst_factor: wgpu::BlendFactor::One,
             operation: wgpu::BlendOperation::Add,
         },
     }
@@ -705,8 +752,8 @@ fn subpixel_blend_state() -> wgpu::BlendState {
     }
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
-pub(super) fn desktop_scene_blend_state(alpha_mode: wgpu::CompositeAlphaMode) -> wgpu::BlendState {
+#[cfg(test)]
+pub(super) fn test_scene_blend_state(alpha_mode: wgpu::CompositeAlphaMode) -> wgpu::BlendState {
     scene_blend_state(alpha_mode)
 }
 
@@ -784,6 +831,7 @@ mod tests {
         ))]
         let _surface = layouts.create_surface(device, binding(), &view, &view, &sampler);
         let _blur = layouts.create_blur(device, binding(), &view, &sampler);
+        let _group = layouts.create_group(device, binding(), &view, &view, &sampler);
         Ok(())
     }
 
@@ -807,6 +855,7 @@ mod tests {
             tier,
         );
         assert!(pipelines.quads.fixed_vertex_count() > 0);
+        assert!(pipelines.group_composite.fixed_vertex_count() > 0);
 
         // The group-0 scene tables become data textures, read from texel zero.
         let mut transforms = SceneTable::<gpui::SceneTransform>::new(
