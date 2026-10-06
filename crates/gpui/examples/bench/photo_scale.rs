@@ -25,6 +25,13 @@
 //! cargo run -p gpui-ce --release --example photo_scale -- --files=/Volumes/Annex/photos
 //! ```
 //!
+//! The window is off the screen, where it never shows, and the run draws
+//! and presents each frame itself, as fast as frames finish; it reports how
+//! long each frame's draw and present took as well. A present includes
+//! waiting for a drawable, which Metal hands out at the display's rate even
+//! off the screen, so most of it is that wait. With `--onscreen`, the
+//! window is on the screen and frames come at the display's rate.
+//!
 //! The run lasts one zoom out and back, then prints frame times grouped by
 //! how many photos were in view, and quits.
 
@@ -131,6 +138,9 @@ struct Stage {
     last_frame: Option<Instant>,
     samples: Rc<RefCell<Vec<Sample>>>,
     pending: Rc<RefCell<Option<Sample>>>,
+    /// How long each frame's draw and present took, when the run draws its
+    /// own frames.
+    draws: Rc<RefCell<Vec<(Duration, Duration)>>>,
     finished: bool,
     source: String,
     /// Paint quads where the photos would be, to compare against.
@@ -162,6 +172,18 @@ impl Stage {
             samples.len(),
             self.started.elapsed().as_secs_f32()
         );
+        let draws = self.draws.borrow();
+        if !draws.is_empty() {
+            let mut draw: Vec<f64> = draws.iter().map(|(draw, _)| millis(*draw)).collect();
+            let mut present: Vec<f64> = draws.iter().map(|(_, present)| millis(*present)).collect();
+            println!(
+                "photo_scale: whole frames: draw median {:.2} ms, p95 {:.2} ms; present median {:.2} ms, p95 {:.2} ms",
+                quantile(&mut draw, 0.5),
+                quantile(&mut draw, 0.95),
+                quantile(&mut present, 0.5),
+                quantile(&mut present, 0.95),
+            );
+        }
         println!(
             "photo_scale: in view  frames  CPU median  CPU p95  tiles median  tiles p95  interval  lacking  resident  layers"
         );
@@ -375,39 +397,71 @@ fn run_example() {
         .iter()
         .find_map(|arg| arg.strip_prefix("--hold="))
         .map(|zoom| zoom.parse().expect("--hold=<zoom>, e.g. --hold=1"));
+    let onscreen = args.iter().any(|arg| arg == "--onscreen");
+    let draws: Rc<RefCell<Vec<(Duration, Duration)>>> = Rc::default();
     // A benchmark run never takes the keyboard: the process cannot be
-    // activated, and the window floats above others without focus, so it
-    // keeps drawing without being brought forward.
+    // activated, and the window has no focus.
     application()
         .with_activation_policy(MacActivationPolicy::Prohibited)
         .run(move |cx: &mut App| {
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                        None,
-                        size(px(1600.0), px(1000.0)),
-                        cx,
-                    ))),
-                    kind: WindowKind::PopUp,
-                    focus: false,
-                    ..Default::default()
-                },
-                |_, cx| {
-                    cx.new(|_| Stage {
-                        photos,
-                        cells,
-                        started: Instant::now(),
-                        last_frame: None,
-                        samples: Rc::default(),
-                        pending: Rc::default(),
-                        finished: false,
-                        source,
-                        quads,
-                        hold,
-                    })
-                },
-            )
-            .unwrap();
+            let window_size = size(px(1600.0), px(1000.0));
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(if onscreen {
+                            Bounds::centered(None, window_size, cx)
+                        } else {
+                            // Off the screen, where it never shows.
+                            Bounds::new(point(px(-10_000.), px(-10_000.)), window_size)
+                        })),
+                        // On the screen, it floats above others, so it keeps
+                        // drawing without being brought forward.
+                        kind: if onscreen {
+                            WindowKind::PopUp
+                        } else {
+                            WindowKind::Normal
+                        },
+                        focus: false,
+                        ..Default::default()
+                    },
+                    |_, cx| {
+                        cx.new(|_| Stage {
+                            photos,
+                            cells,
+                            started: Instant::now(),
+                            last_frame: None,
+                            samples: Rc::default(),
+                            pending: Rc::default(),
+                            draws: draws.clone(),
+                            finished: false,
+                            source,
+                            quads,
+                            hold,
+                        })
+                    },
+                )
+                .unwrap();
+            let window: gpui::AnyWindowHandle = window.into();
+            if !onscreen {
+                // The platform doesn't ask a window off the screen to draw:
+                // draw each frame here, and the next as soon as it's done.
+                cx.spawn(async move |cx| {
+                    loop {
+                        let drawn = cx.update_window(window, |root, window, cx| {
+                            cx.notify(root.entity_id());
+                            let times = window.draw_and_present(cx);
+                            draws.borrow_mut().push(times);
+                        });
+                        if drawn.is_err() {
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(1))
+                            .await;
+                    }
+                })
+                .detach();
+            }
         });
 }
 
