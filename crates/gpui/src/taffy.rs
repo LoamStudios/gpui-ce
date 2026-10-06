@@ -69,6 +69,9 @@ pub struct TaffyLayoutEngine {
     display_and_position: FxHashMap<LayoutId, (Display, Position)>,
     directions: FxHashMap<LayoutId, DirectionMetadata>,
     layout_bounds_scratch_space: Vec<LayoutId>,
+    /// The most nodes a frame has laid out since the engine was made: what
+    /// its storage holds room for, and what clearing it costs.
+    most_nodes: usize,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -88,10 +91,21 @@ impl TaffyLayoutEngine {
             display_and_position: FxHashMap::default(),
             directions: FxHashMap::default(),
             layout_bounds_scratch_space: Vec::new(),
+            most_nodes: 0,
         }
     }
 
     pub fn clear(&mut self) {
+        // Clearing costs as much as the storage holds room for. A frame that
+        // laid out far fewer nodes than one before it, as one reusing a
+        // large cached view does, starts over with storage its size.
+        let nodes = self.taffy.total_node_count();
+        if self.most_nodes > 4 * nodes + 4096 {
+            *self = Self::new();
+            self.most_nodes = nodes;
+            return;
+        }
+        self.most_nodes = self.most_nodes.max(nodes);
         self.taffy.clear();
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();

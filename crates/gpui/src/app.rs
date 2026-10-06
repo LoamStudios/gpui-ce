@@ -1182,16 +1182,19 @@ impl App {
         invalidator: WindowInvalidator,
         entities: &FxHashSet<EntityId>,
     ) {
+        // Only what changed since the window last drew: a window that draws
+        // the same entities again, as one reusing its cached views does,
+        // changes nothing here.
         let mut tracked_entities =
             std::mem::take(self.tracked_entities.entry(window_handle.id).or_default());
-        for entity in tracked_entities.iter() {
+        for entity in tracked_entities.difference(entities) {
             self.window_invalidators_by_entity
                 .entry(*entity)
                 .and_modify(|windows| {
                     windows.remove(&window_handle.id);
                 });
         }
-        for entity in entities.iter() {
+        for entity in entities.difference(&tracked_entities) {
             self.window_invalidators_by_entity
                 .entry(*entity)
                 .or_default()
@@ -1199,8 +1202,13 @@ impl App {
             self.current_window_by_entity
                 .insert(*entity, window_handle.id);
         }
-        tracked_entities.clear();
-        tracked_entities.extend(entities.iter().copied());
+        if tracked_entities.len() != entities.len()
+            || !entities
+                .iter()
+                .all(|entity| tracked_entities.contains(entity))
+        {
+            tracked_entities.clone_from(entities);
+        }
         self.tracked_entities
             .insert(window_handle.id, tracked_entities);
     }
