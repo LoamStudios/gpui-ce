@@ -86,10 +86,9 @@ pub struct Scene {
     transforms: Vec<SceneTransform>,
     /// The clip table primitives refer to by index; see [`Self::clips`].
     clips: Vec<SceneClip>,
-    /// The paint table backgrounds refer to by index; see [`Self::paints`].
-    paints: Vec<ScenePaint>,
-    /// The colour stops of the paint table's gradients.
-    color_stops: Vec<SceneColorStop>,
+    /// The paint table paint references point into; see
+    /// [`Self::paint_table`].
+    paint_table: Vec<PaintWord>,
     /// Scratch space for [`Self::replay_run_at`], kept to reuse its allocation.
     replay_run: Vec<ReplayOperation>,
 }
@@ -115,8 +114,7 @@ impl Scene {
         self.clip = None;
         self.transforms.clear();
         self.clips.clear();
-        self.paints.clear();
-        self.color_stops.clear();
+        self.paint_table.clear();
         self.is_finished = false;
     }
 
@@ -333,15 +331,18 @@ impl Scene {
         if let Some(&index) = adopted.paints.get(&paint) {
             return index;
         }
-        let mut entry = prev_scene.paints()[paint as usize];
-        let stops = entry.first_stop as usize..(entry.first_stop + entry.stop_count) as usize;
-        entry.first_stop = self.color_stops.len() as u32;
-        self.color_stops
-            .extend_from_slice(&prev_scene.color_stops()[stops]);
+        let table = prev_scene.paint_table();
+        let mut entry = ScenePaint::from_words(&table[paint as usize..]);
+        let stops: SmallVec<[SceneColorStop; 8]> = (0..entry.stop_count as usize)
+            .map(|stop| {
+                let word = entry.first_stop as usize + stop * SceneColorStop::WORDS;
+                SceneColorStop::from_words(&table[word..])
+            })
+            .collect();
         entry.transformation = entry
             .transformation
             .compose(placement.inverse().unwrap_or(TransformationMatrix::UNIT));
-        let index = self.push_paint(entry);
+        let index = self.push_paint(entry, &stops);
         adopted.paints.insert(paint, index);
         index
     }
@@ -646,8 +647,9 @@ impl Scene {
         gradient: &peniko::Gradient,
         to_gradient: TransformationMatrix,
     ) -> Option<u32> {
-        let paint = ScenePaint::gradient(gradient, to_gradient, &mut self.color_stops)?;
-        Some(self.push_paint(paint))
+        let mut stops = Vec::new();
+        let paint = ScenePaint::gradient(gradient, to_gradient, &mut stops)?;
+        Some(self.push_paint(paint, &stops))
     }
 
     /// What a primitive with `bounds`, in the space of transform-table entry
@@ -666,10 +668,11 @@ impl Scene {
             };
         }
         let to_viewport = self.transforms()[transform as usize].transformation;
-        match ScenePaint::background(background, bounds, to_viewport, &mut self.color_stops) {
+        let mut stops = Vec::new();
+        match ScenePaint::background(background, bounds, to_viewport, &mut stops) {
             Some(paint) => ScenePaintRef {
                 color: crate::white().into(),
-                paint: self.push_paint(paint),
+                paint: self.push_paint(paint, &stops),
             },
             None => ScenePaintRef {
                 color: background.solid,
@@ -678,48 +681,32 @@ impl Scene {
         }
     }
 
-    fn push_paint(&mut self, paint: ScenePaint) -> u32 {
-        if self.paints.is_empty() {
-            self.paints.push(ScenePaint::default());
+    /// Adds `paint` and its `stops` to the paint table, and returns its
+    /// index: the word it starts at.
+    fn push_paint(&mut self, mut paint: ScenePaint, stops: &[SceneColorStop]) -> u32 {
+        if self.paint_table.is_empty() {
+            // Index 0 is no paint.
+            self.paint_table
+                .extend_from_slice(&ScenePaint::default().words());
         }
-        self.paints.push(paint);
-        (self.paints.len() - 1) as u32
+        let index = self.paint_table.len();
+        paint.first_stop = (index + ScenePaint::WORDS) as u32;
+        paint.stop_count = stops.len() as u32;
+        self.paint_table.extend_from_slice(&paint.words());
+        for stop in stops {
+            self.paint_table.extend_from_slice(&stop.words());
+        }
+        index as u32
     }
 
-    /// The paint table, for the renderer to upload: entry 0 is unused, so
-    /// the table is never empty.
-    pub fn paints(&self) -> &[ScenePaint] {
-        const NONE: ScenePaint = ScenePaint {
-            transformation: TransformationMatrix::UNIT,
-            kind: PaintKind::Linear,
-            extend: PaintExtend::Pad,
-            color_space: PaintColorSpace::Srgb,
-            first_stop: 0,
-            stop_count: 0,
-            padding: 0,
-            geometry: [0.; 4],
-            radii: [0.; 4],
-        };
-        if self.paints.is_empty() {
-            std::slice::from_ref(&NONE)
+    /// The paint table, for the renderer to upload as `vec4<f32>`s: entries
+    /// and their stops, from word [`ScenePaint::WORDS`] on. Never empty.
+    pub fn paint_table(&self) -> &[PaintWord] {
+        const NONE: [PaintWord; ScenePaint::WORDS] = [[0.; 4]; ScenePaint::WORDS];
+        if self.paint_table.is_empty() {
+            &NONE
         } else {
-            &self.paints
-        }
-    }
-
-    /// The stop table, for the renderer to upload; never empty.
-    pub fn color_stops(&self) -> &[SceneColorStop] {
-        const NONE: SceneColorStop = SceneColorStop {
-            color: [0.; 4],
-            offset: 0.,
-            padding0: 0,
-            padding1: 0,
-            padding2: 0,
-        };
-        if self.color_stops.is_empty() {
-            std::slice::from_ref(&NONE)
-        } else {
-            &self.color_stops
+            &self.paint_table
         }
     }
 

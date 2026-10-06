@@ -20,7 +20,6 @@ pub(super) struct SceneTableBindings<'a> {
     pub(super) transforms: wgpu::BindingResource<'a>,
     pub(super) clips: wgpu::BindingResource<'a>,
     pub(super) paints: wgpu::BindingResource<'a>,
-    pub(super) color_stops: wgpu::BindingResource<'a>,
 }
 
 /// Group-1 payload: a storage buffer on modern tiers, a data texture plus per-batch
@@ -260,10 +259,6 @@ impl WgpuBindGroupLayouts {
                 wgpu::BindGroupEntry {
                     binding: shader::PAINTS_BINDING,
                     resource: tables.paints,
-                },
-                wgpu::BindGroupEntry {
-                    binding: shader::COLOR_STOPS_BINDING,
-                    resource: tables.color_stops,
                 },
             ],
         })
@@ -838,7 +833,6 @@ mod tests {
                 transforms: wgpu::BindingResource::Buffer(binding()),
                 clips: wgpu::BindingResource::Buffer(binding()),
                 paints: wgpu::BindingResource::Buffer(binding()),
-                color_stops: wgpu::BindingResource::Buffer(binding()),
             },
         );
         let _instances = layouts.create_instances(device, InstanceBindingSource::Buffer(binding()));
@@ -899,14 +893,9 @@ mod tests {
         assert_eq!(transforms.ensure_capacity(device, 3000), Some(true));
         transforms.write(&context.queue, &[gpui::SceneTransform::IDENTITY; 3000]);
         clips.write(&context.queue, &[gpui::SceneClip::default(); 3]);
-        let paints = SceneTable::<gpui::ScenePaint>::new(
+        let paints = SceneTable::<gpui::PaintWord>::new(
             device,
             "downlevel_test_paints",
-            InstanceTransport::DataTexture,
-        );
-        let color_stops = SceneTable::<gpui::SceneColorStop>::new(
-            device,
-            "downlevel_test_color_stops",
             InstanceTransport::DataTexture,
         );
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -929,7 +918,6 @@ mod tests {
                 transforms: transforms.binding(),
                 clips: clips.binding(),
                 paints: paints.binding(),
-                color_stops: color_stops.binding(),
             },
         );
 

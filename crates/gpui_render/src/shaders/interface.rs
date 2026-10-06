@@ -138,17 +138,16 @@ pub const SURFACE_SAMPLER_BINDING: u32 = 3;
 pub const TRANSFORMS_BINDING: u32 = 2;
 /// Group-0 storage table of the scene's clips, shared by every pipeline.
 pub const CLIPS_BINDING: u32 = 3;
-/// Group-0 storage table of the scene's paints, shared by every pipeline.
+/// Group-0 storage table of the scene's paints and their colour stops, as `vec4<f32>`
+/// words, shared by every pipeline.
 pub const PAINTS_BINDING: u32 = 4;
-/// Group-0 storage table of the paints' colour stops, shared by every pipeline.
-pub const COLOR_STOPS_BINDING: u32 = 5;
 /// How many bindings group 0 declares. Native backends have one flat slot space per
 /// resource class, so group 0 takes the first slots and group 1 follows it.
-pub const GLOBAL_BINDING_COUNT: u32 = 6;
+pub const GLOBAL_BINDING_COUNT: u32 = 5;
 pub const RECTANGLE_VERTEX_COUNT: u32 = 4;
 pub const FULLSCREEN_TRIANGLE_VERTEX_COUNT: u32 = 3;
 /// D3D11 constant-buffer register of the per-draw instance base for instanced pipelines.
-/// Group-0 cbuffers occupy b0 and b1, and the group-1 uniform lands on b6.
+/// Group-0 cbuffers occupy b0 and b1, and the group-1 uniform lands on b5.
 pub const DX11_DRAW_CONSTANTS_REGISTER: u32 = 3;
 /// Metal buffer index of the runtime-array sizes Naga's MSL declares, after every buffer slot.
 pub const MSL_BUFFER_SIZES_SLOT: u32 = native_slot(DATA_BIND_GROUP, DATA_BUFFER_BINDING) + 1;
@@ -191,8 +190,7 @@ buffer_data! {
     gpui::PolychromeSprite => "PolychromeSprite",
     gpui::SceneTransform => "SceneTransform",
     gpui::SceneClip => "SceneClip",
-    gpui::ScenePaint => "ScenePaint",
-    gpui::SceneColorStop => "SceneColorStop",
+    gpui::PaintWord => "PaintWord",
 }
 
 pub const SCENE_STORAGE_ABI: &[StorageAbi] = &[
@@ -204,8 +202,7 @@ pub const SCENE_STORAGE_ABI: &[StorageAbi] = &[
     storage_abi::<gpui::PolychromeSprite>(),
     storage_abi::<gpui::SceneTransform>(),
     storage_abi::<gpui::SceneClip>(),
-    storage_abi::<gpui::ScenePaint>(),
-    storage_abi::<gpui::SceneColorStop>(),
+    storage_abi::<gpui::PaintWord>(),
 ];
 
 macro_rules! render_layout {

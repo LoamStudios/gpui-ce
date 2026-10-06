@@ -1,5 +1,7 @@
-//! The scene's paint table: gradients that primitives refer to by index,
-//! with their colour stops in a table of their own.
+//! The scene's paint table: gradients and patterns that primitives refer
+//! to by index, each followed by its colour stops, in one table of
+//! four-float words. Its few integers are kept as floats, which hold them
+//! exactly, so every backend reads the table as plain `vec4<f32>`s.
 
 use super::{SceneHsla, TransformationMatrix};
 use crate::{Background, BackgroundKind, Bounds, ColorSpace, ScaledPixels};
@@ -54,16 +56,18 @@ pub enum PaintColorSpace {
     LegacyOklab = 5,
 }
 
+/// One word of a scene's paint table.
+pub type PaintWord = [f32; 4];
+
 /// An entry of a scene's paint table: a gradient, placed by the
 /// transformation from viewport positions, in device pixels, to its own
-/// space, with its stops at `first_stop..first_stop + stop_count` of the
-/// stop table.
+/// space, with its stops at word `first_stop` of the table, two words
+/// each. It takes [`Self::WORDS`] words.
 ///
 /// Its geometry is, by kind: for linear, the start and end points; for
 /// radial, the start and end centres, and in `radii` their radii; for
 /// sweep, the centre, then the start and end angles in radians.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[repr(C)]
 #[expect(missing_docs)]
 pub struct ScenePaint {
     pub transformation: TransformationMatrix,
@@ -72,22 +76,98 @@ pub struct ScenePaint {
     pub color_space: PaintColorSpace,
     pub first_stop: u32,
     pub stop_count: u32,
-    pub padding: u32,
     pub geometry: [f32; 4],
     pub radii: [f32; 4],
 }
 
-/// An entry of a scene's stop table: a colour in its gradient's
-/// interpolation space, premultiplied except for hue, and its offset.
+/// A colour stop of a paint-table entry: a colour in its gradient's
+/// interpolation space, premultiplied except for hue, and its offset. It
+/// takes [`Self::WORDS`] words.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[repr(C)]
 #[expect(missing_docs)]
 pub struct SceneColorStop {
     pub color: [f32; 4],
     pub offset: f32,
-    pub padding0: u32,
-    pub padding1: u32,
-    pub padding2: u32,
+}
+
+impl ScenePaint {
+    /// How many words an entry takes.
+    pub const WORDS: usize = 5;
+
+    /// The entry as table words: the transformation's matrix, then its
+    /// translation, kind and extend, then its colour space and stops, then
+    /// its geometry and radii.
+    pub fn words(&self) -> [PaintWord; Self::WORDS] {
+        let [[a, b], [c, d]] = self.transformation.rotation_scale;
+        let [x, y] = self.transformation.translation;
+        [
+            [a, b, c, d],
+            [x, y, self.kind as u32 as f32, self.extend as u32 as f32],
+            [
+                self.color_space as u32 as f32,
+                self.first_stop as f32,
+                self.stop_count as f32,
+                0.,
+            ],
+            self.geometry,
+            self.radii,
+        ]
+    }
+
+    /// The entry whose table words begin `words`.
+    pub fn from_words(words: &[PaintWord]) -> Self {
+        let [a, b, c, d] = words[0];
+        let [x, y, kind, extend] = words[1];
+        let [color_space, first_stop, stop_count, _] = words[2];
+        Self {
+            transformation: TransformationMatrix {
+                rotation_scale: [[a, b], [c, d]],
+                translation: [x, y],
+            },
+            kind: match kind as u32 {
+                1 => PaintKind::Radial,
+                2 => PaintKind::Sweep,
+                3 => PaintKind::Stripes,
+                4 => PaintKind::Checkerboard,
+                _ => PaintKind::Linear,
+            },
+            extend: match extend as u32 {
+                1 => PaintExtend::Repeat,
+                2 => PaintExtend::Reflect,
+                _ => PaintExtend::Pad,
+            },
+            color_space: match color_space as u32 {
+                1 => PaintColorSpace::LinearSrgb,
+                2 => PaintColorSpace::Oklab,
+                3 => PaintColorSpace::Oklch,
+                4 => PaintColorSpace::LegacySrgb,
+                5 => PaintColorSpace::LegacyOklab,
+                _ => PaintColorSpace::Srgb,
+            },
+            first_stop: first_stop as u32,
+            stop_count: stop_count as u32,
+            geometry: words[3],
+            radii: words[4],
+        }
+    }
+}
+
+impl SceneColorStop {
+    /// How many words a stop takes.
+    pub const WORDS: usize = 2;
+
+    /// The stop as table words: its colour, then its offset.
+    pub fn words(&self) -> [PaintWord; Self::WORDS] {
+        [self.color, [self.offset, 0., 0., 0.]]
+    }
+
+    /// The stop whose table words begin `words`.
+    pub fn from_words(words: &[PaintWord]) -> Self {
+        Self {
+            color: words[0],
+            offset: words[1][0],
+        }
+    }
 }
 
 /// How many stops each segment of a gradient in a colour space the shaders
@@ -119,13 +199,7 @@ impl ScenePaint {
             _ => PaintColorSpace::Oklab,
         };
         let push = |stops: &mut Vec<SceneColorStop>, offset: f32, color: DynamicColor| {
-            stops.push(SceneColorStop {
-                color: premultiplied_components(color, color_space),
-                offset,
-                padding0: 0,
-                padding1: 0,
-                padding2: 0,
-            });
+            stops.push(stop(premultiplied_components(color, color_space), offset));
         };
         if rest.is_empty() {
             push(
@@ -211,7 +285,6 @@ impl ScenePaint {
             color_space,
             first_stop,
             stop_count: stops.len() as u32 - first_stop,
-            padding: 0,
             geometry,
             radii,
         })
@@ -309,13 +382,7 @@ impl ScenePaint {
 }
 
 fn stop(color: [f32; 4], offset: f32) -> SceneColorStop {
-    SceneColorStop {
-        color,
-        offset,
-        padding0: 0,
-        padding1: 0,
-        padding2: 0,
-    }
+    SceneColorStop { color, offset }
 }
 
 /// The sRGB-encoded colour of an HSL colour, as the shaders compute it.

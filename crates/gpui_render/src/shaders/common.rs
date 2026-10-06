@@ -347,12 +347,14 @@ mod source {
     storage!(group(0), binding(2), TRANSFORMS: RuntimeArray<SceneTransform>);
     storage!(group(0), binding(3), CLIPS: RuntimeArray<SceneClip>);
 
-    /// An entry of the scene's paint table: a gradient, placed by the
-    /// transformation from viewport positions to its own space.
+    /// An entry of the scene's paint table, decoded: a gradient or pattern,
+    /// placed by the transformation from viewport positions to its own space,
+    /// with its stops at word `first_stop`, two words each.
     ///
     /// Its geometry is, by kind: for linear, the start and end points; for
     /// radial, the start and end centres, and in `radii` their radii; for
-    /// sweep, the centre, then the start and end angles in radians.
+    /// sweep, the centre, then the start and end angles in radians; for
+    /// stripes, their width and gap; for a checkerboard, its squares' size.
     #[derive(Clone, Copy, Wgsl)]
     pub struct ScenePaint {
         pub transformation: TransformationMatrix,
@@ -361,24 +363,107 @@ mod source {
         pub color_space: PaintColorSpace,
         pub first_stop: u32,
         pub stop_count: u32,
-        pub padding: u32,
         pub geometry: Vec4f,
         pub radii: Vec4f,
     }
 
-    /// A colour stop of the scene's stop table: its colour in its gradient's
+    /// A colour stop of a paint-table entry: its colour in its gradient's
     /// interpolation space, premultiplied except for hue, and its offset.
     #[derive(Clone, Copy, Wgsl)]
     pub struct SceneColorStop {
         pub color: Vec4f,
         pub offset: f32,
-        pub padding0: u32,
-        pub padding1: u32,
-        pub padding2: u32,
     }
 
-    storage!(group(0), binding(4), PAINTS: RuntimeArray<ScenePaint>);
-    storage!(group(0), binding(5), COLOR_STOPS: RuntimeArray<SceneColorStop>);
+    /// The paint table: entries and their stops, as words of four floats.
+    /// Integers are kept as floats, which hold them exactly.
+    #[derive(Clone, Copy, Wgsl)]
+    pub struct PaintWord {
+        pub value: Vec4f,
+    }
+    storage!(group(0), binding(4), PAINTS: RuntimeArray<PaintWord>);
+
+    pub fn paint_kind(value: f32) -> PaintKind {
+        let kind = u32(value);
+        if kind == 1u32 {
+            return PaintKind::Radial;
+        }
+        if kind == 2u32 {
+            return PaintKind::Sweep;
+        }
+        if kind == 3u32 {
+            return PaintKind::Stripes;
+        }
+        if kind == 4u32 {
+            return PaintKind::Checkerboard;
+        }
+        PaintKind::Linear
+    }
+
+    pub fn paint_extend(value: f32) -> PaintExtend {
+        let extend = u32(value);
+        if extend == 1u32 {
+            return PaintExtend::Repeat;
+        }
+        if extend == 2u32 {
+            return PaintExtend::Reflect;
+        }
+        PaintExtend::Pad
+    }
+
+    pub fn paint_color_space(value: f32) -> PaintColorSpace {
+        let space = u32(value);
+        if space == 1u32 {
+            return PaintColorSpace::LinearSrgb;
+        }
+        if space == 2u32 {
+            return PaintColorSpace::Oklab;
+        }
+        if space == 3u32 {
+            return PaintColorSpace::Oklch;
+        }
+        if space == 4u32 {
+            return PaintColorSpace::LegacySrgb;
+        }
+        if space == 5u32 {
+            return PaintColorSpace::LegacyOklab;
+        }
+        PaintColorSpace::Srgb
+    }
+
+    /// The paint-table entry that starts at word `index`.
+    pub fn scene_paint(index: u32) -> ScenePaint {
+        let matrix = get!(PAINTS)[index as usize].value;
+        let second = index + 1u32;
+        let placement = get!(PAINTS)[second as usize].value;
+        let third = index + 2u32;
+        let stops = get!(PAINTS)[third as usize].value;
+        let fourth = index + 3u32;
+        let fifth = index + 4u32;
+        ScenePaint {
+            transformation: TransformationMatrix {
+                rotation_scale: mat2x2f(matrix.xy(), matrix.zw()),
+                translation: placement.xy(),
+            },
+            kind: paint_kind(placement.z),
+            extend: paint_extend(placement.w),
+            color_space: paint_color_space(stops.x),
+            first_stop: u32(stops.y),
+            stop_count: u32(stops.z),
+            geometry: get!(PAINTS)[fourth as usize].value,
+            radii: get!(PAINTS)[fifth as usize].value,
+        }
+    }
+
+    /// Stop `stop` of `paint`.
+    pub fn color_stop(paint: ScenePaint, stop: u32) -> SceneColorStop {
+        let color_word = paint.first_stop + 2u32 * stop;
+        let offset_word = color_word + 1u32;
+        SceneColorStop {
+            color: get!(PAINTS)[color_word as usize].value,
+            offset: get!(PAINTS)[offset_word as usize].value.x,
+        }
+    }
 
     /// Where a gradient is at a point in its own space, from 0 at its start to
     /// 1 at its end, before it is extended; `x` is that offset, and `y` is 0
@@ -467,15 +552,14 @@ mod source {
 
     /// The colour of a paint's stops at `offset`, interpolated in its space.
     pub fn stops_color(paint: ScenePaint, offset: f32) -> Vec4f {
-        let first = get!(COLOR_STOPS)[paint.first_stop as usize];
+        let first = color_stop(paint, 0u32);
         if offset <= first.offset || paint.stop_count < 2u32 {
             return first.color;
         }
         let mut previous = first;
         let mut index = 1u32;
         while index < paint.stop_count {
-            let stop_index = paint.first_stop + index;
-            let stop = get!(COLOR_STOPS)[stop_index as usize];
+            let stop = color_stop(paint, index);
             if offset <= stop.offset {
                 let span = stop.offset - previous.offset;
                 let mut t = 1.0;
@@ -527,14 +611,12 @@ mod source {
 
     /// The colour of paint-table entry `index` at a viewport position.
     pub fn table_paint_color(index: u32, viewport_position: Vec2f) -> Vec4f {
-        let paint = get!(PAINTS)[index as usize];
+        let paint = scene_paint(index);
         let point =
             TransformationMatrix::transform_position(paint.transformation, viewport_position);
         if paint.kind == PaintKind::Stripes || paint.kind == PaintKind::Checkerboard {
-            let mut color = paint_space_to_srgba(
-                PaintColorSpace::Srgb,
-                get!(COLOR_STOPS)[paint.first_stop as usize].color,
-            );
+            let mut color =
+                paint_space_to_srgba(PaintColorSpace::Srgb, color_stop(paint, 0u32).color);
             if paint.kind == PaintKind::Stripes {
                 color.w *= stripes_coverage(point, paint.geometry.x, paint.geometry.y);
             } else {

@@ -58,10 +58,6 @@ fn shader_interface_matches_generated_sources() {
     assert_eq!(common::CLIPS.group(), interface::GLOBAL_BIND_GROUP);
     assert_eq!(common::CLIPS.binding(), interface::CLIPS_BINDING);
     assert_eq!(common::PAINTS.binding(), interface::PAINTS_BINDING);
-    assert_eq!(
-        common::COLOR_STOPS.binding(),
-        interface::COLOR_STOPS_BINDING
-    );
 }
 
 #[test]
@@ -291,7 +287,6 @@ fn gradient(kind: common::PaintKind, geometry: [f32; 4], radii: [f32; 2]) -> com
         color_space: PaintColorSpace::Srgb,
         first_stop: 0,
         stop_count: 0,
-        padding: 0,
         geometry: vec4f(geometry[0], geometry[1], geometry[2], geometry[3]),
         radii: vec4f(radii[0], radii[1], 0.0, 0.0),
     }

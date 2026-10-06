@@ -46,28 +46,6 @@ pub const SCENE_BUFFER_LAYOUTS: &[SceneBufferLayout] = &[
     ),
     layout!(SceneTransform, "SceneTransform", transformation, inverse),
     layout!(
-        ScenePaint,
-        "ScenePaint",
-        transformation,
-        kind,
-        extend,
-        color_space,
-        first_stop,
-        stop_count,
-        padding,
-        geometry,
-        radii
-    ),
-    layout!(
-        SceneColorStop,
-        "SceneColorStop",
-        color,
-        offset,
-        padding0,
-        padding1,
-        padding2
-    ),
-    layout!(
         SceneClip,
         "SceneClip",
         bounds,

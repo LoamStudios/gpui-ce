@@ -82,8 +82,7 @@ pub(super) struct WgpuResources {
 struct SceneTables {
     transforms: SceneTable<gpui::SceneTransform>,
     clips: SceneTable<gpui::SceneClip>,
-    paints: SceneTable<gpui::ScenePaint>,
-    color_stops: SceneTable<gpui::SceneColorStop>,
+    paints: SceneTable<gpui::PaintWord>,
 }
 
 impl SceneTables {
@@ -92,7 +91,6 @@ impl SceneTables {
             transforms: SceneTable::new(device, "scene_transforms", transport),
             clips: SceneTable::new(device, "scene_clips", transport),
             paints: SceneTable::new(device, "scene_paints", transport),
-            color_stops: SceneTable::new(device, "scene_color_stops", transport),
         }
     }
 
@@ -101,7 +99,6 @@ impl SceneTables {
             transforms: self.transforms.binding(),
             clips: self.clips.binding(),
             paints: self.paints.binding(),
-            color_stops: self.color_stops.binding(),
         }
     }
 }
@@ -254,13 +251,13 @@ impl WgpuResources {
         self.scene_color_view = None;
     }
 
-    /// Uploads the scene's transform, clip, paint and colour-stop tables, growing them, and
+    /// Uploads the scene's transform, clip and paint tables, growing them, and
     /// rebuilding the group-0 bind groups that reference them, as needed. Returns false when
     /// the device cannot hold them.
     pub(super) fn upload_scene_tables(&mut self, scene: &gpui::Scene) -> bool {
         let tables = &mut self.scene_tables;
         let device = &self.device;
-        let (Some(transforms_grew), Some(clips_grew), Some(paints_grew), Some(color_stops_grew)) = (
+        let (Some(transforms_grew), Some(clips_grew), Some(paints_grew)) = (
             tables
                 .transforms
                 .ensure_capacity(device, scene.transforms().len() as u64),
@@ -269,21 +266,17 @@ impl WgpuResources {
                 .ensure_capacity(device, scene.clips().len() as u64),
             tables
                 .paints
-                .ensure_capacity(device, scene.paints().len() as u64),
-            tables
-                .color_stops
-                .ensure_capacity(device, scene.color_stops().len() as u64),
+                .ensure_capacity(device, scene.paint_table().len() as u64),
         ) else {
             return false;
         };
-        if transforms_grew || clips_grew || paints_grew || color_stops_grew {
+        if transforms_grew || clips_grew || paints_grew {
             self.rebuild_globals_bind_group();
         }
         let tables = &self.scene_tables;
         tables.transforms.write(&self.queue, scene.transforms());
         tables.clips.write(&self.queue, scene.clips());
-        tables.paints.write(&self.queue, scene.paints());
-        tables.color_stops.write(&self.queue, scene.color_stops());
+        tables.paints.write(&self.queue, scene.paint_table());
         true
     }
 

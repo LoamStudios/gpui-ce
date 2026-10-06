@@ -55,17 +55,16 @@ const fn global_register(binding: u32) -> u32 {
 const fn data_register(binding: u32) -> u32 {
     shader_interface::native_slot(shader_interface::DATA_BIND_GROUP, binding)
 }
-/// The scene's transform, clip, paint and colour-stop tables, bound together from this
-/// register in that order.
+/// The scene's transform, clip and paint tables, bound together from this register in
+/// that order.
 const SCENE_TABLES_REGISTER: u32 = global_register(shader_interface::TRANSFORMS_BINDING);
 const _: () = assert!(
     global_register(shader_interface::CLIPS_BINDING) == SCENE_TABLES_REGISTER + 1
-        && global_register(shader_interface::PAINTS_BINDING) == SCENE_TABLES_REGISTER + 2
-        && global_register(shader_interface::COLOR_STOPS_BINDING) == SCENE_TABLES_REGISTER + 3,
-    "the clip, paint and colour-stop tables must follow the transform table"
+        && global_register(shader_interface::PAINTS_BINDING) == SCENE_TABLES_REGISTER + 2,
+    "the clip and paint tables must follow the transform table"
 );
 const _: () = assert!(
-    SCENE_TABLES_REGISTER + 4 <= DATA_REGISTER,
+    SCENE_TABLES_REGISTER + 3 <= DATA_REGISTER,
     "the scene tables must not reach group 1's registers"
 );
 const DATA_REGISTER: u32 = data_register(shader_interface::DATA_BUFFER_BINDING);
@@ -265,8 +264,7 @@ struct DirectXGlobalElements {
     sampler: Option<ID3D11SamplerState>,
     transforms: SceneTableBuffer<SceneTransform>,
     clips: SceneTableBuffer<SceneClip>,
-    paints: SceneTableBuffer<ScenePaint>,
-    color_stops: SceneTableBuffer<SceneColorStop>,
+    paints: SceneTableBuffer<PaintWord>,
 }
 
 impl DirectXGlobalElements {
@@ -275,14 +273,13 @@ impl DirectXGlobalElements {
         [self.globals_buffer.clone(), self.font_buffer.clone()]
     }
 
-    /// The transform, clip, paint and colour-stop tables, for registers from
+    /// The transform, clip and paint tables, for registers from
     /// [`SCENE_TABLES_REGISTER`].
-    fn scene_tables(&self) -> [Option<ID3D11ShaderResourceView>; 4] {
+    fn scene_tables(&self) -> [Option<ID3D11ShaderResourceView>; 3] {
         [
             self.transforms.view.clone(),
             self.clips.view.clone(),
             self.paints.view.clone(),
-            self.color_stops.view.clone(),
         ]
     }
 }
@@ -1056,13 +1053,10 @@ impl DirectXRenderer {
         self.globals
             .clips
             .update(&devices.device, &devices.device_context, scene.clips())?;
-        self.globals
-            .paints
-            .update(&devices.device, &devices.device_context, scene.paints())?;
-        self.globals.color_stops.update(
+        self.globals.paints.update(
             &devices.device,
             &devices.device_context,
-            scene.color_stops(),
+            scene.paint_table(),
         )?;
 
         if !scene.shadows.is_empty() {
@@ -2119,7 +2113,6 @@ impl DirectXGlobalElements {
             transforms: SceneTableBuffer::new(device, "scene_transforms")?,
             clips: SceneTableBuffer::new(device, "scene_clips")?,
             paints: SceneTableBuffer::new(device, "scene_paints")?,
-            color_stops: SceneTableBuffer::new(device, "scene_color_stops")?,
         })
     }
 }

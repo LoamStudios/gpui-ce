@@ -9460,14 +9460,10 @@ mod tests {
     #[gpui::test]
     fn shadow_backgrounds_survive_painting_with_geometry_and_opacity(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| ShadowBackgroundView);
-        let (shadows, paints, stops) = window
+        let (shadows, table) = window
             .update(cx, |_, window, _| {
                 let scene = &window.rendered_frame.scene;
-                (
-                    scene.shadows.clone(),
-                    scene.paints().to_vec(),
-                    scene.color_stops().to_vec(),
-                )
+                (scene.shadows.clone(), scene.paint_table().to_vec())
             })
             .unwrap();
 
@@ -9490,8 +9486,10 @@ mod tests {
             hsla(0.3, 0.7, 0.4, 0.2).into(),
             "element opacity should apply to solid shadow paint"
         );
-        let first_stop_alpha =
-            |paint: u32| stops[paints[paint as usize].first_stop as usize].color[3];
+        let first_stop_alpha = |paint: u32| {
+            let paint = crate::ScenePaint::from_words(&table[paint as usize..]);
+            table[paint.first_stop as usize][3]
+        };
         assert!(
             (first_stop_alpha(drop_gradient.color.paint) - 0.4).abs() < 1e-6,
             "element opacity should apply to gradient shadow paint"
