@@ -25,7 +25,7 @@ use smallvec::SmallVec;
 use wgsl_rs::std::{vec2f, vec4f};
 use windows::{
     Win32::{
-        Foundation::{FreeLibrary, HMODULE, HWND},
+        Foundation::{FreeLibrary, HMODULE, HWND, RECT},
         Graphics::{
             Direct3D::*,
             Direct3D11::*,
@@ -125,6 +125,36 @@ pub(crate) struct DirectXRenderer {
     targets: Vec<FrameTarget>,
     path_rasterization_vertices: Vec<PathRasterizationVertex>,
     path_sprites: Vec<PathSprite>,
+
+    /// The scene whose commands are being drawn: the window's, or a chunk inside it.
+    level: DrawLevel,
+    /// Where each chunk scene drawn this frame keeps its data in the frame's buffers, by the
+    /// address of its scene, which the frame's scene keeps alive.
+    chunk_slots: FxHashMap<*const Scene, SceneSlot>,
+}
+
+/// Where a scene drawn this frame, the window's or a chunk's, keeps its data in the frame's
+/// buffers: each scene's instances and tables follow the window's.
+#[derive(Clone, Default)]
+struct SceneSlot {
+    /// Where its instances start in each batch pipeline's buffer.
+    shadows: u32,
+    quads: u32,
+    underlines: u32,
+    monochrome_sprites: u32,
+    subpixel_sprites: u32,
+    polychrome_sprites: u32,
+    /// Its transform, clip and paint tables, for registers from [`SCENE_TABLES_REGISTER`].
+    tables: [Option<ID3D11ShaderResourceView>; 3],
+}
+
+/// The scene whose commands are being drawn, and how.
+#[derive(Clone, Default)]
+struct DrawLevel {
+    slot: SceneSlot,
+    /// For a chunk: from its viewport to the window's, in device pixels, and the window
+    /// viewport rectangle it is clipped to.
+    chunk: Option<(TransformationMatrix, Bounds<ScaledPixels>)>,
 }
 
 /// Direct3D objects
@@ -161,6 +191,11 @@ struct DirectXResources {
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
+
+    // The rasterizer state for everything but chunks, and the one chunks are drawn with,
+    // which cuts what they draw to their scissor rectangle.
+    rasterizer_state: ID3D11RasterizerState,
+    scissored_rasterizer_state: ID3D11RasterizerState,
 }
 
 struct CachedSurfaceView {
@@ -341,23 +376,25 @@ impl<T> SceneTableBuffer<T> {
         })
     }
 
+    /// Uploads `sections`, one scene's table each, end to end, each starting on a boundary a
+    /// view can start at, and returns where each one is.
     fn update(
         &mut self,
         device: &ID3D11Device,
         device_context: &ID3D11DeviceContext,
-        entries: &[T],
-    ) -> Result<()> {
-        if self.capacity < entries.len() {
+        sections: &[&[T]],
+    ) -> Result<SmallVec<[TableSection; 4]>> {
+        let (offsets, entries) = section_offsets(sections, TABLE_SECTION_ALIGNMENT);
+        if self.capacity < entries {
             let element_size = std::mem::size_of::<T>();
             let max_entries = MAX_INSTANCE_BUFFER_SIZE / element_size;
             anyhow::ensure!(
-                entries.len() <= max_entries,
+                entries <= max_entries,
                 "{} needs {} entries, above the {MAX_INSTANCE_BUFFER_SIZE}-byte limit",
                 self.label,
-                entries.len(),
+                entries,
             );
             let capacity = entries
-                .len()
                 .checked_next_power_of_two()
                 .unwrap_or(max_entries)
                 .min(max_entries);
@@ -365,8 +402,80 @@ impl<T> SceneTableBuffer<T> {
             self.view = create_buffer_view(device, &self.buffer)?;
             self.capacity = capacity;
         }
-        update_buffer(device_context, &self.buffer, entries)
+        update_buffer_sections(device_context, &self.buffer, sections, &offsets)?;
+        Ok(offsets
+            .iter()
+            .zip(sections)
+            .map(|(&offset, section)| TableSection {
+                offset,
+                len: section.len(),
+            })
+            .collect())
     }
+
+    /// A view of one scene's table, uploaded by [`Self::update`], that its shaders index from
+    /// its own entry zero.
+    fn section_view(
+        &self,
+        device: &ID3D11Device,
+        section: &TableSection,
+    ) -> Result<Option<ID3D11ShaderResourceView>> {
+        let element_size = std::mem::size_of::<T>();
+        // Every scene's table holds at least entry zero.
+        let len = section.len.max(1);
+        anyhow::ensure!(
+            section.offset + len <= self.capacity,
+            "{} section {}..{} exceeds its buffer of {} entries",
+            self.label,
+            section.offset,
+            section.offset + len,
+            self.capacity,
+        );
+        create_buffer_section_view(
+            device,
+            &self.buffer,
+            section.offset * element_size,
+            len * element_size,
+        )
+    }
+}
+
+/// Where one scene's table sits in a [`SceneTableBuffer`], in entries.
+struct TableSection {
+    offset: usize,
+    len: usize,
+}
+
+/// The byte boundary each scene's table starts on, so that a raw view can start there.
+const TABLE_SECTION_ALIGNMENT: usize = 16;
+
+/// The `T`s of each of `scenes`, picked by `section`.
+fn sections<'a, T>(
+    scenes: &[&'a Scene],
+    section: impl Fn(&'a Scene) -> &'a [T],
+) -> SmallVec<[&'a [T]; 4]> {
+    scenes.iter().map(|scene| section(scene)).collect()
+}
+
+/// Where each of `sections` starts, in elements, laid end to end with each starting at a
+/// multiple of `alignment` bytes, a power of two; and how many elements they take in all.
+fn section_offsets<T>(sections: &[&[T]], alignment: usize) -> (SmallVec<[usize; 4]>, usize) {
+    let element_size = std::mem::size_of::<T>().max(1);
+    // The fewest elements whose size is a multiple of the alignment.
+    let step = alignment
+        >> element_size
+            .trailing_zeros()
+            .min(alignment.trailing_zeros());
+    let mut end = 0usize;
+    let offsets = sections
+        .iter()
+        .map(|section| {
+            let start = end.next_multiple_of(step);
+            end = start.saturating_add(section.len());
+            start
+        })
+        .collect();
+    (offsets, end)
 }
 
 /// Frame-wide state that every batch draw binds alongside its own pipeline.
@@ -374,6 +483,8 @@ struct FrameBindings<'a> {
     device_context: &'a ID3D11DeviceContext,
     viewport: &'a D3D11_VIEWPORT,
     globals: &'a DirectXGlobalElements,
+    /// The tables of the scene being drawn, the window's or a chunk's.
+    scene_tables: &'a [Option<ID3D11ShaderResourceView>; 3],
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -473,6 +584,8 @@ impl DirectXRenderer {
             targets: Vec::new(),
             path_rasterization_vertices: Vec::new(),
             path_sprites: Vec::new(),
+            level: DrawLevel::default(),
+            chunk_slots: FxHashMap::default(),
         })
     }
 
@@ -520,7 +633,8 @@ impl DirectXRenderer {
     }
 
     /// Points the global uniforms at a target covering `bounds` of the viewport. Shaders place
-    /// what they draw relative to the target's origin, so this changes with the target.
+    /// what they draw relative to the target's origin, so this changes with the target; inside
+    /// a chunk, they place it from the chunk's viewport too.
     fn write_globals(&self, bounds: Bounds<DevicePixels>) -> Result<()> {
         let resources = self.resources.as_ref().context("resources missing")?;
         let device_context = &self
@@ -528,30 +642,35 @@ impl DirectXRenderer {
             .as_ref()
             .context("devices missing")?
             .device_context;
+        let globals = GlobalUniforms {
+            viewport_size: vec2f(resources.viewport.Width, resources.viewport.Height),
+            target_origin: vec2f(bounds.origin.x.0 as f32, bounds.origin.y.0 as f32),
+            target_size: vec2f(bounds.size.width.0 as f32, bounds.size.height.0 as f32),
+            // DirectComposition wants premultiplied output, but path rasterization
+            // premultiplies in-shader; scene geometry blends straight alpha as before.
+            premultiplied_alpha: ShaderBool::Disabled,
+            padding: 0,
+            placement: GlobalUniforms::unplaced(),
+            inverse_placement: GlobalUniforms::unplaced(),
+            placement_translation: vec2f(0.0, 0.0),
+            inverse_placement_translation: vec2f(0.0, 0.0),
+        };
+        let globals = match &self.level.chunk {
+            Some((placement, _)) => globals.placed(placement),
+            None => globals,
+        };
         update_buffer(
             device_context,
             self.globals
                 .globals_buffer
                 .as_ref()
                 .context("globals buffer missing")?,
-            &[GlobalUniforms {
-                viewport_size: vec2f(resources.viewport.Width, resources.viewport.Height),
-                target_origin: vec2f(bounds.origin.x.0 as f32, bounds.origin.y.0 as f32),
-                target_size: vec2f(bounds.size.width.0 as f32, bounds.size.height.0 as f32),
-                // DirectComposition wants premultiplied output, but path rasterization
-                // premultiplies in-shader; scene geometry blends straight alpha as before.
-                premultiplied_alpha: ShaderBool::Disabled,
-                padding: 0,
-                placement: GlobalUniforms::unplaced(),
-                inverse_placement: GlobalUniforms::unplaced(),
-                placement_translation: vec2f(0.0, 0.0),
-                inverse_placement_translation: vec2f(0.0, 0.0),
-            }],
+            &[globals],
         )
     }
 
     /// Binds the current target for the batches that follow: its view, its viewport and the
-    /// globals describing it.
+    /// globals describing it; inside a chunk, with the chunk's placement and its scissor.
     fn bind_current_target(&self) -> Result<()> {
         let target = self.targets.last().context("no render target is bound")?;
         let device_context = &self
@@ -559,9 +678,17 @@ impl DirectXRenderer {
             .as_ref()
             .context("devices missing")?
             .device_context;
+        let resources = self.resources.as_ref().context("resources missing")?;
         unsafe {
             device_context.OMSetRenderTargets(Some(slice::from_ref(&target.color.rtv)), None);
             device_context.RSSetViewports(Some(slice::from_ref(&target.viewport)));
+            match &self.level.chunk {
+                None => device_context.RSSetState(&resources.rasterizer_state),
+                Some((_, clip)) => {
+                    device_context.RSSetState(&resources.scissored_rasterizer_state);
+                    device_context.RSSetScissorRects(Some(&[chunk_scissor(target, *clip)]));
+                }
+            }
         }
         self.write_globals(target.bounds)
     }
@@ -682,6 +809,8 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
+        // Drawn from the window's scene, until a chunk is entered.
+        self.level = DrawLevel::default();
         self.pre_draw(&match background_appearance {
             appearance if appearance.is_opaque() => [1.0f32; 4],
             _ => [0.0f32; 4],
@@ -785,11 +914,13 @@ impl DirectXRenderer {
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(command.label())));
             match command {
-                RenderCommand::Batch(PrimitiveBatch::Shadows { range, smoothed }) => {
-                    self.draw_shadows(instance_range(range)?, *smoothed)
-                }
+                RenderCommand::Batch(PrimitiveBatch::Shadows { range, smoothed }) => self
+                    .draw_shadows(
+                        instance_range(range, self.level.slot.shadows)?,
+                        *smoothed,
+                    ),
                 RenderCommand::Batch(PrimitiveBatch::Quads { range, smoothed }) => {
-                    self.draw_quads(instance_range(range)?, *smoothed)
+                    self.draw_quads(instance_range(range, self.level.slot.quads)?, *smoothed)
                 }
                 RenderCommand::Batch(PrimitiveBatch::Paths {
                     range,
@@ -804,23 +935,29 @@ impl DirectXRenderer {
                     self.draw_paths_from_intermediate(paths, *sprite_count)
                 }
                 RenderCommand::Batch(PrimitiveBatch::Underlines(range)) => {
-                    self.draw_underlines(instance_range(range)?)
+                    self.draw_underlines(instance_range(range, self.level.slot.underlines)?)
                 }
                 RenderCommand::Batch(PrimitiveBatch::MonochromeSprites {
                     texture_id,
                     range,
-                }) => self.draw_monochrome_sprites(*texture_id, instance_range(range)?),
+                }) => self.draw_monochrome_sprites(
+                    *texture_id,
+                    instance_range(range, self.level.slot.monochrome_sprites)?,
+                ),
                 RenderCommand::Batch(PrimitiveBatch::SubpixelSprites {
                     texture_id,
                     range,
-                }) => self.draw_subpixel_sprites(*texture_id, instance_range(range)?),
+                }) => self.draw_subpixel_sprites(
+                    *texture_id,
+                    instance_range(range, self.level.slot.subpixel_sprites)?,
+                ),
                 RenderCommand::Batch(PrimitiveBatch::PolychromeSprites {
                     texture_id,
                     range,
                     smoothed,
                 }) => self.draw_polychrome_sprites(
                     *texture_id,
-                    instance_range(range)?,
+                    instance_range(range, self.level.slot.polychrome_sprites)?,
                     *smoothed,
                 ),
                 RenderCommand::Batch(PrimitiveBatch::Surfaces(range)) => {
@@ -870,10 +1007,8 @@ impl DirectXRenderer {
                 RenderCommand::Batch(PrimitiveBatch::GroupBoundary(_)) => {
                     unreachable!("group boundaries are resolved by the render plan")
                 }
-                // Not made for this renderer: `supports_scene_chunks` is false.
-                RenderCommand::Batch(PrimitiveBatch::Chunks(_)) => {
-                    debug_assert!(false, "a scene chunk reached the DirectX renderer");
-                    Ok(())
+                RenderCommand::Batch(PrimitiveBatch::Chunks(range)) => {
+                    self.draw_chunks(&scene.chunks[range.clone()], viewport_size)
                 }
             }
             .with_context(|| {
@@ -892,6 +1027,46 @@ impl DirectXRenderer {
             })?;
         }
         Ok(())
+    }
+
+    /// Draws each of `chunks` in turn, as a unit: its scene's commands, with its tables, placed
+    /// from its viewport into this one and cut to its clip.
+    fn draw_chunks(
+        &mut self,
+        chunks: &[PlacedChunk],
+        viewport_size: Size<DevicePixels>,
+    ) -> Result<()> {
+        for placed in chunks {
+            let chunk_scene = &placed.chunk.scene;
+            let slot = self
+                .chunk_slots
+                .get(&(chunk_scene as *const Scene))
+                .cloned()
+                .context("a chunk was drawn that was not uploaded")?;
+            let (parent_placement, parent_clip) = match &self.level.chunk {
+                Some((placement, clip)) => (*placement, Some(*clip)),
+                None => (TransformationMatrix::unit(), None),
+            };
+            let placement = parent_placement.compose(placed.placement);
+            let mut clip = transformed_bounds(&parent_placement, placed.content_mask.bounds);
+            if let Some(outer) = parent_clip {
+                clip = clip.intersect(&outer);
+            }
+            let parent = std::mem::replace(
+                &mut self.level,
+                DrawLevel {
+                    slot,
+                    chunk: Some((placement, clip)),
+                },
+            );
+            let result = self
+                .bind_current_target()
+                .and_then(|()| self.encode_commands(chunk_scene, viewport_size));
+            self.level = parent;
+            result?;
+        }
+        // Draw the parent's batches that follow with its placement, tables and clip.
+        self.bind_current_target()
     }
 
     /// Starts drawing a group: into a target of its own, cleared to transparent, when the plan
@@ -1083,74 +1258,109 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    /// Uploads the frame's tables and instances: the window scene's, then each chunk scene's
+    /// drawn in it, once however often it is drawn, after it in the same buffers.
     fn upload_scene_buffers(&mut self, scene: &Scene) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
+        let (device, device_context) = (&devices.device, &devices.device_context);
 
-        self.globals.transforms.update(
-            &devices.device,
-            &devices.device_context,
-            scene.transforms(),
+        // The window's scene, then each chunk scene inside it.
+        let mut scenes: Vec<&Scene> = vec![scene];
+        let mut index = 0;
+        self.chunk_slots.clear();
+        while let Some(&parent) = scenes.get(index) {
+            for placed in &parent.chunks {
+                let chunk_scene = &placed.chunk.scene;
+                if self
+                    .chunk_slots
+                    .insert(chunk_scene as *const Scene, SceneSlot::default())
+                    .is_none()
+                {
+                    scenes.push(chunk_scene);
+                }
+            }
+            index += 1;
+        }
+
+        let transforms = self.globals.transforms.update(
+            device,
+            device_context,
+            &sections(&scenes, |scene| scene.transforms()),
         )?;
-        self.globals
-            .clips
-            .update(&devices.device, &devices.device_context, scene.clips())?;
-        self.globals.paints.update(
-            &devices.device,
-            &devices.device_context,
-            scene.paint_table(),
+        let clips = self.globals.clips.update(
+            device,
+            device_context,
+            &sections(&scenes, |scene| scene.clips()),
+        )?;
+        let paints = self.globals.paints.update(
+            device,
+            device_context,
+            &sections(&scenes, |scene| scene.paint_table()),
         )?;
         self.globals
             .photo_tiles
-            .upload(&devices.device, &devices.device_context, scene)?;
+            .upload(device, device_context, scene)?;
 
-        if !scene.shadows.is_empty() {
-            self.pipelines.shadow_pipeline.update_buffer(
-                &devices.device,
-                &devices.device_context,
-                &scene.shadows,
-            )?;
+        let pipelines = &mut self.pipelines;
+        let shadows = pipelines.shadow_pipeline.update_sections(
+            device,
+            device_context,
+            &sections(&scenes, |scene| &scene.shadows),
+        )?;
+        let quads = pipelines.quad_pipeline.update_sections(
+            device,
+            device_context,
+            &sections(&scenes, |scene| &scene.quads),
+        )?;
+        let underlines = pipelines.underline_pipeline.update_sections(
+            device,
+            device_context,
+            &sections(&scenes, |scene| &scene.underlines),
+        )?;
+        let monochrome_sprites = pipelines.mono_sprites.update_sections(
+            device,
+            device_context,
+            &sections(&scenes, |scene| &scene.monochrome_sprites),
+        )?;
+        let subpixel_sprites = pipelines.subpixel_sprites.update_sections(
+            device,
+            device_context,
+            &sections(&scenes, |scene| &scene.subpixel_sprites),
+        )?;
+        let polychrome_sprites = pipelines.poly_sprites.update_sections(
+            device,
+            device_context,
+            &sections(&scenes, |scene| &scene.polychrome_sprites),
+        )?;
+
+        for (index, scene) in scenes.iter().enumerate() {
+            let tables = if index == 0 {
+                // The window's tables start each buffer: its whole view reads them.
+                self.globals.scene_tables()
+            } else {
+                [
+                    self.globals
+                        .transforms
+                        .section_view(device, &transforms[index])?,
+                    self.globals.clips.section_view(device, &clips[index])?,
+                    self.globals.paints.section_view(device, &paints[index])?,
+                ]
+            };
+            let slot = SceneSlot {
+                shadows: shadows[index],
+                quads: quads[index],
+                underlines: underlines[index],
+                monochrome_sprites: monochrome_sprites[index],
+                subpixel_sprites: subpixel_sprites[index],
+                polychrome_sprites: polychrome_sprites[index],
+                tables,
+            };
+            if index == 0 {
+                self.level.slot = slot;
+            } else {
+                self.chunk_slots.insert(*scene as *const Scene, slot);
+            }
         }
-
-        if !scene.quads.is_empty() {
-            self.pipelines.quad_pipeline.update_buffer(
-                &devices.device,
-                &devices.device_context,
-                &scene.quads,
-            )?;
-        }
-
-        if !scene.underlines.is_empty() {
-            self.pipelines.underline_pipeline.update_buffer(
-                &devices.device,
-                &devices.device_context,
-                &scene.underlines,
-            )?;
-        }
-
-        if !scene.monochrome_sprites.is_empty() {
-            self.pipelines.mono_sprites.update_buffer(
-                &devices.device,
-                &devices.device_context,
-                &scene.monochrome_sprites,
-            )?;
-        }
-
-        if !scene.subpixel_sprites.is_empty() {
-            self.pipelines.subpixel_sprites.update_buffer(
-                &devices.device,
-                &devices.device_context,
-                &scene.subpixel_sprites,
-            )?;
-        }
-
-        if !scene.polychrome_sprites.is_empty() {
-            self.pipelines.poly_sprites.update_buffer(
-                &devices.device,
-                &devices.device_context,
-                &scene.polychrome_sprites,
-            )?;
-        }
-
         Ok(())
     }
 
@@ -1168,6 +1378,7 @@ impl DirectXRenderer {
                 .context("no render target is bound")?
                 .viewport,
             globals: &self.globals,
+            scene_tables: &self.level.slot.tables,
         })
     }
 
@@ -1235,6 +1446,11 @@ impl DirectXRenderer {
             devices
                 .device_context
                 .OMSetRenderTargets(Some(slice::from_ref(&path.msaa_view)), None);
+            // A chunk's scissor is in its target's coordinates, not the intermediate's: its
+            // paths are cut to it when their sprites are drawn.
+            devices
+                .device_context
+                .RSSetState(&resources.rasterizer_state);
         }
 
         self.pipelines.path_rasterization_pipeline.update_buffer(
@@ -1247,6 +1463,7 @@ impl DirectXRenderer {
                 device_context: &devices.device_context,
                 viewport: &resources.viewport,
                 globals: &self.globals,
+                scene_tables: &self.level.slot.tables,
             },
             u32::try_from(rasterization_vertex_count)
                 .context("path rasterization vertex count exceeds the D3D11 draw limit")?,
@@ -1759,7 +1976,7 @@ impl DirectXRenderer {
         update_buffer(ctx, &pipeline.params_buffer, &[uniforms])?;
         let cbuffers = self.globals.cbuffers();
         let params = [Some(pipeline.params_buffer.clone())];
-        let scene_tables = self.globals.scene_tables();
+        let scene_tables = self.level.slot.tables.clone();
         let textures = [source.clone(), backdrop.clone()];
         let unbound: [Option<ID3D11ShaderResourceView>; 2] = [None, None];
         unsafe {
@@ -1887,7 +2104,9 @@ impl DirectXResources {
 
         let (render_target, render_target_view, viewport) =
             create_resources(devices, &swap_chain, width, height)?;
-        set_rasterizer_state(&devices.device, &devices.device_context)?;
+        let rasterizer_state = create_rasterizer_state(&devices.device, false)?;
+        let scissored_rasterizer_state = create_rasterizer_state(&devices.device, true)?;
+        unsafe { devices.device_context.RSSetState(&rasterizer_state) };
         Ok(Self {
             swap_chain,
             render_target: Some(render_target),
@@ -1897,6 +2116,8 @@ impl DirectXResources {
             target_pool: TexturePool::new(RENDER_TARGET_FORMAT),
             surface_views: FxHashMap::default(),
             viewport,
+            rasterizer_state,
+            scissored_rasterizer_state,
         })
     }
 
@@ -2258,7 +2479,28 @@ impl<T> PipelineState<T> {
         device_context: &ID3D11DeviceContext,
         data: &[T],
     ) -> Result<()> {
-        if self.buffer_size < data.len() {
+        self.update_sections(device, device_context, &[data])
+            .map(drop)
+    }
+
+    /// Uploads `sections`, one scene's instances each, end to end, and returns where each one
+    /// starts, the base its batches' instance ranges are drawn from.
+    fn update_sections(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        sections: &[&[T]],
+    ) -> Result<SmallVec<[u32; 4]>> {
+        let (offsets, len) = section_offsets(sections, 1);
+        let bases = offsets
+            .iter()
+            .map(|&offset| u32::try_from(offset))
+            .collect::<Result<_, _>>()
+            .with_context(|| format!("{} instances exceed the D3D11 instance limit", self.label))?;
+        if len == 0 {
+            return Ok(bases);
+        }
+        if self.buffer_size < len {
             let element_size = std::mem::size_of::<T>();
             anyhow::ensure!(
                 element_size > 0,
@@ -2266,7 +2508,7 @@ impl<T> PipelineState<T> {
                 self.label
             );
             let required_size = element_size
-                .checked_mul(data.len())
+                .checked_mul(len)
                 .context("instance-buffer byte size overflow")?;
             anyhow::ensure!(
                 required_size <= MAX_INSTANCE_BUFFER_SIZE,
@@ -2274,15 +2516,11 @@ impl<T> PipelineState<T> {
                 self.label,
             );
             let max_elements = MAX_INSTANCE_BUFFER_SIZE / element_size;
-            let new_buffer_size = data
-                .len()
+            let new_buffer_size = len
                 .checked_next_power_of_two()
                 .unwrap_or(max_elements)
                 .min(max_elements);
-            anyhow::ensure!(
-                new_buffer_size >= data.len(),
-                "instance-buffer capacity overflow"
-            );
+            anyhow::ensure!(new_buffer_size >= len, "instance-buffer capacity overflow");
             log::debug!(
                 "Updating {} buffer size from {} to {}",
                 self.label,
@@ -2295,7 +2533,8 @@ impl<T> PipelineState<T> {
             self.view = view;
             self.buffer_size = new_buffer_size;
         }
-        update_buffer(device_context, &self.buffer, data)
+        update_buffer_sections(device_context, &self.buffer, sections, &offsets)?;
+        Ok(bases)
     }
 
     /// Draws `instances` of the uploaded frame data as the pipeline's fixed rectangle,
@@ -2393,10 +2632,9 @@ impl<T> PipelineState<T> {
             }
         };
         let draw_constants = [Some(frame.globals.draw_constants_buffer.clone())];
-        let scene_tables = frame.globals.scene_tables();
         unsafe {
-            ctx.VSSetShaderResources(SCENE_TABLES_REGISTER, Some(&scene_tables));
-            ctx.PSSetShaderResources(SCENE_TABLES_REGISTER, Some(&scene_tables));
+            ctx.VSSetShaderResources(SCENE_TABLES_REGISTER, Some(frame.scene_tables));
+            ctx.PSSetShaderResources(SCENE_TABLES_REGISTER, Some(frame.scene_tables));
             frame.globals.bind_photo_tiles(ctx);
             ctx.VSSetShaderResources(DATA_REGISTER, Some(slice::from_ref(&self.view)));
             ctx.PSSetShaderResources(DATA_REGISTER, Some(slice::from_ref(&self.view)));
@@ -2610,8 +2848,9 @@ fn set_viewport(device_context: &ID3D11DeviceContext, width: f32, height: f32) -
     viewport[0]
 }
 
-#[inline]
-fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceContext) -> Result<()> {
+/// The rasterizer state scene geometry is drawn with, cutting it to the scissor rectangle if
+/// `scissor`.
+fn create_rasterizer_state(device: &ID3D11Device, scissor: bool) -> Result<ID3D11RasterizerState> {
     let desc = D3D11_RASTERIZER_DESC {
         FillMode: D3D11_FILL_SOLID,
         CullMode: D3D11_CULL_NONE,
@@ -2620,17 +2859,13 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
         DepthBiasClamp: 0.0,
         SlopeScaledDepthBias: 0.0,
         DepthClipEnable: true.into(),
-        ScissorEnable: false.into(),
+        ScissorEnable: scissor.into(),
         MultisampleEnable: true.into(),
         AntialiasedLineEnable: false.into(),
     };
-    let rasterizer_state = unsafe {
-        let mut state = None;
-        device.CreateRasterizerState(&desc, Some(&mut state))?;
-        state.unwrap()
-    };
-    unsafe { device_context.RSSetState(&rasterizer_state) };
-    Ok(())
+    let mut state = None;
+    unsafe { device.CreateRasterizerState(&desc, Some(&mut state))? };
+    state.context("creating a rasterizer state")
 }
 
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ns-d3d11-d3d11_blend_desc
@@ -2794,13 +3029,29 @@ fn create_buffer_view(
 ) -> Result<Option<ID3D11ShaderResourceView>> {
     let mut buffer_desc = D3D11_BUFFER_DESC::default();
     unsafe { buffer.GetDesc(&mut buffer_desc) };
+    create_buffer_section_view(device, buffer, 0, buffer_desc.ByteWidth as usize)
+}
+
+/// A raw view of `byte_len` bytes of `buffer` from `byte_offset`, both multiples of four.
+fn create_buffer_section_view(
+    device: &ID3D11Device,
+    buffer: &ID3D11Buffer,
+    byte_offset: usize,
+    byte_len: usize,
+) -> Result<Option<ID3D11ShaderResourceView>> {
+    anyhow::ensure!(
+        byte_offset.is_multiple_of(4) && byte_len.is_multiple_of(4),
+        "a raw buffer view must start and end on four-byte boundaries"
+    );
     let desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
         ViewDimension: D3D11_SRV_DIMENSION_BUFFEREX,
         Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
             BufferEx: D3D11_BUFFEREX_SRV {
-                FirstElement: 0,
-                NumElements: buffer_desc.ByteWidth / 4,
+                FirstElement: u32::try_from(byte_offset / 4)
+                    .context("buffer view offset exceeds the D3D11 limit")?,
+                NumElements: u32::try_from(byte_len / 4)
+                    .context("buffer view length exceeds the D3D11 limit")?,
                 Flags: D3D11_BUFFEREX_SRV_FLAG_RAW.0 as u32,
             },
         },
@@ -2825,10 +3076,93 @@ fn update_buffer<T>(
     Ok(())
 }
 
-/// Converts a render-plan slice into draw arguments, refusing ranges D3D11 cannot address.
-fn instance_range(range: &std::ops::Range<usize>) -> Result<InstanceRange> {
-    InstanceRange::new(range.clone())
-        .with_context(|| format!("batch {range:?} exceeds the D3D11 instance limit"))
+/// Writes each of `sections` into `buffer` from its element offset in `offsets`, discarding
+/// what was there; what lies between them is left undefined.
+fn update_buffer_sections<T>(
+    device_context: &ID3D11DeviceContext,
+    buffer: &ID3D11Buffer,
+    sections: &[&[T]],
+    offsets: &[usize],
+) -> Result<()> {
+    debug_assert_eq!(sections.len(), offsets.len());
+    unsafe {
+        let mut dest = std::mem::zeroed();
+        device_context.Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut dest))?;
+        let dest = dest.pData.cast::<T>();
+        // SAFETY: the buffer holds the sections' extent, which the callers grew it to.
+        for (section, &offset) in sections.iter().zip(offsets) {
+            std::ptr::copy_nonoverlapping(section.as_ptr(), dest.add(offset), section.len());
+        }
+        device_context.Unmap(buffer, 0);
+    }
+    Ok(())
+}
+
+/// Converts a render-plan slice of a scene whose instances start at `base` in the frame's
+/// buffer into draw arguments, refusing ranges D3D11 cannot address.
+fn instance_range(range: &std::ops::Range<usize>, base: u32) -> Result<InstanceRange> {
+    let base = base as usize;
+    range
+        .start
+        .checked_add(base)
+        .zip(range.end.checked_add(base))
+        .and_then(|(start, end)| InstanceRange::new(start..end))
+        .with_context(|| format!("batch {range:?} from {base} exceeds the D3D11 instance limit"))
+}
+
+/// The scissor rectangle, in `target`'s pixels, that keeps what is drawn into it inside
+/// `clip`, a window viewport rectangle.
+fn chunk_scissor(target: &FrameTarget, clip: Bounds<ScaledPixels>) -> RECT {
+    let (width, height) = (
+        target.bounds.size.width.0.max(0) as f32,
+        target.bounds.size.height.0.max(0) as f32,
+    );
+    let origin = (
+        target.bounds.origin.x.0 as f32,
+        target.bounds.origin.y.0 as f32,
+    );
+    let left = (clip.origin.x.0 - origin.0).floor().clamp(0., width);
+    let top = (clip.origin.y.0 - origin.1).floor().clamp(0., height);
+    let right = (clip.origin.x.0 + clip.size.width.0 - origin.0)
+        .ceil()
+        .clamp(left, width);
+    let bottom = (clip.origin.y.0 + clip.size.height.0 - origin.1)
+        .ceil()
+        .clamp(top, height);
+    RECT {
+        left: left as i32,
+        top: top as i32,
+        right: right as i32,
+        bottom: bottom as i32,
+    }
+}
+
+/// The viewport bounds that contain `bounds` moved by `transformation`.
+fn transformed_bounds(
+    transformation: &TransformationMatrix,
+    bounds: Bounds<ScaledPixels>,
+) -> Bounds<ScaledPixels> {
+    let corners = [
+        bounds.origin,
+        point(bounds.origin.x + bounds.size.width, bounds.origin.y),
+        point(bounds.origin.x, bounds.origin.y + bounds.size.height),
+        point(
+            bounds.origin.x + bounds.size.width,
+            bounds.origin.y + bounds.size.height,
+        ),
+    ]
+    .map(|corner| transformation.apply(corner.map(|value| px(value.0))));
+    let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for corner in corners {
+        left = left.min(f32::from(corner.x));
+        top = top.min(f32::from(corner.y));
+        right = right.max(f32::from(corner.x));
+        bottom = bottom.max(f32::from(corner.y));
+    }
+    Bounds {
+        origin: point(ScaledPixels(left), ScaledPixels(top)),
+        size: size(ScaledPixels(right - left), ScaledPixels(bottom - top)),
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -3156,13 +3490,14 @@ mod tests {
     use crate::directx_devices::DirectXDevices;
     use anyhow::{Context as _, Result};
     use gpui::{
-        AtlasKey, AtlasTile, BorderStyle, Bounds, ContentMask, Corners, DevicePixels, Edges,
-        ImageId, MonochromeSprite, PlatformAtlas, Point, PolychromeSprite, PrimitiveBatch, Quad,
-        RenderCommand, RenderImageParams, RenderSvgParams, ScaledPixels, Scene, SceneClip,
-        SceneTransform, ShaderBool, Size, TransformationMatrix, WindowBackgroundAppearance, hsla,
-        rgb, rgb_to_hsla, solid_background,
+        AtlasKey, AtlasTile, BorderStyle, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
+        ImageId, MonochromeSprite, PlacedChunk, PlatformAtlas, Point, PolychromeSprite, Primitive,
+        PrimitiveBatch, Quad, RenderCommand, RenderImageParams, RenderSvgParams, ScaledPixels,
+        Scene, SceneChunk, SceneClip, ScenePaintRef, SceneTransform, ShaderBool, Size,
+        TransformationMatrix, WindowBackgroundAppearance, hsla, rgb, rgb_to_hsla, solid_background,
     };
     use std::borrow::Cow;
+    use std::rc::Rc;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_OVERLAPPED,
@@ -3475,6 +3810,103 @@ mod tests {
                 (r, g, b) == (0, 255, 0),
                 painted,
                 "{what} at ({x},{y}) rendered ({r},{g},{b})"
+            );
+        }
+        Ok(())
+    }
+
+    /// A chunk drawn twice, scaled and clipped, then moved, lands where each placement puts
+    /// it, cut to its clip; the window's own quads, before and after it, still read theirs.
+    #[test]
+    fn chunks_draw_at_their_placements() -> Result<()> {
+        let window = HiddenWindow::new()?;
+        let devices = DirectXDevices::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        renderer.resize(Size {
+            width: DevicePixels(200),
+            height: DevicePixels(100),
+        })?;
+        let red = rgb_to_hsla(rgb(0xff0000));
+        let green = rgb_to_hsla(rgb(0x00ff00));
+        let blue = rgb_to_hsla(rgb(0x0000ff));
+        let quad = |bounds, color: Hsla| Quad {
+            bounds,
+            content_mask: full_mask(),
+            background: ScenePaintRef {
+                color: color.into(),
+                paint: 0,
+            },
+            ..Default::default()
+        };
+
+        // Green then blue, side by side, 20 pixels square, at the chunk's origin.
+        let mut chunk_scene = Scene::default();
+        chunk_scene.insert_primitive(quad(scaled(0.0, 0.0, 20.0, 20.0), green));
+        chunk_scene.insert_primitive(quad(scaled(20.0, 0.0, 20.0, 20.0), blue));
+        chunk_scene.finish();
+        let chunk = Rc::new(SceneChunk {
+            scene: chunk_scene,
+            bounds: scaled(0.0, 0.0, 40.0, 20.0),
+        });
+        let placed = |placement: TransformationMatrix, bounds, clip| {
+            Primitive::Chunk(PlacedChunk {
+                order: 0,
+                chunk: chunk.clone(),
+                placement,
+                bounds,
+                content_mask: ContentMask {
+                    bounds: clip,
+                    ..Default::default()
+                },
+            })
+        };
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(scaled(0.0, 30.0, 10.0, 10.0), red));
+        // Doubled at (100, 10): green over x 100..140, blue over 140..180, cut at 160.
+        scene.insert_primitive(placed(
+            TransformationMatrix {
+                rotation_scale: [[2.0, 0.0], [0.0, 2.0]],
+                translation: [100.0, 10.0],
+            },
+            scaled(100.0, 10.0, 80.0, 40.0),
+            scaled(100.0, 10.0, 60.0, 40.0),
+        ));
+        // As it is, at (0, 60).
+        scene.insert_primitive(placed(
+            TransformationMatrix {
+                rotation_scale: [[1.0, 0.0], [0.0, 1.0]],
+                translation: [0.0, 60.0],
+            },
+            scaled(0.0, 60.0, 40.0, 20.0),
+            scaled(0.0, 0.0, 200.0, 100.0),
+        ));
+        scene.insert_primitive(quad(scaled(180.0, 80.0, 20.0, 20.0), red));
+        scene.finish();
+        assert!(
+            scene
+                .render_commands()
+                .iter()
+                .any(|command| matches!(command, RenderCommand::Batch(PrimitiveBatch::Chunks(_)))),
+            "the scene must draw its chunks as chunks"
+        );
+
+        let image = renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+        for (what, x, y, expected) in [
+            ("doubled chunk, green", 110, 30, [0, 255, 0]),
+            ("doubled chunk, blue", 150, 30, [0, 0, 255]),
+            ("doubled chunk, past its clip", 170, 30, [255, 255, 255]),
+            ("moved chunk, green", 10, 70, [0, 255, 0]),
+            ("moved chunk, blue", 30, 70, [0, 0, 255]),
+            ("where the chunk was recorded", 10, 10, [255, 255, 255]),
+            ("window quad before the chunks", 5, 35, [255, 0, 0]),
+            ("window quad after the chunks", 190, 90, [255, 0, 0]),
+        ] {
+            let [r, g, b, _] = image.get_pixel(x, y).0;
+            let close = |actual: u8, wanted: u8| actual.abs_diff(wanted) <= 8;
+            assert!(
+                close(r, expected[0]) && close(g, expected[1]) && close(b, expected[2]),
+                "{what} at ({x},{y}) rendered ({r},{g},{b}), expected {expected:?}"
             );
         }
         Ok(())
