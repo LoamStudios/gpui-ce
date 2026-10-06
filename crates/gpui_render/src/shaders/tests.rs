@@ -53,6 +53,55 @@ fn shader_interface_matches_generated_sources() {
     );
     assert_eq!(quad::QUADS.group(), interface::DATA_BIND_GROUP);
     assert_eq!(quad::QUADS.binding(), interface::DATA_BUFFER_BINDING);
+    assert_eq!(common::TRANSFORMS.group(), interface::GLOBAL_BIND_GROUP);
+    assert_eq!(common::TRANSFORMS.binding(), interface::TRANSFORMS_BINDING);
+    assert_eq!(common::CLIPS.group(), interface::GLOBAL_BIND_GROUP);
+    assert_eq!(common::CLIPS.binding(), interface::CLIPS_BINDING);
+}
+
+#[test]
+fn native_slots_give_every_binding_its_own_slot() {
+    let module = naga::front::wgsl::parse_str(&base::WGSL_SOURCE.wgsl_source().unwrap()).unwrap();
+    let global_bindings = module
+        .global_variables
+        .iter()
+        .filter_map(|(_, variable)| variable.binding.as_ref())
+        .filter(|binding| binding.group == interface::GLOBAL_BIND_GROUP)
+        .map(|binding| binding.binding + 1)
+        .max();
+    assert_eq!(global_bindings, Some(interface::GLOBAL_BINDING_COUNT));
+
+    let mut slots = std::collections::BTreeSet::new();
+    for group in [interface::GLOBAL_BIND_GROUP, interface::DATA_BIND_GROUP] {
+        for binding in 0..interface::GLOBAL_BINDING_COUNT {
+            assert!(
+                slots.insert(interface::native_slot(group, binding)),
+                "binding {group}:{binding} shares a native slot"
+            );
+        }
+    }
+    assert!(
+        interface::MSL_BUFFER_SIZES_SLOT
+            > interface::native_slot(interface::DATA_BIND_GROUP, interface::DATA_BUFFER_BINDING)
+    );
+    assert_ne!(
+        interface::DX11_DRAW_CONSTANTS_REGISTER,
+        interface::native_slot(
+            interface::GLOBAL_BIND_GROUP,
+            interface::GLOBAL_UNIFORMS_BINDING
+        )
+    );
+    assert_ne!(
+        interface::DX11_DRAW_CONSTANTS_REGISTER,
+        interface::native_slot(
+            interface::GLOBAL_BIND_GROUP,
+            interface::FONT_RASTERIZATION_BINDING
+        )
+    );
+    assert_ne!(
+        interface::DX11_DRAW_CONSTANTS_REGISTER,
+        interface::native_slot(interface::DATA_BIND_GROUP, interface::DATA_BUFFER_BINDING)
+    );
 }
 
 fn vertex_output_shape(module: &naga::Module, entry_name: &str) -> (usize, u32) {

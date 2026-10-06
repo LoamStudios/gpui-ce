@@ -179,6 +179,38 @@ mod tests {
         );
     }
 
+    /// Group-0 tables are whole-frame data textures read from texel zero, unlike instances,
+    /// which each draw reads from its `DATA_RANGE` base.
+    #[test]
+    fn downlevel_scene_tables_are_read_from_texel_zero() {
+        for (loader, stride) in [
+            (
+                "dl_load_TRANSFORMS",
+                std::mem::size_of::<gpui::SceneTransform>(),
+            ),
+            ("dl_load_CLIPS", std::mem::size_of::<gpui::SceneClip>()),
+        ] {
+            let body = generated_function(BASE_DOWNLEVEL_WGSL, loader);
+            assert!(
+                body.starts_with("(i: u32)")
+                    && body.contains(&format!("_DATA, i * {}u)", stride / 4)),
+                "{loader} must index its table by the host stride from texel zero: {body}"
+            );
+            assert!(
+                !body.contains("DATA_RANGE"),
+                "{loader} must not use a draw's range"
+            );
+        }
+        assert!(
+            BASE_DOWNLEVEL_WGSL
+                .contains("@group(0) @binding(2) var TRANSFORMS_DATA: texture_2d<u32>;")
+                && BASE_DOWNLEVEL_WGSL
+                    .contains("@group(0) @binding(3) var CLIPS_DATA: texture_2d<u32>;"),
+            "downlevel scene tables must be group-0 data textures at their storage bindings"
+        );
+        assert!(!BASE_DOWNLEVEL_WGSL.contains("var<storage"));
+    }
+
     #[test]
     fn downlevel_quad_decoder_uses_host_dash_offsets_and_stride() {
         let decoder = generated_function(BASE_DOWNLEVEL_WGSL, "dl_load_Quad_impl");

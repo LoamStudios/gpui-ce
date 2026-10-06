@@ -84,6 +84,16 @@ struct NativeShaderModule {
 struct StorageArray {
     name: String,
     element_type: String,
+    group: u32,
+    binding: u32,
+}
+
+impl StorageArray {
+    /// Group-1 arrays hold a whole frame's instances, of which each draw reads a range; group-0
+    /// arrays are frame tables that every draw reads from index 0.
+    fn is_instance_range(&self) -> bool {
+        self.group == shaders::interface::DATA_BIND_GROUP
+    }
 }
 
 fn main() {
@@ -181,6 +191,12 @@ fn main() {
     ];
     let downlevel_layouts = [
         BindingLayout {
+            constant: "DOWNLEVEL_GLOBAL_BINDINGS",
+            source: &downlevel.source,
+            group: shaders::interface::GLOBAL_BIND_GROUP,
+            dialect: ReflectionDialect::Downlevel,
+        },
+        BindingLayout {
             constant: "DOWNLEVEL_INSTANCE_BINDINGS",
             source: &downlevel_quad,
             group: shaders::interface::DATA_BIND_GROUP,
@@ -259,6 +275,10 @@ fn validate_artifact(artifact: &ShaderArtifact) {
 }
 
 /// Lowers modern WGSL to the downlevel dialect: storage arrays become texel loads.
+///
+/// Each storage array becomes a data texture at its own binding. The group-1 instance array
+/// is shared by a frame's draws, so its loads are offset by the draw's `DATA_RANGE`; group-0
+/// tables are read whole.
 fn downlevel_dialect(name: &str, source: &str) -> String {
     let mut transformed = String::with_capacity(source.len() + 4096);
     let mut arrays = Vec::new();
@@ -267,8 +287,8 @@ fn downlevel_dialect(name: &str, source: &str) -> String {
         let trimmed = line.trim();
         if let Some(array) = parse_storage_array_decl(trimmed) {
             transformed.push_str(&format!(
-                "@group(1) @binding(0) var {}_DATA: texture_2d<u32>;\n",
-                array.name
+                "@group({}) @binding({}) var {}_DATA: texture_2d<u32>;\n",
+                array.group, array.binding, array.name
             ));
             arrays.push(array);
         } else {
@@ -293,8 +313,21 @@ fn downlevel_dialect(name: &str, source: &str) -> String {
 }
 
 fn parse_storage_array_decl(line: &str) -> Option<StorageArray> {
-    let rest = line.strip_prefix("@group(1) @binding(0) var<storage, read> ")?;
+    let rest = line.strip_prefix("@group(")?;
+    let (group, rest) = rest.split_once(") @binding(")?;
+    let (binding, rest) = rest.split_once(") var<storage, read> ")?;
     let (name, rest) = rest.split_once(": array<")?;
+    let group = group.parse().ok()?;
+    let binding = binding.parse().ok()?;
+    match group {
+        shaders::interface::GLOBAL_BIND_GROUP => {}
+        shaders::interface::DATA_BIND_GROUP => assert_eq!(
+            binding,
+            shaders::interface::DATA_BUFFER_BINDING,
+            "the downlevel transport carries group-1 instances only at the data binding"
+        ),
+        _ => panic!("storage array {name} is in unsupported group {group}"),
+    }
     let type_name = rest
         .strip_suffix(';')?
         .strip_suffix('>')?
@@ -307,6 +340,8 @@ fn parse_storage_array_decl(line: &str) -> Option<StorageArray> {
     Some(StorageArray {
         name: name.trim().to_string(),
         element_type: type_name,
+        group,
+        binding,
     })
 }
 
@@ -348,17 +383,19 @@ fn emit_downlevel_runtime(name: &str, base_source: &str, arrays: &[StorageArray]
         "const DATA_TEXTURE_WIDTH: u32 = {DATA_TEXTURE_WIDTH}u;"
     )
     .unwrap();
-    writeln!(
-        runtime,
-        "struct DataRange {{
+    if arrays.iter().any(StorageArray::is_instance_range) {
+        writeln!(
+            runtime,
+            "struct DataRange {{
     base_texel: u32,
     element_count: u32,
     padding0: u32,
     padding1: u32,
 }}
 @group(1) @binding({DOWNLEVEL_RANGE_BINDING}) var<uniform> DATA_RANGE: DataRange;"
-    )
-    .unwrap();
+        )
+        .unwrap();
+    }
     writeln!(
         runtime,
         "fn dl_scene_word(t: texture_2d<u32>, base: u32, w: u32) -> u32 {{
@@ -383,10 +420,15 @@ fn emit_downlevel_runtime(name: &str, base_source: &str, arrays: &[StorageArray]
         let handle = find_type(&module, &array.element_type, name);
         emit_type_decoder(&module, &layouter, handle, &mut runtime, &mut emitted);
         let words = words_per_element(&layouter, handle);
+        let base_word = if array.is_instance_range() {
+            "DATA_RANGE.base_texel * 4u + "
+        } else {
+            ""
+        };
         writeln!(
             runtime,
             "fn dl_load_{array_name}(i: u32) -> {type_name} {{
-    return dl_load_{type_name}_impl({array_name}_DATA, DATA_RANGE.base_texel * 4u + i * {words}u);
+    return dl_load_{type_name}_impl({array_name}_DATA, {base_word}i * {words}u);
 }}",
             array_name = array.name,
             type_name = array.element_type,
@@ -1231,7 +1273,7 @@ fn write_hlsl(
                 binding.clone(),
                 naga_old::back::hlsl::BindTarget {
                     space: 0,
-                    register: binding.binding + if binding.group == 0 { 0 } else { 2 },
+                    register: shaders::interface::native_slot(binding.group, binding.binding),
                     ..Default::default()
                 },
             );
@@ -1306,8 +1348,13 @@ fn write_msl(module: &naga::Module, info: &naga::valid::ModuleInfo, label: &str)
         };
         let target = match variable.space {
             naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. } => {
+                let slot = shaders::interface::native_slot(binding.group, binding.binding);
+                assert!(
+                    slot < shaders::interface::MSL_BUFFER_SIZES_SLOT,
+                    "MSL buffer slot {slot} of {label} collides with the buffer sizes"
+                );
                 naga::back::msl::BindTarget {
-                    buffer: Some((binding.binding + if binding.group == 0 { 0 } else { 2 }) as u8),
+                    buffer: Some(slot as u8),
                     ..Default::default()
                 }
             }
@@ -1328,7 +1375,7 @@ fn write_msl(module: &naga::Module, info: &naga::valid::ModuleInfo, label: &str)
     }
     let entry_resources = naga::back::msl::EntryPointResources {
         resources,
-        sizes_buffer: Some(3),
+        sizes_buffer: Some(shaders::interface::MSL_BUFFER_SIZES_SLOT as u8),
         ..Default::default()
     };
     let per_entry_point_map = module
@@ -1342,12 +1389,31 @@ fn write_msl(module: &naga::Module, info: &naga::valid::ModuleInfo, label: &str)
         fake_missing_bindings: false,
         ..Default::default()
     };
-    naga::back::msl::write_string(
+    let source = naga::back::msl::write_string(
         module,
         info,
         &options,
         &naga::back::msl::PipelineOptions::default(),
     )
     .map(|(source, _)| source)
-    .unwrap_or_else(|error| panic!("failed to generate MSL for {label}: {error}"))
+    .unwrap_or_else(|error| panic!("failed to generate MSL for {label}: {error}"));
+    assert_msl_buffer_sizes_unread(&source, label);
+    source
+}
+
+/// Renderers bind `MSL_BUFFER_SIZES_BYTES` of placeholder sizes rather than tracking which
+/// runtime arrays each entry point reaches, which is sound only while nothing reads them.
+fn assert_msl_buffer_sizes_unread(source: &str, label: &str) {
+    assert!(
+        !source.contains("_buffer_sizes."),
+        "{label}: generated MSL reads runtime-array sizes, which renderers do not bind"
+    );
+    let sizes = source
+        .split_once("struct _mslBufferSizes {")
+        .and_then(|(_, rest)| rest.split_once("};"))
+        .map_or(0, |(members, _)| members.matches("uint size").count());
+    assert!(
+        sizes as u32 * 4 <= shaders::interface::MSL_BUFFER_SIZES_BYTES,
+        "{label}: generated MSL declares {sizes} runtime-array sizes, more than renderers bind"
+    );
 }
