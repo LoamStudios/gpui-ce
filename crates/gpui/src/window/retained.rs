@@ -37,6 +37,8 @@ pub(crate) struct Subframe<T, P> {
     pub(crate) id: SubframeId,
     pub(crate) placement: P,
     pub(crate) entries: Vec<Entry<T, P>>,
+    /// How many items it holds, its subframes' included.
+    pub(crate) len: usize,
 }
 
 /// Where a retained list is, for rolling back to: how many subframes are
@@ -119,13 +121,22 @@ impl<T, P> RetainedList<T, P> {
         self.open.push((id, Vec::new()));
     }
 
-    /// Ends the innermost subframe, placed in its parent by `placement`.
-    pub(crate) fn end(&mut self, placement: P) {
+    /// Ends the innermost subframe, placed in its parent by what `placement`
+    /// makes of its entries.
+    pub(crate) fn end(&mut self, placement: impl FnOnce(&[Entry<T, P>]) -> P) {
         let (id, entries) = self.open.pop().expect("ended a subframe that wasn't begun");
+        let len = entries
+            .iter()
+            .map(|entry| match entry {
+                Entry::Item(_) => 1,
+                Entry::Subframe(subframe) => subframe.len,
+            })
+            .sum();
         self.current().push(Entry::Subframe(Box::new(Subframe {
             id,
-            placement,
+            placement: placement(&entries),
             entries,
+            len,
         })));
     }
 
@@ -226,7 +237,7 @@ mod tests {
         previous.begin(view);
         previous.push(10);
         previous.push(11);
-        previous.end(0);
+        previous.end(|_| 0);
         previous.push(2);
         previous.make_available();
 
@@ -247,8 +258,8 @@ mod tests {
         previous.push(5);
         previous.begin(inner);
         previous.push(20);
-        previous.end(0);
-        previous.end(0);
+        previous.end(|_| 0);
+        previous.end(|_| 0);
         previous.make_available();
 
         let mut next = RetainedList::default();
@@ -258,7 +269,7 @@ mod tests {
         next.begin(outer_again);
         next.push(6);
         assert!(next.reuse(&mut previous, inner, |_| 1));
-        next.end(0);
+        next.end(|_| 0);
         assert_eq!(flattened(&next), [6, 21]);
     }
 
@@ -269,7 +280,7 @@ mod tests {
         let index = list.index();
         list.begin(SubframeId::next());
         list.push(2);
-        list.end(0);
+        list.end(|_| 0);
         list.push(3);
         list.truncate(index);
         assert_eq!(flattened(&list), [1]);

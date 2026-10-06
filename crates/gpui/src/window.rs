@@ -910,36 +910,35 @@ pub(crate) struct CursorStyleRequest {
 pub struct HitTest {
     // HitboxIds which were included in the test's click path (the last of which will be the box that caused occlusion)
     ordered_ids: SmallVec<[HitboxId; 8]>,
-    // metadata about all hitboxes, even those outside the test's path
+    // metadata about the hitboxes the position hits, even those behind an
+    // occluding one
     entries: HashMap<HitboxId, HitTestEntry>,
+    // how many hitboxes the frame holds
+    hitbox_count: usize,
     // the number of hitbox ids in `ordered_ids` which support mouse. anything after this amount only support scroll.
     hover_hitbox_count: usize,
 }
 
 impl HitTest {
-    /// Creates a new hit-test by iterating the provided hitboxes, front to
-    /// back, each with whether the position hits it, to find all those which
-    /// are not occluded.
-    fn new<'a>(hitboxes: impl Iterator<Item = (&'a Hitbox, bool)>) -> Self {
+    /// Creates a new hit-test from the hitboxes the position hits, front to
+    /// back, each with its depth among the frame's `hitbox_count`, to find
+    /// all those which are not occluded.
+    fn new<'a>(hits: impl Iterator<Item = (&'a Hitbox, usize)>, hitbox_count: usize) -> Self {
         let mut num_until_mouse_blocked = None::<usize>;
         let mut ids_until_occlusion = SmallVec::default();
         let mut entries = HashMap::default();
         let mut found_hit_occlusion = false;
-        // index is 0=closest to viewer, n=farthest from viewer
-        for (index, (hitbox, hit)) in hitboxes.enumerate() {
+        // depth is 0=closest to viewer, n=farthest from viewer
+        for (hitbox, depth) in hits {
             entries.insert(
                 hitbox.id,
                 HitTestEntry {
-                    depth: index,
+                    depth,
                     tags: hitbox.tags.clone(),
                 },
             );
 
             if found_hit_occlusion {
-                continue;
-            }
-
-            if !hit {
                 continue;
             }
 
@@ -959,6 +958,7 @@ impl HitTest {
             hover_hitbox_count: num_until_mouse_blocked.unwrap_or(ids_until_occlusion.len()),
             ordered_ids: ids_until_occlusion,
             entries,
+            hitbox_count,
         }
     }
 
@@ -974,7 +974,7 @@ impl HitTest {
         self.ordered_ids.iter()
     }
 
-    /// Returns metadata about a hitbox included in this hit-test.
+    /// Returns metadata about a hitbox the position hits, occluded or not.
     pub fn entry(&self, id: &HitboxId) -> Option<&HitTestEntry> {
         self.entries.get(id)
     }
@@ -1189,6 +1189,8 @@ pub(crate) struct HitboxPlacement {
     /// recorded masks leave out, and the clips set under transforms.
     clip: Bounds<Pixels>,
     transformed_clips: Option<Arc<[HitboxClip]>>,
+    /// What its hitboxes cover, in the coordinates they were recorded in.
+    bounds: Bounds<Pixels>,
 }
 
 impl HitboxPlacement {
@@ -1202,28 +1204,57 @@ impl HitboxPlacement {
                     .iter()
                     .all(|(bounds, to_clip)| bounds.contains(&to_clip.apply(point)))
             });
-        (!clipped).then(|| self.to_recorded.apply(point))
+        let recorded = self.to_recorded.apply(point);
+        (!clipped && self.bounds.contains(&recorded)).then_some(recorded)
     }
 }
 
-/// Every hitbox of `entries`, front to back, each with whether `point`, in
-/// the coordinates they sit in, hits it; `None` when nothing in them can be
-/// hit there.
-fn hitboxes_front_to_back<'a>(
+/// What the hitboxes of `entries` cover, in the coordinates they sit in.
+fn hitbox_bounds(entries: &[Entry<Hitbox, HitboxPlacement>]) -> Bounds<Pixels> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Item(hitbox) => {
+                let bounds = hitbox
+                    .bounds
+                    .intersect(&hitbox.recorded_content_mask.bounds);
+                match hitbox.to_element {
+                    Some(to_element) => Some(transformed_bounds(&to_element.inverse()?, bounds)),
+                    None => Some(bounds),
+                }
+            }
+            Entry::Subframe(subframe) => {
+                let placement = &subframe.placement;
+                let to_here = placement.to_recorded.inverse()?;
+                Some(transformed_bounds(&to_here, placement.bounds).intersect(&placement.clip))
+            }
+        })
+        .filter(|bounds| !bounds.is_empty())
+        .reduce(|bounds, other| bounds.union(&other))
+        .unwrap_or_default()
+}
+
+/// The hitboxes of `entries` that `point`, in the coordinates they sit in,
+/// hits, front to back, each with its depth: how many hitboxes are in front
+/// of it, counted from `depth`, which ends past them all.
+fn hits_front_to_back<'a>(
     entries: &'a [Entry<Hitbox, HitboxPlacement>],
-    point: Option<Point<Pixels>>,
-    out: &mut Vec<(&'a Hitbox, bool)>,
+    point: Point<Pixels>,
+    depth: &mut usize,
+    out: &mut Vec<(&'a Hitbox, usize)>,
 ) {
     for entry in entries.iter().rev() {
         match entry {
             Entry::Item(hitbox) => {
-                out.push((hitbox, point.is_some_and(|point| hitbox.hit(&point))))
+                if hitbox.hit(&point) {
+                    out.push((hitbox, *depth));
+                }
+                *depth += 1;
             }
-            Entry::Subframe(subframe) => hitboxes_front_to_back(
-                &subframe.entries,
-                point.and_then(|point| subframe.placement.place(point)),
-                out,
-            ),
+            Entry::Subframe(subframe) => match subframe.placement.place(point) {
+                Some(point) => hits_front_to_back(&subframe.entries, point, depth, out),
+                None => *depth += subframe.len,
+            },
         }
     }
 }
@@ -1518,9 +1549,9 @@ impl Frame {
     }
 
     pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
-        let mut hitboxes = Vec::new();
-        hitboxes_front_to_back(self.hitboxes.entries(), Some(position), &mut hitboxes);
-        HitTest::new(hitboxes.into_iter())
+        let (mut hits, mut count) = (Vec::new(), 0);
+        hits_front_to_back(self.hitboxes.entries(), position, &mut count, &mut hits);
+        HitTest::new(hits.into_iter(), count)
     }
 
     pub(crate) fn focus_path(&self) -> SmallVec<[FocusId; 8]> {
@@ -4373,6 +4404,7 @@ impl Window {
             subframe,
             |previous| HitboxPlacement {
                 to_recorded: previous.to_recorded.compose(back),
+                bounds: previous.bounds,
                 ..clip.clone()
             },
         );
@@ -4392,6 +4424,7 @@ impl Window {
             to_recorded: TransformationMatrix::UNIT,
             clip: self.window_content_mask().bounds,
             transformed_clips: self.hitbox_clips(),
+            bounds: Bounds::default(),
         }
     }
 
@@ -4434,7 +4467,10 @@ impl Window {
     /// see [`Self::subframe_placement`].
     pub(crate) fn end_subframe(&mut self, placement: HitboxPlacement) {
         self.subframe_stack.pop();
-        self.next_frame.hitboxes.end(placement);
+        self.next_frame.hitboxes.end(|entries| HitboxPlacement {
+            bounds: hitbox_bounds(entries),
+            ..placement
+        });
     }
 
     pub(crate) fn paint_index(&self) -> PaintIndex {
@@ -8766,7 +8802,7 @@ impl Window {
                 inspector.update(cx, |inspector, _cx| {
                     if let Some(depth) = inspector.pick_depth.as_mut() {
                         *depth += f32::from(delta_y) / SCROLL_PIXELS_PER_LAYER;
-                        let max_depth = self.mouse_hit_test.entries.len() as f32 - 0.5;
+                        let max_depth = self.mouse_hit_test.hitbox_count as f32 - 0.5;
                         if *depth < 0.0 {
                             *depth = 0.0;
                         } else if *depth > max_depth {
@@ -8791,7 +8827,7 @@ impl Window {
     ) -> Option<(HitboxId, crate::InspectorElementId)> {
         if let Some(pick_depth) = inspector.pick_depth {
             let depth = (pick_depth as i64).try_into().unwrap_or(0);
-            let max_skipped = self.mouse_hit_test.entries.len().saturating_sub(1);
+            let max_skipped = self.mouse_hit_test.hitbox_count.saturating_sub(1);
             let skip_count = (depth as usize).min(max_skipped);
             for hitbox_id in self.mouse_hit_test.ordered_ids.iter().skip(skip_count) {
                 if let Some(inspector_id) = frame.inspector_hitboxes.get(hitbox_id) {
@@ -9430,7 +9466,10 @@ mod tests {
                 let hit_test = HitTest::new(
                     [&inline, &background]
                         .into_iter()
-                        .map(|hitbox| (hitbox, hitbox.hit(&position))),
+                        .enumerate()
+                        .filter(|(_, hitbox)| hitbox.hit(&position))
+                        .map(|(depth, hitbox)| (hitbox, depth)),
+                    2,
                 );
                 let mut hovered = Vec::new();
                 let mut scrollable = Vec::new();
@@ -9457,10 +9496,21 @@ mod tests {
                     scrollable
                 );
 
-                for (depth, hitbox) in [&inline, &background].into_iter().enumerate() {
-                    let entry = hit_test.entry(&hitbox.id).unwrap();
-                    assert_eq!(entry.depth(), depth);
-                    assert_eq!(entry.tags(), &hitbox.tags);
+                // Metadata is kept for every hitbox the position hits, behind
+                // an occluding one or not, and none other.
+                for (depth, (hitbox, inside)) in
+                    [(&inline, inside_inline), (&background, inside_background)]
+                        .into_iter()
+                        .enumerate()
+                {
+                    match hit_test.entry(&hitbox.id) {
+                        Some(entry) => {
+                            assert!(inside);
+                            assert_eq!(entry.depth(), depth);
+                            assert_eq!(entry.tags(), &hitbox.tags);
+                        }
+                        None => assert!(!inside),
+                    }
                 }
             }
         }
