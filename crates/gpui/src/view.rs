@@ -1,8 +1,8 @@
 use crate::{
-    AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element, ElementId,
-    Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
-    Pixels, PrepaintStateIndex, Render, RenderOnce, ResolvedDirection, Style, StyleRefinement,
-    TextStyle, UnicodeBidi, WeakEntity,
+    AnyElement, AnyEntity, AnyWeakEntity, App, AppContext as _, Bounds, ContentMask, Context,
+    Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, IsZero,
+    LayoutId, MouseMoveEvent, PaintIndex, Pixels, Point, PrepaintStateIndex, Render, RenderOnce,
+    ResolvedDirection, Style, StyleRefinement, TextStyle, UnicodeBidi, WeakEntity, px,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -278,10 +278,11 @@ impl<T: Render> View for Entity<T> {
 impl<T: Render> Entity<T> {
     /// Embed this entity as a cached [`ViewElement`] laid out at `style`.
     ///
-    /// The rendered subtree is reused until the entity is notified (or the
-    /// cached bounds / text style change). Caching requires a definite size:
-    /// a cached view is laid out from `style` and is *not* measured from its
-    /// contents. Use [`ViewElement::new`] (or `.child(entity)`) for the
+    /// The rendered subtree is reused until the entity is notified (or its
+    /// size or text style change); a view that has only moved, as in a
+    /// scrolling list, is reused where it now is. Caching requires a
+    /// definite size: a cached view is laid out from `style` and is *not*
+    /// measured from its contents. Use [`ViewElement::new`] (or `.child(entity)`) for the
     /// uncached case.
     #[track_caller]
     pub fn cached(self, style: StyleRefinement) -> ViewElement<Entity<T>> {
@@ -342,6 +343,13 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    /// How far the reused prepaint records were moved this frame, for paint
+    /// to move the paint records by the same amount.
+    reuse_offset: Point<Pixels>,
+    /// The records have been moved since the view was last rendered, so the
+    /// closures it registered during paint still hold the coordinates it was
+    /// rendered at.
+    moved_since_render: bool,
 }
 
 #[derive(Default)]
@@ -358,13 +366,64 @@ struct ViewDirectionState {
     contribution: Option<ResolvedDirection>,
 }
 
-#[derive(PartialEq)]
 struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
+    /// Where the records lie relative to `bounds`: moves are rounded to
+    /// whole device pixels, and this is what the rounding left over.
+    records_offset: Point<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
     direction: ResolvedDirection,
     unicode_bidi: UnicodeBidi,
+    /// The view lay entirely inside its content mask when it was recorded,
+    /// so the records hold everything it painted and can be reused at
+    /// another position; a clipped recording is missing what fell outside.
+    unclipped: bool,
+}
+
+/// Whether `bounds` lies entirely inside `content_mask`, edges included —
+/// `Bounds::is_contained_within` excludes the far edges, which a view that
+/// fills its container's width always touches.
+fn unclipped_by(bounds: Bounds<Pixels>, content_mask: &ContentMask<Pixels>) -> bool {
+    let mask = content_mask.bounds;
+    bounds.origin.x >= mask.origin.x
+        && bounds.origin.y >= mask.origin.y
+        && bounds.right() <= mask.right()
+        && bounds.bottom() <= mask.bottom()
+}
+
+impl ViewElementState {
+    /// Whether the records can be reused at `bounds` under `content_mask`:
+    /// exactly as they are, or moved by the returned offset.
+    ///
+    /// A move is rounded to whole device pixels: glyph sprites are snapped to
+    /// the pixel and rasterized for that position, so moving them by a
+    /// fraction of a pixel would blur them. The view under the pointer is not
+    /// moved: the closures it registered during paint hold the coordinates it
+    /// was rendered at, so it is rendered again where it is instead.
+    fn reuse_offset(
+        &self,
+        bounds: Bounds<Pixels>,
+        content_mask: &ContentMask<Pixels>,
+        window: &Window,
+    ) -> Option<Point<Pixels>> {
+        let key = &self.cache_key;
+        let offset = if key.bounds == bounds && key.content_mask == *content_mask {
+            Point::default()
+        } else if key.unclipped && key.bounds.size == bounds.size {
+            let scale_factor = window.scale_factor();
+            (bounds.origin - (key.bounds.origin + key.records_offset))
+                .map(|coordinate| px((coordinate.0 * scale_factor).round() / scale_factor))
+        } else {
+            return None;
+        };
+        if (self.moved_since_render || !offset.is_zero())
+            && bounds.contains(&window.mouse_position())
+        {
+            return None;
+        }
+        Some(offset)
+    }
 }
 
 impl<V: View> Element for ViewElement<V> {
@@ -484,9 +543,12 @@ impl<V: View> Element for ViewElement<V> {
                 window.with_element_state::<ViewElementState, _>(
                     global_id.unwrap(),
                     |element_state, window| {
+                        let content_mask = window.content_mask();
                         let cache_key = ViewElementCacheKey {
                             bounds,
-                            content_mask: window.content_mask(),
+                            records_offset: Point::default(),
+                            unclipped: unclipped_by(bounds, &content_mask),
+                            content_mask,
                             text_style: window.text_style(),
                             direction: window.resolved_direction(),
                             unicode_bidi: window.resolved_unicode_bidi(),
@@ -494,16 +556,31 @@ impl<V: View> Element for ViewElement<V> {
 
                         if request_layout.element.is_none()
                             && let Some(mut element_state) = element_state
-                            && element_state.cache_key == cache_key
+                            && element_state.cache_key.text_style == cache_key.text_style
+                            && element_state.cache_key.direction == cache_key.direction
+                            && element_state.cache_key.unicode_bidi == cache_key.unicode_bidi
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
+                            && let Some(offset) =
+                                element_state.reuse_offset(bounds, &content_mask, window)
                         {
                             let prepaint_start = window.prepaint_index();
-                            window.reuse_prepaint(element_state.prepaint_range.clone());
+                            window.reuse_prepaint_at(element_state.prepaint_range.clone(), offset);
                             cx.entities
                                 .extend_accessed(&element_state.accessed_entities);
                             let prepaint_end = window.prepaint_index();
                             element_state.prepaint_range = prepaint_start..prepaint_end;
+                            element_state.reuse_offset = offset;
+                            element_state.moved_since_render |= !offset.is_zero();
+                            // The records now describe the view here, clipped
+                            // by what clips it here.
+                            let records_origin = element_state.cache_key.bounds.origin
+                                + element_state.cache_key.records_offset
+                                + offset;
+                            element_state.cache_key = ViewElementCacheKey {
+                                records_offset: records_origin - bounds.origin,
+                                ..cache_key
+                            };
 
                             return (None, element_state);
                         }
@@ -550,6 +627,8 @@ impl<V: View> Element for ViewElement<V> {
                                 prepaint_range: prepaint_start..prepaint_end,
                                 paint_range: PaintIndex::default()..PaintIndex::default(),
                                 cache_key,
+                                reuse_offset: Point::default(),
+                                moved_since_render: false,
                             },
                         )
                     },
@@ -575,7 +654,7 @@ impl<V: View> Element for ViewElement<V> {
         &mut self,
         global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         element: &mut Self::PrepaintState,
         window: &mut Window,
@@ -598,11 +677,30 @@ impl<V: View> Element for ViewElement<V> {
                                 element.paint(window, cx);
                                 window.refreshing = refreshing;
                             } else {
-                                window.reuse_paint(element_state.paint_range.clone());
+                                window.reuse_paint_at(
+                                    element_state.paint_range.clone(),
+                                    element_state.reuse_offset,
+                                );
                             }
 
                             let paint_end = window.paint_index();
                             element_state.paint_range = paint_start..paint_end;
+
+                            if element_state.moved_since_render {
+                                // The moved records still answer mouse events
+                                // with the coordinates the view was rendered
+                                // at, so the view is rendered again once the
+                                // pointer reaches it. Registered after the
+                                // range so it is not reused with it, but made
+                                // anew each frame with the view's bounds then.
+                                window.on_mouse_event(
+                                    move |event: &MouseMoveEvent, phase, _, cx| {
+                                        if phase.bubble() && bounds.contains(&event.position) {
+                                            cx.notify(entity_id);
+                                        }
+                                    },
+                                );
+                            }
 
                             ((), element_state)
                         },
@@ -622,6 +720,9 @@ impl<V: View> Element for ViewElement<V> {
         }
     }
 }
+
+#[cfg(test)]
+mod cached_view_tests;
 
 /// A view that renders nothing
 pub struct EmptyView;

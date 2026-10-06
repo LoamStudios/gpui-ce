@@ -250,6 +250,41 @@ impl Scene {
         }
     }
 
+    /// Replays `range` of `prev_scene` moved by `offset`, clipping every
+    /// primitive to `content_mask` on top of its own (moved) mask.
+    ///
+    /// This is how a cached view is painted again, at the same position or a
+    /// new one: its primitives were recorded where it was, and their masks
+    /// include whatever clipped them there, so the masks move with them and
+    /// are then cut down to what clips them here.
+    pub fn replay_at(
+        &mut self,
+        range: Range<usize>,
+        prev_scene: &Scene,
+        offset: Point<ScaledPixels>,
+        content_mask: &ContentMask<ScaledPixels>,
+    ) {
+        for operation in &prev_scene.paint_operations[range] {
+            match operation {
+                PaintOperation::Primitive(primitive) => {
+                    let mut primitive = primitive.clone();
+                    primitive.translate(offset, content_mask);
+                    self.insert_primitive(primitive);
+                }
+                PaintOperation::Surface { surface, opacity } => {
+                    let mut primitive = Primitive::Surface(surface.clone());
+                    primitive.translate(offset, content_mask);
+                    let Primitive::Surface(surface) = primitive else {
+                        unreachable!()
+                    };
+                    self.insert_surface(surface, *opacity);
+                }
+                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds + offset),
+                PaintOperation::EndLayer => self.pop_layer(),
+            }
+        }
+    }
+
     pub fn finish(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
@@ -445,6 +480,67 @@ impl Primitive {
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::BackdropFilter(filter) => &filter.content_mask,
             Primitive::FilterBoundary(boundary) => &boundary.content_mask,
+        }
+    }
+
+    /// Moves the primitive by `offset`, moving its mask with it and clipping
+    /// that mask to `content_mask`.
+    pub(crate) fn translate(
+        &mut self,
+        offset: Point<ScaledPixels>,
+        content_mask: &ContentMask<ScaledPixels>,
+    ) {
+        let moved = |mask: &mut ContentMask<ScaledPixels>| {
+            *mask = mask.translate(offset).intersect(content_mask);
+        };
+        match self {
+            Primitive::Shadow(shadow) => {
+                shadow.bounds = shadow.bounds + offset;
+                shadow.element_bounds = shadow.element_bounds + offset;
+                moved(&mut shadow.content_mask);
+            }
+            Primitive::Quad(quad) => {
+                quad.bounds = quad.bounds + offset;
+                moved(&mut quad.content_mask);
+            }
+            Primitive::Path(path) => {
+                path.bounds = path.bounds + offset;
+                moved(&mut path.content_mask);
+                for vertex in &mut path.vertices {
+                    vertex.xy_position = vertex.xy_position + offset;
+                    moved(&mut vertex.content_mask);
+                }
+            }
+            Primitive::Underline(underline) => {
+                underline.bounds = underline.bounds + offset;
+                moved(&mut underline.content_mask);
+            }
+            Primitive::MonochromeSprite(sprite) => {
+                sprite.bounds = sprite.bounds + offset;
+                sprite.transformation = sprite.transformation.moved_by(offset);
+                moved(&mut sprite.content_mask);
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                sprite.bounds = sprite.bounds + offset;
+                sprite.transformation = sprite.transformation.moved_by(offset);
+                moved(&mut sprite.content_mask);
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                sprite.bounds = sprite.bounds + offset;
+                moved(&mut sprite.content_mask);
+            }
+            Primitive::Surface(surface) => {
+                surface.bounds = surface.bounds + offset;
+                moved(&mut surface.content_mask);
+            }
+            Primitive::BackdropFilter(filter) => {
+                filter.bounds = filter.bounds + offset;
+                moved(&mut filter.content_mask);
+            }
+            Primitive::FilterBoundary(boundary) => {
+                boundary.bounds = boundary.bounds + offset;
+                moved(&mut boundary.content_mask);
+            }
         }
     }
 }
@@ -1044,6 +1140,20 @@ impl TransformationMatrix {
         }
     }
 
+    /// The same transformation for content moved by `offset`: a sprite is
+    /// transformed about points in window space (an SVG rotates about its
+    /// centre), so those points move with it. Moving the content, then
+    /// applying this, is applying `self` and then moving the result.
+    pub fn moved_by(self, offset: Point<ScaledPixels>) -> Self {
+        if self == Self::unit() {
+            return self;
+        }
+        Self::unit()
+            .translate(offset)
+            .compose(self)
+            .translate(point(ScaledPixels(-offset.x.0), ScaledPixels(-offset.y.0)))
+    }
+
     /// Apply transformation to a point, mainly useful for debugging
     pub fn apply(&self, point: Point<Pixels>) -> Point<Pixels> {
         let input = [point.x.0, point.y.0];
@@ -1309,6 +1419,30 @@ impl PathVertex<Pixels> {
 mod tests {
     use super::*;
     use crate::{AtlasTextureKind, DevicePixels, Point, ShaderBool, Size, SurfaceSource, TileId};
+
+    #[test]
+    fn a_moved_transformation_turns_about_the_moved_point() {
+        // An SVG rotates about its centre, in window space.
+        let center = point(ScaledPixels(50.), ScaledPixels(30.));
+        let rotation = TransformationMatrix::unit()
+            .translate(center)
+            .rotate(Radians(0.7))
+            .scale(Size::new(1.5, 0.5))
+            .translate(point(ScaledPixels(-50.), ScaledPixels(-30.)));
+        let offset = point(ScaledPixels(12.), ScaledPixels(-40.));
+        let moved = rotation.moved_by(offset);
+
+        for corner in [(0., 0.), (100., 0.), (0., 60.), (100., 60.)] {
+            let before = rotation.apply(point(corner.0.into(), corner.1.into()));
+            let after = moved.apply(point((corner.0 + 12.).into(), (corner.1 - 40.).into()));
+            assert!((f32::from(after.x) - (f32::from(before.x) + 12.)).abs() < 1e-3);
+            assert!((f32::from(after.y) - (f32::from(before.y) - 40.)).abs() < 1e-3);
+        }
+        assert_eq!(
+            TransformationMatrix::unit().moved_by(offset),
+            TransformationMatrix::unit()
+        );
+    }
 
     fn sp(value: f32) -> ScaledPixels {
         ScaledPixels(value)
