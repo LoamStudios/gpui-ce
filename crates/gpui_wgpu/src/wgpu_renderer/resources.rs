@@ -102,7 +102,7 @@ struct BlurBindGroups {
 #[derive(Default)]
 struct GroupBindGroups {
     uniform_generation: u64,
-    groups: FxHashMap<(wgpu::TextureView, wgpu::TextureView), wgpu::BindGroup>,
+    groups: FxHashMap<(wgpu::TextureView, wgpu::TextureView, wgpu::TextureView), wgpu::BindGroup>,
 }
 
 pub(super) struct ResourceMetadata {
@@ -292,11 +292,12 @@ impl WgpuResources {
     }
 
     /// The bind group compositing a group from `source`, mixed, for a blend mode other
-    /// than normal, with `backdrop`.
+    /// than normal, with `backdrop`, and cut, when the group is masked, to `mask`.
     pub(super) fn group_bind_group(
         &self,
         source: &wgpu::TextureView,
         backdrop: &wgpu::TextureView,
+        mask: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         let mut cache = self.group_bind_groups.borrow_mut();
         let uniform_generation = self.group_uniforms.generation();
@@ -306,7 +307,7 @@ impl WgpuResources {
         }
         cache
             .groups
-            .entry((source.clone(), backdrop.clone()))
+            .entry((source.clone(), backdrop.clone(), mask.clone()))
             .or_insert_with(|| {
                 self.bind_group_layouts.create_group(
                     &self.device,
@@ -318,6 +319,7 @@ impl WgpuResources {
                     source,
                     backdrop,
                     &self.surface_sampler,
+                    mask,
                 )
             })
             .clone()

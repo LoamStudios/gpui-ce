@@ -228,8 +228,9 @@ impl WgpuRenderer {
     }
 
     /// Composites `group`, an isolated group's finished target, into `parent`: blurred by
-    /// its filters, faded by its opacity, and mixed by its blend mode with a copy of what
-    /// is beneath it in `parent`. Gives the group's textures back to the pool.
+    /// its filters, faded by its opacity, cut to its mask, and mixed by its blend mode
+    /// with a copy of what is beneath it in `parent`. Gives the group's textures, and its
+    /// mask's, back to the pool.
     pub(super) fn composite_group(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -264,16 +265,23 @@ impl WgpuRenderer {
             boundary.opacity,
             boundary.blend_mode,
             backdrop.as_ref().map(|_| group.bounds),
-            None,
+            group
+                .mask
+                .as_ref()
+                .map(|(_, bounds, mode)| (*bounds, *mode)),
         );
         {
             let resources = self.resources();
             let uniform_offset = resources.group_uniforms.write(&uniforms);
-            // The shader reads the backdrop only for blend modes other than normal; the
-            // binding must be filled either way.
+            // The shader reads the backdrop only for blend modes other than normal, and
+            // the mask only for a masked group; the bindings must be filled either way.
             let bind_group = resources.group_bind_group(
                 source,
                 backdrop.as_ref().map_or(source, |backdrop| &backdrop.view),
+                group
+                    .mask
+                    .as_ref()
+                    .map_or(source, |(mask, _, _)| &mask.view),
             );
             let pipeline = &resources.pipelines.group_composite;
             let mut pass = begin_color_render_pass(
@@ -302,6 +310,9 @@ impl WgpuRenderer {
         }
         if let Some(backdrop) = backdrop {
             self.give_back_pooled_texture(backdrop);
+        }
+        if let Some((mask, _, _)) = group.mask {
+            self.give_back_pooled_texture(mask);
         }
         if let Some(texture) = group.texture {
             self.give_back_pooled_texture(PooledTexture {

@@ -3,10 +3,11 @@ use super::{
     buffers::{InstanceTransport, InstanceUpload},
     filters::{FILTER_UNIFORMS_PER_COMPOSITE, FrameUniformRequirements},
     path_types,
+    target_pool::PooledTexture,
 };
 use gpui::{
-    Bounds, DevicePixels, GroupTarget, MonochromeSprite, PolychromeSprite, PrimitiveBatch, Quad,
-    RenderCommand, Scene, Shadow, SubpixelSprite, Underline, point,
+    Bounds, DevicePixels, GroupTarget, MaskMode, MonochromeSprite, PolychromeSprite,
+    PrimitiveBatch, Quad, RenderCommand, Scene, Shadow, SubpixelSprite, Underline, point,
 };
 use gpui_render::group::group_target_bounds;
 use gpui_render::shaders::{
@@ -327,6 +328,21 @@ pub(super) struct FrameTarget {
     pub(super) bounds: Bounds<DevicePixels>,
     /// Where the globals describing this target are in the target globals.
     pub(super) globals_offset: u32,
+    /// A masked group's mask, once drawn: its target, the viewport rectangle that
+    /// covers, and how it masks. Kept out of the pool until the group is composited.
+    pub(super) mask: Option<(PooledTexture, Bounds<DevicePixels>, MaskMode)>,
+}
+
+impl FrameTarget {
+    /// An isolated group's target, to go back to the pool or to be sampled as a mask.
+    fn into_pooled(self) -> PooledTexture {
+        PooledTexture {
+            texture: self
+                .texture
+                .expect("an isolated group's target is taken from the pool"),
+            view: self.view,
+        }
+    }
 }
 
 /// A target of its own for a group covering `bounds` of the viewport, taken from the
@@ -347,6 +363,7 @@ fn group_target(
         texture: Some(pooled.texture),
         bounds,
         globals_offset: renderer.resources().target_globals.write(&globals),
+        mask: None,
     })
 }
 
@@ -381,6 +398,7 @@ impl<'a> FrameEncoder<'a> {
                 size: renderer.target.viewport_size(),
             },
             globals_offset: targets.globals.window_offset,
+            mask: None,
         };
         Self {
             renderer,
@@ -451,7 +469,19 @@ impl<'a> FrameEncoder<'a> {
             wgpu::LoadOp::Clear(self.renderer.target.clear_color()),
         );
 
+        // How many of the groups being drawn are hidden: a mask, or a masked group, that
+        // got no target is not drawn at all, nor is what it holds.
+        let mut hidden = 0usize;
+
         for command in self.scene.render_commands() {
+            if hidden > 0 {
+                match command {
+                    RenderCommand::BeginGroup { .. } => hidden += 1,
+                    RenderCommand::EndGroup { .. } => hidden -= 1,
+                    RenderCommand::Batch(_) => {}
+                }
+                continue;
+            }
             match command {
                 RenderCommand::Batch(PrimitiveBatch::Paths {
                     range,
@@ -508,7 +538,10 @@ impl<'a> FrameEncoder<'a> {
                     &mut self.instances,
                     &mut pass,
                 )?,
-                RenderCommand::BeginGroup { target, .. } => {
+                RenderCommand::BeginGroup {
+                    boundary_index,
+                    target,
+                } => {
                     // A group the plan isolates is drawn in place when it is out of view or
                     // the pool has no room for its target.
                     let group = match target {
@@ -518,6 +551,11 @@ impl<'a> FrameEncoder<'a> {
                         GroupTarget::Inline => None,
                     }
                     .and_then(|bounds| group_target(self.renderer, self.globals.window, bounds));
+                    let boundary = &self.scene.group_boundaries[*boundary_index];
+                    if group.is_none() && (boundary.masked || boundary.mask_mode.is_some()) {
+                        hidden = 1;
+                        continue;
+                    }
                     self.isolated.push(group.is_some());
                     if let Some(group) = group {
                         drop(pass);
@@ -540,16 +578,30 @@ impl<'a> FrameEncoder<'a> {
                             .targets
                             .pop()
                             .expect("an isolated group's target is on the stack");
-                        let parent = self
-                            .targets
-                            .last()
-                            .expect("the window's target is under every group's");
-                        self.renderer.composite_group(
-                            &mut self.encoder,
-                            &self.scene.group_boundaries[*boundary_index],
-                            group,
-                            parent,
-                        );
+                        let boundary = &self.scene.group_boundaries[*boundary_index];
+                        if let Some(mode) = boundary.mask_mode {
+                            // A mask is not composited: the group it masks samples it.
+                            let parent = self
+                                .targets
+                                .last_mut()
+                                .expect("a mask's group is under the mask");
+                            let bounds = group.bounds;
+                            parent.mask = Some((group.into_pooled(), bounds, mode));
+                        } else if boundary.masked && group.mask.is_none() {
+                            // Its mask is out of view: so is all of it.
+                            self.renderer.give_back_pooled_texture(group.into_pooled());
+                        } else {
+                            let parent = self
+                                .targets
+                                .last()
+                                .expect("the window's target is under every group's");
+                            self.renderer.composite_group(
+                                &mut self.encoder,
+                                boundary,
+                                group,
+                                parent,
+                            );
+                        }
                         pass = begin_scene_render_pass(
                             self.renderer,
                             &mut self.encoder,

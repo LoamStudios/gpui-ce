@@ -1,12 +1,12 @@
 //! Renders groups on both WGPU tiers and checks their pixels: a group faded as one
 //! picture, a group multiplied into what is beneath it, groups faded three deep, a
-//! blurred group, and a backdrop filter inside a group. Each group sits away from the
-//! viewport's origin, so its target does too, and a target drawn as if it covered the
-//! viewport would put its pixels somewhere else.
+//! blurred group, a backdrop filter inside a group, and groups masked by alpha and by
+//! luminance. Each group sits away from the viewport's origin, so its target does too,
+//! and a target drawn as if it covered the viewport would put its pixels somewhere else.
 #![cfg(feature = "test-support")]
 
 use gpui::{
-    BackdropFilter, BlendMode, Bounds, ContentMask, DevicePixels, GroupBoundary,
+    BackdropFilter, BlendMode, Bounds, ContentMask, DevicePixels, GroupBoundary, MaskMode,
     PlatformHeadlessRenderer, Point, Quad, ScaledFilter, ScaledPixels, Scene, Size,
     solid_background,
 };
@@ -279,6 +279,155 @@ fn a_backdrop_filter_in_a_group_blurs_the_groups_target() {
                 (10..64).contains(&left) && (64..118).contains(&right),
                 "{what}: the edge must be blurred, got red {left} and {right} either side of it"
             );
+        },
+    );
+}
+
+/// Paints what `contents` paints as one group, made by an element at `bounds`, masked
+/// in `mode` by what `mask` paints within `mask_bounds`: the group's first child group.
+fn masked_group(
+    scene: &mut Scene,
+    bounds: Bounds<ScaledPixels>,
+    mask_bounds: Bounds<ScaledPixels>,
+    mode: MaskMode,
+    mask: impl FnOnce(&mut Scene),
+    contents: impl FnOnce(&mut Scene),
+) {
+    let start = GroupBoundary {
+        order: 0,
+        bounds,
+        content_mask: viewport_mask(),
+        filters: Default::default(),
+        opacity: 1.0,
+        blend_mode: BlendMode::Normal,
+        masked: true,
+        mask_mode: None,
+        is_start: true,
+    };
+    let mask_start = GroupBoundary {
+        bounds: mask_bounds,
+        masked: false,
+        mask_mode: Some(mode),
+        ..start.clone()
+    };
+    scene.insert_primitive(start.clone());
+    scene.insert_primitive(mask_start.clone());
+    mask(scene);
+    scene.insert_primitive(GroupBoundary {
+        is_start: false,
+        ..mask_start
+    });
+    contents(scene);
+    scene.insert_primitive(GroupBoundary {
+        is_start: false,
+        ..start
+    });
+}
+
+#[test]
+fn an_alpha_mask_shows_the_group_only_where_it_is_opaque() {
+    render_on_both_tiers(
+        || {
+            let mut scene = Scene::default();
+            quad(&mut scene, bounds(0.0, 0.0, 100.0, 100.0), 0xffffff);
+            masked_group(
+                &mut scene,
+                bounds(10.0, 10.0, 80.0, 80.0),
+                bounds(30.0, 30.0, 40.0, 40.0),
+                MaskMode::Alpha,
+                // Its colour does not matter, only its coverage.
+                |scene| quad(scene, bounds(30.0, 30.0, 40.0, 40.0), 0x000000),
+                |scene| quad(scene, bounds(10.0, 10.0, 80.0, 80.0), 0xff0000),
+            );
+            scene
+        },
+        |what, image| {
+            assert_rgb(image, what, 50, 50, [255, 0, 0]);
+            assert_rgb(image, what, 32, 68, [255, 0, 0]);
+            assert_rgb(image, what, 15, 15, [255, 255, 255]);
+            assert_rgb(image, what, 85, 50, [255, 255, 255]);
+            assert_rgb(image, what, 50, 27, [255, 255, 255]);
+        },
+    );
+}
+
+#[test]
+fn a_luminance_mask_shows_the_group_where_it_is_white() {
+    render_on_both_tiers(
+        || {
+            let mut scene = Scene::default();
+            quad(&mut scene, bounds(0.0, 0.0, 100.0, 100.0), 0xffffff);
+            let square = bounds(20.0, 20.0, 60.0, 60.0);
+            masked_group(
+                &mut scene,
+                square,
+                square,
+                MaskMode::Luminance,
+                |scene| {
+                    quad(scene, bounds(20.0, 20.0, 30.0, 60.0), 0xffffff);
+                    quad(scene, bounds(50.0, 20.0, 30.0, 60.0), 0x000000);
+                },
+                |scene| quad(scene, square, 0x0000ff),
+            );
+            scene
+        },
+        |what, image| {
+            assert_rgb(image, what, 30, 50, [0, 0, 255]);
+            assert_rgb(image, what, 70, 50, [255, 255, 255]);
+            assert_rgb(image, what, 10, 50, [255, 255, 255]);
+        },
+    );
+}
+
+#[test]
+fn a_mask_partly_outside_its_group_shows_only_their_overlap() {
+    render_on_both_tiers(
+        || {
+            let mut scene = Scene::default();
+            quad(&mut scene, bounds(0.0, 0.0, 100.0, 100.0), 0xffffff);
+            masked_group(
+                &mut scene,
+                bounds(20.0, 20.0, 40.0, 40.0),
+                bounds(40.0, 40.0, 50.0, 50.0),
+                MaskMode::Alpha,
+                |scene| quad(scene, bounds(40.0, 40.0, 50.0, 50.0), 0x000000),
+                |scene| quad(scene, bounds(20.0, 20.0, 40.0, 40.0), 0x00ff00),
+            );
+            scene
+        },
+        |what, image| {
+            assert_rgb(image, what, 50, 50, [0, 255, 0]);
+            assert_rgb(image, what, 42, 58, [0, 255, 0]);
+            // The group without the mask, and the mask without the group.
+            assert_rgb(image, what, 30, 30, [255, 255, 255]);
+            assert_rgb(image, what, 50, 30, [255, 255, 255]);
+            assert_rgb(image, what, 70, 70, [255, 255, 255]);
+            assert_rgb(image, what, 85, 50, [255, 255, 255]);
+        },
+    );
+}
+
+#[test]
+fn a_group_masked_out_of_view_is_not_drawn() {
+    render_on_both_tiers(
+        || {
+            let mut scene = Scene::default();
+            quad(&mut scene, bounds(0.0, 0.0, 100.0, 100.0), 0xffffff);
+            masked_group(
+                &mut scene,
+                bounds(20.0, 20.0, 40.0, 40.0),
+                bounds(200.0, 200.0, 40.0, 40.0),
+                MaskMode::Alpha,
+                |scene| quad(scene, bounds(200.0, 200.0, 40.0, 40.0), 0x000000),
+                |scene| quad(scene, bounds(20.0, 20.0, 40.0, 40.0), 0xff0000),
+            );
+            // What follows the hidden group is still drawn.
+            quad(&mut scene, bounds(70.0, 70.0, 20.0, 20.0), 0x0000ff);
+            scene
+        },
+        |what, image| {
+            assert_rgb(image, what, 40, 40, [255, 255, 255]);
+            assert_rgb(image, what, 80, 80, [0, 0, 255]);
         },
     );
 }
