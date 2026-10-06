@@ -182,18 +182,14 @@ fn native_renderer_fallbacks_and_intermediates_are_lazy() {
     let directx = fs::read_to_string(&directx_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", directx_path.display()));
     assert!(
-        directx.contains("blur: Option<BlurResources>"),
-        "{} must make large filter targets optional",
+        directx.contains("scene_color: Option<ColorTarget>")
+            && directx.contains("target_pool: TexturePool"),
+        "{} must make the offscreen scene target optional and take group and blur targets from a pool",
         directx_path.display()
     );
     assert!(
         directx.contains("path: Option<PathResources>"),
         "{} must make large path targets optional",
-        directx_path.display()
-    );
-    assert!(
-        directx.contains("ensure_blur_resources(device, requirements.isolated_target_count)"),
-        "{} must allocate filter targets from the typed scene requirements",
         directx_path.display()
     );
     assert!(
