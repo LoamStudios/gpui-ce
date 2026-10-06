@@ -4,9 +4,9 @@
 
 use super::*;
 use crate::{
-    AnyWindowHandle, InteractiveElement as _, Modifiers, MouseButton, ParentElement as _,
-    ScaledPixels, ScrollHandle, StatefulInteractiveElement as _, Styled as _, TestAppContext,
-    VisualTestContext, div, hsla, point, px, red,
+    AnyWindowHandle, InteractiveElement as _, ListAlignment, ListState, Modifiers, MouseButton,
+    ParentElement as _, ScaledPixels, ScrollHandle, StatefulInteractiveElement as _, Styled as _,
+    TestAppContext, VisualTestContext, canvas, div, hsla, list, point, px, red,
 };
 use std::{cell::Cell, rc::Rc};
 
@@ -457,4 +457,122 @@ fn cached_view_moved_by_a_fraction_of_a_pixel_is_snapped(cx: &mut TestAppContext
         vec![(0., 198.5, 20., 20.), (0., 198.5, 100., 100.)],
         "the rounding tracks the card's true position rather than accumulating"
     );
+}
+
+/// A 150px-tall `list` of the cached card over a 100px square that asks to be
+/// scrolled into view when told to, below an optional 10px stateful div whose
+/// hitbox shifts every record index in the frame by one.
+struct RollbackList {
+    card: Entity<Card>,
+    state: ListState,
+    request: Rc<Cell<bool>>,
+    extra: Rc<Cell<bool>>,
+}
+
+impl Render for RollbackList {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let card = self.card.clone();
+        let request = self.request.clone();
+        // Inset from the pointer at the window's origin, which would keep the
+        // card from being moved (see `ViewElementState::reuse_offset`).
+        div()
+            .flex()
+            .flex_col()
+            .pl(px(50.))
+            .w(px(250.))
+            .h(px(160.))
+            .children(self.extra.get().then(|| {
+                div()
+                    .id("extra")
+                    .size(px(10.))
+                    .on_mouse_down(MouseButton::Left, |_, _, _| {})
+            }))
+            .child(
+                list(self.state.clone(), move |ix, _, _| match ix {
+                    0 => card.clone().cached(card_style()).into_any_element(),
+                    _ => {
+                        let request = request.clone();
+                        canvas(
+                            move |bounds, window, _| {
+                                if request.replace(false) {
+                                    window.request_autoscroll(bounds);
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .size(px(100.))
+                        .into_any_element()
+                    }
+                })
+                .w(px(200.))
+                .h(px(150.)),
+            )
+    }
+}
+
+/// A `list` prepaints its items, and if one of them asks to be scrolled into
+/// view it rolls the prepaint back (`Window::transact`) and prepaints them
+/// again, scrolled. A cached view reused in the first attempt recorded where
+/// its records lie in *this* frame, and the rollback discarded them; reusing
+/// that record in the second attempt would copy whatever the rendered frame
+/// holds at those indices.
+///
+/// Ported from zed-industries/zed#64236.
+#[crate::test]
+fn cached_view_is_rendered_again_after_its_list_rolls_a_prepaint_back(cx: &mut TestAppContext) {
+    let renders = Rc::new(Cell::new(0));
+    let request = Rc::new(Cell::new(false));
+    let extra = Rc::new(Cell::new(false));
+    let state = ListState::new(2, ListAlignment::Top, px(0.));
+    let window = cx.add_window({
+        let (renders, request, extra) = (renders.clone(), request.clone(), extra.clone());
+        move |_, cx| RollbackList {
+            card: cx.new(|_| Card { renders }),
+            state,
+            request,
+            extra,
+        }
+    });
+    let window = AnyWindowHandle::from(window);
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window, |root, window, cx| {
+            root.downcast::<RollbackList>()
+                .unwrap()
+                .update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear(cx)
+        })
+        .unwrap();
+    };
+    assert_eq!(renders.get(), 1);
+    assert_eq!(
+        hitboxes(cx, window),
+        vec![(0., 100.), (0., 150.)],
+        "the card's hitbox and the list's"
+    );
+
+    // The extra div moves the list down by 10px and puts a hitbox before
+    // everything else in the frame; the square asks to be scrolled into
+    // view, which scrolls the list by 50px. The card is reused where it moved
+    // to in the first prepaint, and must be rendered again in the second:
+    // the first prepaint's records are gone.
+    extra.set(true);
+    request.set(true);
+    draw(cx);
+    assert_eq!(renders.get(), 2, "the card was rendered again");
+    assert_eq!(
+        hitboxes(cx, window),
+        vec![(-40., 100.), (0., 10.), (10., 150.)],
+        "the card's hitbox, scrolled, the extra div's and the list's"
+    );
+    assert_eq!(
+        quads(cx, window),
+        vec![(50., 10., 100., 50.)],
+        "the visible part of the card"
+    );
+
+    // With the records made in the second attempt, the card is reused again
+    // from the next frame on.
+    draw(cx);
+    assert_eq!(renders.get(), 2);
+    assert_eq!(quads(cx, window), vec![(50., 10., 100., 50.)]);
 }

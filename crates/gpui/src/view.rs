@@ -339,6 +339,11 @@ impl<V: View> IntoElement for ViewElement<V> {
 }
 
 struct ViewElementState {
+    /// The frame the ranges below index into: the one this state was
+    /// recorded in. They are only good for reuse from the next frame; a
+    /// container that rolls a prepaint back (`Window::transact`) and
+    /// prepaints again in the same frame has discarded what they point at.
+    frame: usize,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
@@ -556,6 +561,7 @@ impl<V: View> Element for ViewElement<V> {
 
                         if request_layout.element.is_none()
                             && let Some(mut element_state) = element_state
+                            && element_state.frame != window.next_frame.id
                             && element_state.cache_key.text_style == cache_key.text_style
                             && element_state.cache_key.direction == cache_key.direction
                             && element_state.cache_key.unicode_bidi == cache_key.unicode_bidi
@@ -569,6 +575,7 @@ impl<V: View> Element for ViewElement<V> {
                             cx.entities
                                 .extend_accessed(&element_state.accessed_entities);
                             let prepaint_end = window.prepaint_index();
+                            element_state.frame = window.next_frame.id;
                             element_state.prepaint_range = prepaint_start..prepaint_end;
                             element_state.reuse_offset = offset;
                             element_state.moved_since_render |= !offset.is_zero();
@@ -623,6 +630,7 @@ impl<V: View> Element for ViewElement<V> {
                         (
                             Some(element),
                             ViewElementState {
+                                frame: window.next_frame.id,
                                 accessed_entities,
                                 prepaint_range: prepaint_start..prepaint_end,
                                 paint_range: PaintIndex::default()..PaintIndex::default(),
