@@ -70,7 +70,7 @@ pub mod surface {
             return transparent();
         }
         let locals = get!(SURFACE_LOCALS);
-        let fade = ContentMask::alpha(locals.content_mask, input.position.xy());
+        let fade = ContentMask::alpha(locals.content_mask, scene_position(input.position.xy()));
         if locals.color_format == SurfaceColorFormat::Yuv {
             return sample_yuv_surface(input.texture_position) * locals.opacity * fade;
         }
@@ -107,8 +107,8 @@ pub mod blur {
         pub target_size: Vec2f,
         pub corner_smoothing: f32,
         pub padding0: u32,
-        pub padding1: u32,
-        pub padding2: u32,
+        /// Where the blurred source's first texel sits in the viewport.
+        pub source_origin: Vec2f,
     }
     uniform!(group(1), binding(0), BLUR_LOCALS: BlurUniforms);
     texture!(group(1), binding(1), BLUR_TEXTURE: Texture2D<f32>);
@@ -137,7 +137,7 @@ pub mod blur {
         let blurred = texture_sample_level(
             BLUR_TEXTURE,
             BLUR_SAMPLER,
-            position / get!(BLUR_LOCALS).target_size,
+            (position - get!(BLUR_LOCALS).source_origin) / get!(BLUR_LOCALS).target_size,
             0.0,
         );
         let factor = coverage * get!(BLUR_LOCALS).opacity;
@@ -229,13 +229,13 @@ pub mod blur {
         let coverage = select(
             1.0,
             antialiased_coverage(rounded_rectangle_signed_distance(
-                input.position.xy(),
+                scene_position(input.position.xy()),
                 get!(BLUR_LOCALS).bounds,
                 get!(BLUR_LOCALS).corner_radii,
             )),
             get!(BLUR_LOCALS).composite_clip == BlurCompositeClip::RoundedBounds,
         );
-        blur_composite_color(input.position.xy(), coverage)
+        blur_composite_color(scene_position(input.position.xy()), coverage)
     }
 
     #[derive(Wgsl)]
@@ -290,7 +290,7 @@ pub mod blur {
         let coverage = select(
             1.0,
             antialiased_coverage(prepared_corner_signed_distance(
-                input.position.xy(),
+                scene_position(input.position.xy()),
                 get!(BLUR_LOCALS).bounds,
                 get!(BLUR_LOCALS).corner_radii,
                 get!(BLUR_LOCALS).corner_smoothing,
@@ -303,6 +303,6 @@ pub mod blur {
             )),
             get!(BLUR_LOCALS).composite_clip == BlurCompositeClip::RoundedBounds,
         );
-        blur_composite_color(input.position.xy(), coverage)
+        blur_composite_color(scene_position(input.position.xy()), coverage)
     }
 }

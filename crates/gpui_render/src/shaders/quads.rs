@@ -608,9 +608,9 @@ pub mod quad {
             return transparent();
         }
         let quad = get!(QUADS)[input.quad_id as usize];
-        let point = local_position(quad.transform, input.position.xy());
-        let fade = ContentMask::alpha(quad.content_mask, input.position.xy())
-            * clip_coverage(quad.clip, input.position.xy());
+        let point = local_position(quad.transform, scene_position(input.position.xy()));
+        let fade = ContentMask::alpha(quad.content_mask, scene_position(input.position.xy()))
+            * clip_coverage(quad.clip, scene_position(input.position.xy()));
         let fill_color = paint_color(
             Paint::new(quad.background, quad.bounds),
             point,
@@ -729,9 +729,9 @@ pub mod quad {
             return transparent();
         }
         let quad = get!(QUADS)[input.quad_id as usize];
-        let point = local_position(quad.transform, input.position.xy());
-        let fade = ContentMask::alpha(quad.content_mask, input.position.xy())
-            * clip_coverage(quad.clip, input.position.xy());
+        let point = local_position(quad.transform, scene_position(input.position.xy()));
+        let fade = ContentMask::alpha(quad.content_mask, scene_position(input.position.xy()))
+            * clip_coverage(quad.clip, scene_position(input.position.xy()));
         let fill_color = paint_color(
             Paint::new(quad.background, quad.bounds),
             point,

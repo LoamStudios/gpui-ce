@@ -73,3 +73,8 @@ harness = false
 name = "transforms_render"
 path = "tests/transforms_render.rs"
 harness = false
+
+[[test]]
+name = "groups_render"
+path = "tests/groups_render.rs"
+harness = false

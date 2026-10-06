@@ -11,6 +11,7 @@ pub mod interface;
 mod corner_smoothing;
 mod emoji;
 mod filters;
+mod groups;
 mod linkage;
 mod paths;
 mod quads;
@@ -19,6 +20,7 @@ mod sprites;
 
 pub use emoji::emoji_rasterization;
 pub use filters::{blur, surface};
+pub use groups::group;
 pub use linkage::base;
 pub use paths::{path, path_rasterization};
 pub use quads::quad;

@@ -60,7 +60,11 @@ pub mod path_rasterization {
         }
         let vertex = get!(PATH_VERTICES)[input.vertex_id as usize];
         let paint = Paint::new(vertex.color, vertex.bounds);
-        let color = paint_color(paint, input.position.xy(), prepare_paint(paint));
+        let color = paint_color(
+            paint,
+            scene_position(input.position.xy()),
+            prepare_paint(paint),
+        );
         premultiply(color, coverage)
     }
 }

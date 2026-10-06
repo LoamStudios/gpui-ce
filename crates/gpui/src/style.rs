@@ -395,6 +395,16 @@ pub struct Style {
     /// The opacity of this element
     pub opacity: Option<f32>,
 
+    /// The opacity this element and its children are composited with as one
+    /// picture, as CSS `opacity` does: unlike [`Self::opacity`], which fades
+    /// each thing painted, overlapping children do not show through each
+    /// other (see [`Window::with_compositing`](crate::Window::with_compositing)).
+    pub group_opacity: Option<f32>,
+
+    /// How this element and its children mix with what is beneath them, as
+    /// one picture (CSS `mix-blend-mode`).
+    pub mix_blend_mode: Option<crate::BlendMode>,
+
     /// A transform of this element and its children about the element's
     /// center, in logical pixels: rotation, scale, skew or translation. It
     /// does not affect layout; painting, hit testing and mouse events follow
@@ -1103,19 +1113,13 @@ impl Style {
             }
         };
 
-        if self.filter.is_empty() {
-            paint_box(window, cx);
-        } else {
-            window.with_filter_layer_with_corner_smoothing(
-                bounds,
-                corner_radii,
-                corner_smoothing,
-                &self.filter,
-                |window| {
-                    paint_box(window, cx);
-                },
-            );
-        }
+        window.with_compositing(
+            bounds,
+            self.group_opacity.unwrap_or(1.0),
+            self.mix_blend_mode.unwrap_or_default(),
+            &self.filter,
+            |window| paint_box(window, cx),
+        );
 
         #[cfg(debug_assertions)]
         if self.debug_below {
@@ -1183,6 +1187,8 @@ impl Default for Style {
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
+            group_opacity: None,
+            mix_blend_mode: None,
             transform: None,
             grid_rows: None,
             grid_cols: None,

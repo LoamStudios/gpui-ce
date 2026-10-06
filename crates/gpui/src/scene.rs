@@ -74,7 +74,7 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
     surface_opacities: Vec<f32>,
     pub backdrop_filters: Vec<BackdropFilter>,
-    pub filter_boundaries: Vec<FilterBoundary>,
+    pub group_boundaries: Vec<GroupBoundary>,
     render_plan: ScenePlan,
     is_finished: bool,
     /// Clips what is drawn, but not what is recorded; see [`Self::set_clip`].
@@ -104,7 +104,7 @@ impl Scene {
         self.surfaces.clear();
         self.surface_opacities.clear();
         self.backdrop_filters.clear();
-        self.filter_boundaries.clear();
+        self.group_boundaries.clear();
         self.render_plan.clear();
         self.clip = None;
         self.transforms.clear();
@@ -123,6 +123,84 @@ impl Scene {
                 crate::window::transformed_bounds(&transformation, bounds.map(|value| px(value.0)))
                     .map(|value| ScaledPixels(value.0))
             }
+        }
+    }
+
+    /// The viewport bounds of what `batch` draws: the union of its
+    /// primitives' bounds, transformed into the viewport and clipped to their
+    /// masks. `None` for a batch that draws nothing.
+    pub(crate) fn batch_region(&self, batch: &PrimitiveBatch) -> Option<Bounds<ScaledPixels>> {
+        let region =
+            |bounds: Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>, transform: u32| {
+                let bounds = match transform {
+                    0 => bounds,
+                    transform => {
+                        let transformation = self.transforms()[transform as usize].transformation;
+                        crate::window::transformed_bounds(
+                            &transformation,
+                            bounds.map(|value| px(value.0)),
+                        )
+                        .map(|value| ScaledPixels(value.0))
+                    }
+                };
+                bounds.intersect(&mask.bounds)
+            };
+        let union = |regions: &mut dyn Iterator<Item = Bounds<ScaledPixels>>| {
+            regions
+                .filter(|bounds| !bounds.is_empty())
+                .reduce(|union, bounds| union.union(&bounds))
+        };
+        match batch {
+            PrimitiveBatch::Shadows { range, .. } => union(
+                &mut self.shadows[range.clone()]
+                    .iter()
+                    .map(|shadow| region(shadow.bounds, &shadow.content_mask, shadow.transform)),
+            ),
+            PrimitiveBatch::Quads { range, .. } => union(
+                &mut self.quads[range.clone()]
+                    .iter()
+                    .map(|quad| region(quad.bounds, &quad.content_mask, quad.transform)),
+            ),
+            PrimitiveBatch::Paths { range, .. } => union(
+                &mut self.paths[range.clone()]
+                    .iter()
+                    .map(|path| region(path.bounds, &path.content_mask, 0)),
+            ),
+            PrimitiveBatch::Underlines(range) => {
+                union(&mut self.underlines[range.clone()].iter().map(|underline| {
+                    region(
+                        underline.bounds,
+                        &underline.content_mask,
+                        underline.transform,
+                    )
+                }))
+            }
+            PrimitiveBatch::MonochromeSprites { range, .. } => union(
+                &mut self.monochrome_sprites[range.clone()]
+                    .iter()
+                    .map(|sprite| region(sprite.bounds, &sprite.content_mask, sprite.transform)),
+            ),
+            PrimitiveBatch::SubpixelSprites { range, .. } => union(
+                &mut self.subpixel_sprites[range.clone()]
+                    .iter()
+                    .map(|sprite| region(sprite.bounds, &sprite.content_mask, sprite.transform)),
+            ),
+            PrimitiveBatch::PolychromeSprites { range, .. } => union(
+                &mut self.polychrome_sprites[range.clone()]
+                    .iter()
+                    .map(|sprite| region(sprite.bounds, &sprite.content_mask, sprite.transform)),
+            ),
+            PrimitiveBatch::Surfaces(range) => union(
+                &mut self.surfaces[range.clone()]
+                    .iter()
+                    .map(|surface| region(surface.bounds, &surface.content_mask, 0)),
+            ),
+            PrimitiveBatch::BackdropFilters(range) => union(
+                &mut self.backdrop_filters[range.clone()]
+                    .iter()
+                    .map(|filter| region(filter.bounds, &filter.content_mask, 0)),
+            ),
+            PrimitiveBatch::GroupBoundary(_) => None,
         }
     }
 
@@ -334,13 +412,13 @@ impl Scene {
                 .map(|value| ScaledPixels(value.0));
                 mask(&mut path.content_mask);
             }
-            Primitive::Surface(_) | Primitive::BackdropFilter(_) | Primitive::FilterBoundary(_) => {
+            Primitive::Surface(_) | Primitive::BackdropFilter(_) | Primitive::GroupBoundary(_) => {
                 // Not transformed on the GPU: they take the viewport bounds
                 // that contain them.
                 let bounds = match primitive {
                     Primitive::Surface(surface) => &mut surface.bounds,
                     Primitive::BackdropFilter(filter) => &mut filter.bounds,
-                    Primitive::FilterBoundary(boundary) => &mut boundary.bounds,
+                    Primitive::GroupBoundary(boundary) => &mut boundary.bounds,
                     _ => unreachable!(),
                 };
                 *bounds =
@@ -541,13 +619,13 @@ impl Scene {
         // painted *after* the group is held above it by raising the order floor when the end
         // marker is inserted (see below) — otherwise a later non-overlapping sibling could reuse a
         // low order that lands inside the start..end range and be swept into the group.
-        let is_filter_boundary = matches!(primitive, Primitive::FilterBoundary(_));
+        let is_group_boundary = matches!(primitive, Primitive::GroupBoundary(_));
 
-        if clipped_bounds.is_empty() && !is_filter_boundary {
+        if clipped_bounds.is_empty() && !is_group_boundary {
             return;
         }
 
-        let order = if is_filter_boundary {
+        let order = if is_group_boundary {
             let order_bounds = if clipped_bounds.is_empty() {
                 *primitive.bounds()
             } else {
@@ -574,14 +652,13 @@ impl Scene {
         raster_source: Option<Box<RasterSource>>,
     ) {
         primitive.set_order(order);
-        if let Primitive::FilterBoundary(boundary) = &primitive
-            && !boundary.is_start
-        {
-            // A closed content-filter group is a draw-order barrier: everything painted
-            // afterwards must sort above the group's end marker so it can't fall back
-            // inside the group's order range (subsequent non-overlapping content otherwise
-            // reuses a low order). Mirrors the floor raised before deferred draws in
-            // `raise_order_floor`.
+        if let Primitive::GroupBoundary(_) = &primitive {
+            // Group markers are draw-order barriers. Everything painted after a start
+            // marker sorts above it, so the group's content, which need not overlap the
+            // element that made the group, falls inside the group; everything painted after
+            // an end marker sorts above that, so later content cannot fall back inside the
+            // group's order range (non-overlapping content otherwise reuses a low order).
+            // Mirrors the floor raised before deferred draws in `raise_order_floor`.
             self.primitive_bounds.set_order_floor(order + 1);
         }
         match self.clip {
@@ -590,7 +667,7 @@ impl Scene {
                 let mut drawn = primitive.clone();
                 drawn.translate(Point::default(), &clip);
                 // Content-filter boundaries are drawn in pairs, visible or not.
-                if matches!(drawn, Primitive::FilterBoundary(_))
+                if matches!(drawn, Primitive::GroupBoundary(_))
                     || !drawn
                         .bounds()
                         .intersect(&drawn.content_mask().bounds)
@@ -633,7 +710,7 @@ impl Scene {
                 self.surface_opacities.push(surface_opacity.unwrap_or(1.0));
             }
             Primitive::BackdropFilter(filter) => self.backdrop_filters.push(filter.clone()),
-            Primitive::FilterBoundary(boundary) => self.filter_boundaries.push(boundary.clone()),
+            Primitive::GroupBoundary(boundary) => self.group_boundaries.push(boundary.clone()),
         }
     }
 
@@ -776,7 +853,7 @@ impl Scene {
             || operations.iter().any(|operation| {
                 matches!(
                     operation,
-                    PaintOperation::Primitive(Primitive::FilterBoundary(_))
+                    PaintOperation::Primitive(Primitive::GroupBoundary(_))
                 )
             })
         {
@@ -870,7 +947,7 @@ impl Scene {
         // their group bounds and so sort strictly between the start and end). The `!is_start`
         // tiebreak only matters for a degenerate empty group whose start and end tie: it keeps
         // the start (false = 0) ahead of the end (true = 1) so the pair stays well-formed.
-        self.filter_boundaries
+        self.group_boundaries
             .sort_by_key(|boundary| (boundary.order, !boundary.is_start));
         let commands = std::mem::take(&mut self.render_plan.commands);
         self.render_plan = ScenePlan::build(self, commands);
@@ -887,13 +964,13 @@ impl Scene {
     pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
         self.render_commands().iter().map(|command| match command {
             RenderCommand::Batch(batch) => batch.clone(),
-            RenderCommand::BeginFilter { boundary_index, .. } => {
-                PrimitiveBatch::FilterBoundary(*boundary_index)
+            RenderCommand::BeginGroup { boundary_index, .. } => {
+                PrimitiveBatch::GroupBoundary(*boundary_index)
             }
-            RenderCommand::EndFilter {
+            RenderCommand::EndGroup {
                 closing_boundary_index,
                 ..
-            } => PrimitiveBatch::FilterBoundary(*closing_boundary_index),
+            } => PrimitiveBatch::GroupBoundary(*closing_boundary_index),
         })
     }
 
@@ -969,7 +1046,7 @@ impl From<palette::Hsla> for SceneHsla {
 pub(crate) enum PrimitiveKind {
     // Lowest discriminant: at an equal order, a content-filter group-start is emitted before
     // the group's own content so the renderer redirects rendering before any child draws.
-    FilterBoundaryStart,
+    GroupStart,
     Shadow,
     #[default]
     Quad,
@@ -982,7 +1059,7 @@ pub(crate) enum PrimitiveKind {
     BackdropFilter,
     // Highest discriminant: at an equal order, a group-end is emitted after the group's content
     // so the renderer composites the filtered group only once every child has been drawn.
-    FilterBoundaryEnd,
+    GroupEnd,
 }
 
 /// Where a rasterized sprite came from: what a replay at another scale needs
@@ -1158,7 +1235,7 @@ pub enum Primitive {
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
     BackdropFilter(BackdropFilter),
-    FilterBoundary(FilterBoundary),
+    GroupBoundary(GroupBoundary),
 }
 
 #[expect(missing_docs)]
@@ -1174,7 +1251,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
             Primitive::BackdropFilter(filter) => &filter.bounds,
-            Primitive::FilterBoundary(boundary) => &boundary.bounds,
+            Primitive::GroupBoundary(boundary) => &boundary.bounds,
         }
     }
 
@@ -1189,7 +1266,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &mut sprite.content_mask,
             Primitive::Surface(surface) => &mut surface.content_mask,
             Primitive::BackdropFilter(filter) => &mut filter.content_mask,
-            Primitive::FilterBoundary(boundary) => &mut boundary.content_mask,
+            Primitive::GroupBoundary(boundary) => &mut boundary.content_mask,
         }
     }
 
@@ -1204,7 +1281,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::BackdropFilter(filter) => &filter.content_mask,
-            Primitive::FilterBoundary(boundary) => &boundary.content_mask,
+            Primitive::GroupBoundary(boundary) => &boundary.content_mask,
         }
     }
 
@@ -1219,7 +1296,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => sprite.order = order,
             Primitive::Surface(surface) => surface.order = order,
             Primitive::BackdropFilter(filter) => filter.order = order,
-            Primitive::FilterBoundary(boundary) => boundary.order = order,
+            Primitive::GroupBoundary(boundary) => boundary.order = order,
         }
     }
 
@@ -1303,9 +1380,8 @@ impl Primitive {
                 filters(&mut filter.filters);
                 mask(&mut filter.content_mask);
             }
-            Primitive::FilterBoundary(boundary) => {
+            Primitive::GroupBoundary(boundary) => {
                 boundary.bounds = placement.bounds(boundary.bounds);
-                boundary.corner_radii = corners(boundary.corner_radii);
                 filters(&mut boundary.filters);
                 mask(&mut boundary.content_mask);
             }
@@ -1325,7 +1401,7 @@ impl Primitive {
             Primitive::Path(_)
             | Primitive::Surface(_)
             | Primitive::BackdropFilter(_)
-            | Primitive::FilterBoundary(_) => 0,
+            | Primitive::GroupBoundary(_) => 0,
         }
     }
 
@@ -1344,7 +1420,7 @@ impl Primitive {
             Primitive::Path(_)
             | Primitive::Surface(_)
             | Primitive::BackdropFilter(_)
-            | Primitive::FilterBoundary(_) => None,
+            | Primitive::GroupBoundary(_) => None,
         }
     }
 
@@ -1360,7 +1436,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => sprite.order,
             Primitive::Surface(surface) => surface.order,
             Primitive::BackdropFilter(filter) => filter.order,
-            Primitive::FilterBoundary(boundary) => boundary.order,
+            Primitive::GroupBoundary(boundary) => boundary.order,
         }
     }
 
@@ -1426,7 +1502,7 @@ impl Primitive {
                 filter.bounds = filter.bounds + geometry_offset;
                 moved(&mut filter.content_mask);
             }
-            Primitive::FilterBoundary(boundary) => {
+            Primitive::GroupBoundary(boundary) => {
                 boundary.bounds = boundary.bounds + geometry_offset;
                 moved(&mut boundary.content_mask);
             }
@@ -1461,8 +1537,8 @@ struct BatchIterator<'a> {
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
     backdrop_filters_start: usize,
     backdrop_filters_iter: Peekable<slice::Iter<'a, BackdropFilter>>,
-    filter_boundaries_start: usize,
-    filter_boundaries_iter: Peekable<slice::Iter<'a, FilterBoundary>>,
+    group_boundaries_start: usize,
+    group_boundaries_iter: Peekable<slice::Iter<'a, GroupBoundary>>,
 }
 
 impl<'a> BatchIterator<'a> {
@@ -1487,8 +1563,8 @@ impl<'a> BatchIterator<'a> {
             surfaces_iter: scene.surfaces.iter().peekable(),
             backdrop_filters_start: 0,
             backdrop_filters_iter: scene.backdrop_filters.iter().peekable(),
-            filter_boundaries_start: 0,
-            filter_boundaries_iter: scene.filter_boundaries.iter().peekable(),
+            group_boundaries_start: 0,
+            group_boundaries_iter: scene.group_boundaries.iter().peekable(),
         }
     }
 }
@@ -1541,13 +1617,13 @@ impl<'a> Iterator for BatchIterator<'a> {
                 PrimitiveKind::BackdropFilter,
             ),
             (
-                self.filter_boundaries_iter.peek().map(|b| b.order),
+                self.group_boundaries_iter.peek().map(|b| b.order),
                 // The same vec yields both start and end markers; the discriminant decides
                 // where the next marker sorts relative to draw batches at an equal order
                 // (start before content, end after).
-                match self.filter_boundaries_iter.peek() {
-                    Some(boundary) if boundary.is_start => PrimitiveKind::FilterBoundaryStart,
-                    _ => PrimitiveKind::FilterBoundaryEnd,
+                match self.group_boundaries_iter.peek() {
+                    Some(boundary) if boundary.is_start => PrimitiveKind::GroupStart,
+                    _ => PrimitiveKind::GroupEnd,
                 },
             ),
         ];
@@ -1760,11 +1836,11 @@ impl<'a> Iterator for BatchIterator<'a> {
             }
             // Boundaries are emitted one at a time (never merged) so the renderer can switch
             // render targets at exactly the right point in the batch stream.
-            PrimitiveKind::FilterBoundaryStart | PrimitiveKind::FilterBoundaryEnd => {
-                let index = self.filter_boundaries_start;
-                self.filter_boundaries_iter.next();
-                self.filter_boundaries_start = index + 1;
-                Some(PrimitiveBatch::FilterBoundary(index))
+            PrimitiveKind::GroupStart | PrimitiveKind::GroupEnd => {
+                let index = self.group_boundaries_start;
+                self.group_boundaries_iter.next();
+                self.group_boundaries_start = index + 1;
+                Some(PrimitiveBatch::GroupBoundary(index))
             }
         }
     }
@@ -1910,33 +1986,99 @@ impl From<BackdropFilter> for Primitive {
     }
 }
 
-/// The start or end marker of a content-filter (`filter`) isolation group. The element's
-/// subtree is painted between a matched start/end pair; the renderer redirects that span into
-/// an offscreen target, filters it, and composites it back at `bounds`. Produces the CSS
-/// `filter` effect (e.g. blurring the element and its children as a single group).
+/// The start or end marker of a group: what is painted between a matched
+/// pair is composited into what is beneath it as one picture, filtered,
+/// faded and blended as a whole. This is CSS's `filter`, `opacity` and
+/// `mix-blend-mode` on an element and its children.
+///
+/// The renderer isolates a group, rendering it into a target of its own,
+/// only when [`Self::isolates`]; the render plan sizes that target to what
+/// the group draws.
 #[derive(Debug, Clone)]
-#[expect(missing_docs)]
-pub struct FilterBoundary {
+pub struct GroupBoundary {
+    /// The marker's draw order: above everything painted before the group.
     pub order: DrawOrder,
+    /// The bounds of the element that made the group, in the viewport.
     pub bounds: Bounds<ScaledPixels>,
+    /// What the group's composite is clipped to.
     pub content_mask: ContentMask<ScaledPixels>,
-    pub corner_radii: Corners<ScaledPixels>,
-    pub corner_smoothing: f32,
     /// The filter chain applied to the isolated group, in scene (device-pixel) space. Identity
-    /// filters are dropped at paint time, so a `FilterBoundary` is only emitted when non-empty.
+    /// filters are dropped at paint time.
     /// Inline capacity 4 (same struct size as 1 here — see [`BackdropFilter::filters`]).
     pub filters: SmallVec<[ScaledFilter; 4]>,
+    /// The opacity the group is composited with, as one picture.
     pub opacity: f32,
+    /// How the group's colours mix with what is beneath it.
+    pub blend_mode: BlendMode,
     /// `true` for the start marker (opens the group), `false` for the end marker (closes it).
     pub is_start: bool,
 }
 
-impl FilterBoundary {
+impl GroupBoundary {
     /// Largest gaussian blur radius in this filter chain, in device pixels.
     pub fn max_blur_radius(&self) -> f32 {
         max_blur_radius(&self.filters)
     }
+
+    /// How far the group's filters spread what it draws, in device pixels:
+    /// its isolated target covers this much more on every side.
+    pub fn filter_extent(&self) -> f32 {
+        GAUSSIAN_EXTENT_PER_RADIUS * self.max_blur_radius()
+    }
+
+    /// Whether the group has to be rendered on its own and composited: it
+    /// is filtered, faded or blended. Otherwise it draws in place.
+    pub fn isolates(&self) -> bool {
+        self.opacity < 1.0 || self.blend_mode != BlendMode::Normal || self.max_blur_radius() > 0.0
+    }
 }
+
+/// How a group's colours mix with the colours beneath it: the blend modes of
+/// the W3C Compositing and Blending specification, as CSS's `mix-blend-mode`
+/// names them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[repr(u32)]
+pub enum BlendMode {
+    /// The group's colour, composited over what is beneath it.
+    #[default]
+    Normal,
+    /// The product of the colours: never lighter.
+    Multiply,
+    /// The inverse of the product of the inverses: never darker.
+    Screen,
+    /// Multiply or screen, by the colour beneath.
+    Overlay,
+    /// The darker of the colours.
+    Darken,
+    /// The lighter of the colours.
+    Lighten,
+    /// Brightens what is beneath towards the group's colour.
+    ColorDodge,
+    /// Darkens what is beneath towards the group's colour.
+    ColorBurn,
+    /// Multiply or screen, by the group's colour.
+    HardLight,
+    /// A softer hard light.
+    SoftLight,
+    /// The difference of the colours.
+    Difference,
+    /// A lower-contrast difference.
+    Exclusion,
+    /// The group's hue with the saturation and luminosity beneath.
+    Hue,
+    /// The group's saturation with the hue and luminosity beneath.
+    Saturation,
+    /// The group's hue and saturation with the luminosity beneath.
+    Color,
+    /// The group's luminosity with the hue and saturation beneath.
+    Luminosity,
+}
+
+/// How far a gaussian blur spreads, per unit of its radius: the standard
+/// deviation is half the radius, and the kernel is cut off at three of them,
+/// but the spread is kept at three radii, as the renderers' blur passes
+/// dilate their bounds.
+pub const GAUSSIAN_EXTENT_PER_RADIUS: f32 = 3.0;
 
 /// Returns the largest blur radius in a scene-space filter chain.
 ///
@@ -1948,9 +2090,9 @@ fn max_blur_radius(filters: &[ScaledFilter]) -> f32 {
     })
 }
 
-impl From<FilterBoundary> for Primitive {
-    fn from(boundary: FilterBoundary) -> Self {
-        Primitive::FilterBoundary(boundary)
+impl From<GroupBoundary> for Primitive {
+    fn from(boundary: GroupBoundary) -> Self {
+        Primitive::GroupBoundary(boundary)
     }
 }
 
@@ -2903,15 +3045,14 @@ mod tests {
         }
     }
 
-    fn boundary(is_start: bool) -> FilterBoundary {
-        FilterBoundary {
+    fn boundary(is_start: bool) -> GroupBoundary {
+        GroupBoundary {
             order: 0,
             bounds: full_bounds(),
             content_mask: mask(),
-            corner_radii: Corners::default(),
-            corner_smoothing: 0.0,
             filters: smallvec::smallvec![ScaledFilter::Blur(sp(8.0))],
             opacity: 1.0,
+            blend_mode: BlendMode::Normal,
             is_start,
         }
     }
@@ -2943,8 +3084,8 @@ mod tests {
             .map(|batch| match batch {
                 PrimitiveBatch::Quads { .. } => "quad",
                 PrimitiveBatch::BackdropFilters(_) => "backdrop",
-                PrimitiveBatch::FilterBoundary(ix) => {
-                    if scene.filter_boundaries[ix].is_start {
+                PrimitiveBatch::GroupBoundary(ix) => {
+                    if scene.group_boundaries[ix].is_start {
                         "start"
                     } else {
                         "end"
@@ -3038,11 +3179,9 @@ mod tests {
     }
 
     #[test]
-    fn render_commands_pair_nested_filters_and_bound_isolation_targets() {
+    fn render_commands_pair_nested_filters_and_isolate_each() {
         let mut scene = Scene::default();
-        // Three nested groups exercise the bounded target allocator. The first two
-        // receive their own targets; the third must render inline rather than aliasing
-        // either outer target.
+        // Three nested groups each receive a target of their own, at any depth.
         scene.insert_primitive(boundary(true));
         scene.insert_primitive(quad());
         scene.insert_primitive(boundary(true));
@@ -3059,23 +3198,23 @@ mod tests {
             .iter()
             .map(|command| match command {
                 RenderCommand::Batch(PrimitiveBatch::Quads { .. }) => "quad".to_string(),
-                RenderCommand::BeginFilter {
+                RenderCommand::BeginGroup {
                     boundary_index,
                     target,
                 } => {
-                    let boundary = &scene.filter_boundaries[*boundary_index];
+                    let boundary = &scene.group_boundaries[*boundary_index];
                     assert!(boundary.is_start);
                     format!("begin:{target:?}")
                 }
                 // An end command must carry its matched *start* boundary. This lets a
                 // renderer use the opening group's bounds, filters, and opacity while
                 // composing it, rather than trusting an independently-sorted end marker.
-                RenderCommand::EndFilter {
+                RenderCommand::EndGroup {
                     boundary_index,
                     target,
                     ..
                 } => {
-                    let boundary = &scene.filter_boundaries[*boundary_index];
+                    let boundary = &scene.group_boundaries[*boundary_index];
                     assert!(boundary.is_start);
                     format!("end:{target:?}")
                 }
@@ -3083,18 +3222,24 @@ mod tests {
             })
             .collect();
 
+        let isolated = format!(
+            "{:?}",
+            GroupTarget::Isolated {
+                region: full_bounds()
+            }
+        );
         assert_eq!(
             commands,
             vec![
-                "begin:Isolated(FilterTargetIndex(0))",
-                "quad",
-                "begin:Isolated(FilterTargetIndex(1))",
-                "quad",
-                "begin:Inline",
-                "quad",
-                "end:Inline",
-                "end:Isolated(FilterTargetIndex(1))",
-                "end:Isolated(FilterTargetIndex(0))",
+                format!("begin:{isolated}"),
+                "quad".into(),
+                format!("begin:{isolated}"),
+                "quad".into(),
+                format!("begin:{isolated}"),
+                "quad".into(),
+                format!("end:{isolated}"),
+                format!("end:{isolated}"),
+                format!("end:{isolated}"),
             ]
         );
     }
@@ -3115,23 +3260,109 @@ mod tests {
             .render_commands()
             .iter()
             .map(|command| match command {
-                RenderCommand::BeginFilter { target, .. } => {
+                RenderCommand::BeginGroup { target, .. } => {
                     format!("begin:{target:?}")
                 }
-                RenderCommand::EndFilter { target, .. } => format!("end:{target:?}"),
+                RenderCommand::EndGroup { target, .. } => format!("end:{target:?}"),
                 RenderCommand::Batch(PrimitiveBatch::Quads { .. }) => "quad".to_string(),
                 RenderCommand::Batch(other) => panic!("unexpected batch: {other:?}"),
             })
             .collect();
 
+        let isolated = format!(
+            "{:?}",
+            GroupTarget::Isolated {
+                region: full_bounds()
+            }
+        );
         assert_eq!(
             commands,
             vec![
-                "begin:Isolated(FilterTargetIndex(0))",
-                "quad",
-                "end:Isolated(FilterTargetIndex(0))",
-                "quad"
+                format!("begin:{isolated}"),
+                "quad".into(),
+                format!("end:{isolated}"),
+                "quad".into()
             ]
+        );
+    }
+
+    /// A group's target covers what it draws, which an enclosing group's
+    /// covers in turn; a group with nothing to apply draws in place.
+    #[test]
+    fn a_group_target_covers_what_the_group_draws() {
+        let rect = |x: f32, y: f32, width: f32, height: f32| Bounds {
+            origin: point(sp(x), sp(y)),
+            size: Size {
+                width: sp(width),
+                height: sp(height),
+            },
+        };
+        let wide_mask = ContentMask {
+            bounds: rect(0., 0., 1000., 1000.),
+            ..Default::default()
+        };
+        let group = |is_start: bool, opacity: f32, blend_mode: BlendMode| GroupBoundary {
+            order: 0,
+            bounds: rect(0., 0., 1000., 1000.),
+            content_mask: wide_mask,
+            filters: SmallVec::new(),
+            opacity,
+            blend_mode,
+            is_start,
+        };
+        let quad_at = |bounds: Bounds<ScaledPixels>| Quad {
+            bounds,
+            content_mask: wide_mask,
+            ..Default::default()
+        };
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(group(true, 0.5, BlendMode::Normal));
+        scene.insert_primitive(quad_at(rect(10., 10., 20., 20.)));
+        scene.insert_primitive(group(true, 1.0, BlendMode::Multiply));
+        scene.insert_primitive(quad_at(rect(100., 100., 10., 10.)));
+        scene.insert_primitive(group(true, 1.0, BlendMode::Normal));
+        scene.insert_primitive(quad_at(rect(300., 300., 10., 10.)));
+        scene.insert_primitive(group(false, 1.0, BlendMode::Normal));
+        scene.insert_primitive(group(false, 1.0, BlendMode::Multiply));
+        scene.insert_primitive(group(false, 0.5, BlendMode::Normal));
+        scene.finish();
+
+        let targets: Vec<GroupTarget> = scene
+            .render_commands()
+            .iter()
+            .filter_map(|command| match command {
+                RenderCommand::BeginGroup { target, .. } => Some(*target),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                GroupTarget::Isolated {
+                    region: rect(10., 10., 300., 300.)
+                },
+                GroupTarget::Isolated {
+                    region: rect(100., 100., 210., 210.)
+                },
+                GroupTarget::Inline,
+            ]
+        );
+        let requirements = scene.render_plan().requirements();
+        assert_eq!(requirements.isolated_group_count, 2);
+        assert!(
+            requirements.uses_offscreen_target,
+            "a blend mode reads what is beneath it"
+        );
+
+        let mut faded = Scene::default();
+        faded.insert_primitive(group(true, 0.5, BlendMode::Normal));
+        faded.insert_primitive(quad_at(rect(10., 10., 20., 20.)));
+        faded.insert_primitive(group(false, 0.5, BlendMode::Normal));
+        faded.finish();
+        assert!(
+            !faded.requires_offscreen_rendering(),
+            "a faded group does not read what is beneath it"
         );
     }
 
@@ -3145,8 +3376,8 @@ mod tests {
         let mut commands = scene.render_commands().iter();
         assert!(matches!(
             commands.next(),
-            Some(RenderCommand::BeginFilter {
-                target: FilterRenderTarget::Inline,
+            Some(RenderCommand::BeginGroup {
+                target: GroupTarget::Inline,
                 ..
             })
         ));
@@ -3215,8 +3446,7 @@ mod tests {
 
         let requirements = scene.render_plan().requirements();
         assert_eq!(requirements.backdrop_filter_count, 1);
-        assert_eq!(requirements.isolated_filter_count, 1);
-        assert_eq!(requirements.isolated_target_count, 1);
+        assert_eq!(requirements.isolated_group_count, 1);
         assert_eq!(requirements.instance_batch_count, 1);
         assert!(requirements.uses_offscreen_target);
     }

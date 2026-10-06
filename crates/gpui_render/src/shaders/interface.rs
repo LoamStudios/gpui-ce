@@ -43,6 +43,7 @@ pub enum DataLayout {
     NativeOnly,
     Surface,
     Blur,
+    Group,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,6 +113,7 @@ define_pipelines! {
     BLUR: "blur", vertex_blur_fullscreen, fragment_blur, TriangleList, Blur, FullscreenTriangle;
     BLUR_COMPOSITE: "blur_composite", vertex_blur_composite, fragment_blur_composite, TriangleStrip, Blur, Rectangle;
     SMOOTHED_BLUR_COMPOSITE: "smoothed_blur_composite", vertex_smoothed_blur_composite, fragment_smoothed_blur_composite, TriangleStrip, Blur, Rectangle;
+    GROUP_COMPOSITE: "group_composite", vertex_group_composite, fragment_group_composite, TriangleStrip, Group, Rectangle;
 }
 
 pub const EMOJI_RASTERIZATION: Pipeline = Pipeline {
@@ -176,6 +178,7 @@ buffer_data! {
     super::common::FontRasterizationUniforms => "FontRasterizationUniforms",
     super::surface::SurfaceUniforms => "SurfaceUniforms",
     super::blur::BlurUniforms => "BlurUniforms",
+    super::group::GroupUniforms => "GroupUniforms",
     gpui::Quad => "Quad",
     gpui::Shadow => "Shadow",
     gpui::Underline => "Underline",
@@ -213,6 +216,8 @@ pub const RENDER_BUFFER_LAYOUTS: &[gpui::SceneBufferLayout] = &[
         super::common::GlobalUniforms,
         "GlobalUniforms",
         viewport_size,
+        target_origin,
+        target_size,
         premultiplied_alpha,
         padding
     ),
@@ -256,8 +261,23 @@ pub const RENDER_BUFFER_LAYOUTS: &[gpui::SceneBufferLayout] = &[
         target_size,
         corner_smoothing,
         padding0,
-        padding1,
-        padding2
+        source_origin
+    ),
+    render_layout!(
+        super::group::GroupUniforms,
+        "GroupUniforms",
+        bounds,
+        content_mask,
+        clip_bounds,
+        corner_radii,
+        source_origin,
+        source_size,
+        backdrop_origin,
+        backdrop_size,
+        opacity,
+        blend_mode,
+        clip,
+        transform
     ),
     render_layout!(crate::path_types::PathSprite, "PathSprite", bounds),
     render_layout!(

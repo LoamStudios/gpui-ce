@@ -462,3 +462,57 @@ fn a_cached_svg_is_rasterized_again_under_a_new_zoom(cx: &mut TestAppContext) {
         "where painting it there puts it"
     );
 }
+
+/// A square in three groups, each made by an element of no height that
+/// the square does not overlap.
+struct NestedFades;
+impl Render for NestedFades {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(400.)).relative().child(
+            div().group_opacity(0.5).child(
+                div().group_opacity(0.5).child(
+                    div().group_opacity(0.5).child(
+                        div()
+                            .absolute()
+                            .left(px(50.))
+                            .top(px(30.))
+                            .size(px(100.))
+                            .bg(red()),
+                    ),
+                ),
+            ),
+        )
+    }
+}
+
+/// Content that does not overlap the elements that make its groups still
+/// falls inside every one of them.
+#[crate::test]
+fn content_falls_inside_the_groups_that_enclose_it(cx: &mut TestAppContext) {
+    let window: AnyWindowHandle = cx.add_window(|_, _| NestedFades).into();
+    cx.update_window(window, |_, window, _| {
+        let commands: Vec<&str> = window
+            .rendered_frame
+            .scene
+            .render_commands()
+            .iter()
+            .map(|command| match command {
+                crate::RenderCommand::BeginGroup {
+                    target: crate::GroupTarget::Isolated { .. },
+                    ..
+                } => "begin",
+                crate::RenderCommand::EndGroup {
+                    target: crate::GroupTarget::Isolated { .. },
+                    ..
+                } => "end",
+                crate::RenderCommand::Batch(_) => "quad",
+                _ => "inline",
+            })
+            .collect();
+        assert_eq!(
+            commands,
+            ["begin", "begin", "begin", "quad", "end", "end", "end"]
+        );
+    })
+    .unwrap();
+}

@@ -105,8 +105,10 @@ impl BlurUniforms {
         clip: FilterCompositeClip,
         source_size: [f32; 2],
         target_size: [f32; 2],
+        source_origin: [f32; 2],
     ) -> Self {
         Self {
+            source_origin: vec2f(source_origin[0], source_origin[1]),
             bounds: bounds.into(),
             content_mask: content_mask.into(),
             corner_radii: corner_radii.into(),
@@ -227,8 +229,7 @@ fn empty_uniforms(downsample_mode: DownsampleMode) -> BlurUniforms {
         target_size: vec2f(1.0, 1.0),
         corner_smoothing: 0.0,
         padding0: 0,
-        padding1: 0,
-        padding2: 0,
+        source_origin: vec2f(0.0, 0.0),
     }
 }
 

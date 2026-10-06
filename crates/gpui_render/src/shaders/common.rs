@@ -14,6 +14,8 @@ mod source {
     pub const PATTERN_PACKING_RADIX: f32 = 65535.0;
     pub const MIN_NORMALIZED_WEIGHT: f32 = 0.00001;
     pub const MIN_PATH_GRADIENT: f32 = 0.001;
+    /// The smallest alpha a colour is divided by to unpremultiply it.
+    pub const MIN_UNPREMULTIPLY_ALPHA: f32 = 0.00001;
     pub const UNDERLINE_WAVE_FREQUENCY: f32 = 2.0;
     pub const UNDERLINE_WAVE_HEIGHT_RATIO: f32 = 0.8;
     pub const GRADIENT_DITHER_SCALE: f32 = 0.6180339887;
@@ -96,6 +98,37 @@ mod source {
         Yuv = 1,
     }
 
+    /// How a group's colours mix with its parent's: the blend modes of the
+    /// W3C Compositing and Blending specification.
+    #[repr(u32)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Wgsl)]
+    pub enum GroupBlendMode {
+        Normal = 0,
+        Multiply = 1,
+        Screen = 2,
+        Overlay = 3,
+        Darken = 4,
+        Lighten = 5,
+        ColorDodge = 6,
+        ColorBurn = 7,
+        HardLight = 8,
+        SoftLight = 9,
+        Difference = 10,
+        Exclusion = 11,
+        Hue = 12,
+        Saturation = 13,
+        Color = 14,
+        Luminosity = 15,
+    }
+
+    /// Whether a group's composite is clipped to its rounded bounds.
+    #[repr(u32)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Wgsl)]
+    pub enum GroupClip {
+        None = 0,
+        RoundedBounds = 1,
+    }
+
     #[repr(u32)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Wgsl)]
     pub enum BlurCompositeClip {
@@ -113,7 +146,13 @@ mod source {
     #[repr(C)]
     #[derive(Clone, Copy, PartialEq, Wgsl)]
     pub struct GlobalUniforms {
+        /// The scene's viewport, in device pixels.
         pub viewport_size: Vec2f,
+        /// Where the render target's first texel sits in the viewport: zero
+        /// for the window, a group's origin for a group's target.
+        pub target_origin: Vec2f,
+        /// The render target's size, in device pixels.
+        pub target_size: Vec2f,
         pub premultiplied_alpha: ShaderBool,
         pub padding: u32,
     }
@@ -432,9 +471,17 @@ mod source {
     }
 
     pub fn viewport_to_clip_position(position: Vec2f) -> Vec4f {
-        let clip_position =
-            position / get!(GLOBALS).viewport_size * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0);
+        let globals = get!(GLOBALS);
+        let clip_position = (position - globals.target_origin) / globals.target_size
+            * vec2f(2.0, -2.0)
+            + vec2f(-1.0, 1.0);
         vec4f(clip_position.x, clip_position.y, 0.0, 1.0)
+    }
+
+    /// The viewport position of a fragment, from its position in the render
+    /// target, which may be a group's target placed anywhere in the viewport.
+    pub fn scene_position(fragment_position: Vec2f) -> Vec2f {
+        fragment_position + get!(GLOBALS).target_origin
     }
 
     pub fn rectangle_vertex(vertex_id: u32, bounds: Bounds) -> RectangleVertex {

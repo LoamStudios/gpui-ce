@@ -1,16 +1,16 @@
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds,
-    BoxShadow, Capslock, ColorExt, Context, Corners, CursorHideMode, CursorStyle, Decorations,
-    DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
-    Entity, EntityId, EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId, Global,
-    GlobalElementId, GlyphId, GlyphRenderMode, GpuSpecs, InputHandler, IntoElement, IsZero,
-    KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, Lerp,
-    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton,
-    MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority,
-    PromptButton, PromptLevel, Quad, RasterizedGlyphFormat, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedDirection,
+    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BlendMode,
+    BorderStyle, Bounds, BoxShadow, Capslock, ColorExt, Context, Corners, CursorHideMode,
+    CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree,
+    DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, Filter, FontId,
+    Global, GlobalElementId, GlyphId, GlyphRenderMode, GpuSpecs, GroupBoundary, InputHandler,
+    IntoElement, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent,
+    LayoutId, Lerp, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, Motion,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
+    Priority, PromptButton, PromptLevel, Quad, RasterizedGlyphFormat, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedDirection,
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels,
     Scene, SceneClip, SceneTransform, Shadow, SharedString, Size, StrikethroughStyle, Style,
     SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
@@ -5186,8 +5186,8 @@ impl Window {
 
     /// Isolate the painting performed by `f` into a content-filter group: the renderer renders
     /// everything `f` paints into an offscreen target, blurs it as a single layer, and
-    /// composites the result back into the rounded rectangle described by `bounds` and
-    /// `corner_radii` — the CSS `filter` effect (e.g. blurring an element and its children).
+    /// composites the result back — the CSS `filter` effect (e.g. blurring an element and its
+    /// children). See [`Self::with_compositing`].
     ///
     /// When `filters` produce no visible blur this simply runs `f` with no offscreen
     /// indirection.
@@ -5196,19 +5196,41 @@ impl Window {
     pub fn with_filter_layer<R>(
         &mut self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        _corner_radii: Corners<Pixels>,
         filters: &[Filter],
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        self.with_filter_layer_with_corner_smoothing(bounds, corner_radii, 0.0, filters, f)
+        self.with_compositing(bounds, 1.0, BlendMode::Normal, filters, f)
     }
 
-    /// Runs `f` in a content-filter group clipped to smoothed corners.
+    /// Runs `f` in a content-filter group; see [`Self::with_filter_layer`].
     pub fn with_filter_layer_with_corner_smoothing<R>(
         &mut self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
-        corner_smoothing: f32,
+        _corner_radii: Corners<Pixels>,
+        _corner_smoothing: f32,
+        filters: &[Filter],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_compositing(bounds, 1.0, BlendMode::Normal, filters, f)
+    }
+
+    /// Paints what `f` paints as one picture, composited into what is beneath
+    /// it filtered by `filters`, faded to `opacity` and mixed by
+    /// `blend_mode`: CSS's `filter`, `opacity` and `mix-blend-mode` on an
+    /// element, whose bounds are `bounds`, and its children.
+    ///
+    /// Unlike an element's opacity, which fades each thing it paints, a
+    /// group's opacity fades the group as a whole, so its overlapping parts do
+    /// not show through each other. A group with no effect to apply paints in
+    /// place, as `f` alone would.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_compositing<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        opacity: f32,
+        blend_mode: BlendMode,
         filters: &[Filter],
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
@@ -5220,31 +5242,29 @@ impl Window {
             .filter(|filter| !filter.is_identity())
             .map(|filter| filter.scale(scale_factor))
             .collect();
-        if filters.is_empty() {
+        let opacity = opacity.clamp(0.0, 1.0);
+        if filters.is_empty() && opacity >= 1.0 && blend_mode == BlendMode::Normal {
             return f(self);
         }
 
         // Snapshot the (scaled) group parameters once so the start and end markers agree.
         //
-        // `opacity` is 1.0 — NOT `element_opacity()`. The group's children/bg/border are painted
-        // through the normal paint methods while `element_opacity` is still in effect, so they
-        // already carry the element's opacity (consistent with gpui's per-primitive opacity for
-        // non-filtered elements). Re-applying it at composite time would double it (e.g.
-        // `.blur(r).opacity(0.5)` would render at 0.25 instead of 0.5).
-        let boundary = FilterBoundary {
+        // The element's own opacity is not applied to the group: what the group paints
+        // already carries it (consistent with gpui's per-primitive opacity), and applying it
+        // again at composite time would double it.
+        let boundary = GroupBoundary {
             order: 0,
             bounds: self.viewport_bounds(self.snap_bounds(bounds)),
             content_mask: self.snapped_content_mask(),
-            corner_radii: corner_radii.scale(scale_factor),
-            corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
             filters,
-            opacity: 1.0,
+            opacity,
+            blend_mode,
             is_start: true,
         };
 
         self.next_frame.scene.insert_primitive(boundary.clone());
         let result = f(self);
-        self.next_frame.scene.insert_primitive(FilterBoundary {
+        self.next_frame.scene.insert_primitive(GroupBoundary {
             is_start: false,
             ..boundary
         });
@@ -9269,14 +9289,6 @@ mod tests {
                         .backdrop_filters
                         .iter()
                         .map(|filter| filter.corner_smoothing),
-                );
-                assert_smoothing(
-                    "filter boundaries",
-                    2,
-                    scene
-                        .filter_boundaries
-                        .iter()
-                        .map(|boundary| boundary.corner_smoothing),
                 );
                 assert_smoothing(
                     "images",

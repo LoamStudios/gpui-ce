@@ -74,19 +74,19 @@ pub mod underline {
             return transparent();
         }
         let underline = get!(UNDERLINES)[input.underline_id as usize];
-        let point = local_position(underline.transform, input.position.xy());
+        let point = local_position(underline.transform, scene_position(input.position.xy()));
         if !is_enabled(underline.wavy) {
             return blend_color(
                 input.color,
-                ContentMask::alpha(underline.content_mask, input.position.xy())
-                    * clip_coverage(underline.clip, input.position.xy()),
+                ContentMask::alpha(underline.content_mask, scene_position(input.position.xy()))
+                    * clip_coverage(underline.clip, scene_position(input.position.xy())),
             );
         }
         blend_color(
             input.color,
             wavy_underline_coverage(underline, point)
-                * ContentMask::alpha(underline.content_mask, input.position.xy())
-                * clip_coverage(underline.clip, input.position.xy()),
+                * ContentMask::alpha(underline.content_mask, scene_position(input.position.xy()))
+                * clip_coverage(underline.clip, scene_position(input.position.xy())),
         )
     }
 }
@@ -180,8 +180,8 @@ pub mod monochrome_sprite {
         blend_color(
             input.color,
             corrected
-                * ContentMask::alpha(sprite.content_mask, input.position.xy())
-                * clip_coverage(sprite.clip, input.position.xy()),
+                * ContentMask::alpha(sprite.content_mask, scene_position(input.position.xy()))
+                * clip_coverage(sprite.clip, scene_position(input.position.xy())),
         )
     }
 }
@@ -286,7 +286,7 @@ pub mod polychrome_sprite {
             return transparent();
         }
         let sprite = get!(POLYCHROME_SPRITES)[input.sprite_id as usize];
-        let point = local_position(sprite.transform, input.position.xy());
+        let point = local_position(sprite.transform, scene_position(input.position.xy()));
         let color = polychrome_color(sprite, input.tile_position);
         blend_color(
             color,
@@ -296,8 +296,8 @@ pub mod polychrome_sprite {
                     sprite.bounds,
                     sprite.corner_radii,
                 ))
-                * ContentMask::alpha(sprite.content_mask, input.position.xy())
-                * clip_coverage(sprite.clip, input.position.xy()),
+                * ContentMask::alpha(sprite.content_mask, scene_position(input.position.xy()))
+                * clip_coverage(sprite.clip, scene_position(input.position.xy())),
         )
     }
 
@@ -358,7 +358,7 @@ pub mod polychrome_sprite {
             return transparent();
         }
         let sprite = get!(POLYCHROME_SPRITES)[input.sprite_id as usize];
-        let point = local_position(sprite.transform, input.position.xy());
+        let point = local_position(sprite.transform, scene_position(input.position.xy()));
         let color = polychrome_color(sprite, input.tile_position);
         blend_color(
             color,
@@ -375,8 +375,8 @@ pub mod polychrome_sprite {
                         superellipse_power: input.superellipse_power,
                     },
                 ))
-                * ContentMask::alpha(sprite.content_mask, input.position.xy())
-                * clip_coverage(sprite.clip, input.position.xy()),
+                * ContentMask::alpha(sprite.content_mask, scene_position(input.position.xy()))
+                * clip_coverage(sprite.clip, scene_position(input.position.xy())),
         )
     }
 }
@@ -480,8 +480,9 @@ pub mod subpixel_sprite {
             get!(FONT_RASTERIZATION).subpixel_enhanced_contrast,
             get!(FONT_RASTERIZATION).gamma_ratios,
         );
-        let mask_alpha = ContentMask::alpha(sprite.content_mask, input.position.xy())
-            * clip_coverage(sprite.clip, input.position.xy());
+        let mask_alpha =
+            ContentMask::alpha(sprite.content_mask, scene_position(input.position.xy()))
+                * clip_coverage(sprite.clip, scene_position(input.position.xy()));
         SubpixelSpriteFragmentOutput {
             foreground: vec4f(input.color.x, input.color.y, input.color.z, 1.0),
             alpha: vec4f(

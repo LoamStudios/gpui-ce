@@ -972,6 +972,21 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Composites this element and its children with `opacity` as one
+    /// picture, as CSS `opacity` does: overlapping children do not show
+    /// through each other, as they do under [`Styled::opacity`].
+    fn group_opacity(mut self, opacity: f32) -> Self {
+        self.style().group_opacity = Some(opacity);
+        self
+    }
+
+    /// Mixes this element and its children with what is beneath them, as one
+    /// picture, like CSS `mix-blend-mode`.
+    fn mix_blend_mode(mut self, mode: crate::BlendMode) -> Self {
+        self.style().mix_blend_mode = Some(mode);
+        self
+    }
+
     /// Transforms this element and its children about the element's center,
     /// after any transform already set, without affecting layout.
     fn transform(mut self, transform: impl Into<kurbo::Affine>) -> Self {

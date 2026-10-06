@@ -235,7 +235,7 @@ pub mod shadow {
             return transparent();
         }
         let shadow = get!(SHADOWS)[input.shadow_id as usize];
-        let point = local_position(shadow.transform, input.position.xy());
+        let point = local_position(shadow.transform, scene_position(input.position.xy()));
         let color = paint_color(
             shadow_paint(shadow),
             point,
@@ -244,8 +244,8 @@ pub mod shadow {
         blend_color(
             color,
             shadow_coverage(shadow, point)
-                * ContentMask::alpha(shadow.content_mask, input.position.xy())
-                * clip_coverage(shadow.clip, input.position.xy()),
+                * ContentMask::alpha(shadow.content_mask, scene_position(input.position.xy()))
+                * clip_coverage(shadow.clip, scene_position(input.position.xy())),
         )
     }
 
@@ -325,7 +325,7 @@ pub mod shadow {
             return transparent();
         }
         let shadow = get!(SHADOWS)[input.shadow_id as usize];
-        let point = local_position(shadow.transform, input.position.xy());
+        let point = local_position(shadow.transform, scene_position(input.position.xy()));
         let coverage = smoothed_shadow_coverage(
             shadow,
             point,
@@ -350,8 +350,8 @@ pub mod shadow {
         blend_color(
             color,
             coverage
-                * ContentMask::alpha(shadow.content_mask, input.position.xy())
-                * clip_coverage(shadow.clip, input.position.xy()),
+                * ContentMask::alpha(shadow.content_mask, scene_position(input.position.xy()))
+                * clip_coverage(shadow.clip, scene_position(input.position.xy())),
         )
     }
 }
