@@ -164,6 +164,52 @@ pub(crate) fn transformed_bounds(
     Bounds::from_corners(min, max)
 }
 
+/// Where records reused from the previous frame go.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Placement {
+    /// Moved by an offset, in the coordinates of the element they were
+    /// recorded in.
+    Offset(Point<Pixels>),
+    /// Placed by a transform of window coordinates, in logical pixels: for
+    /// records whose element is now drawn under another transform.
+    Transform(TransformationMatrix),
+}
+
+impl Default for Placement {
+    fn default() -> Self {
+        Self::Offset(Point::default())
+    }
+}
+
+impl Placement {
+    /// Whether the records stay where they were.
+    pub(crate) fn is_zero(&self) -> bool {
+        match self {
+            Self::Offset(offset) => offset.is_zero(),
+            Self::Transform(transformation) => *transformation == TransformationMatrix::UNIT,
+        }
+    }
+
+    /// This placement, then `next`, for records in window coordinates (as
+    /// deferred draws are), where an offset is a window offset.
+    pub(crate) fn then(self, next: Self) -> Self {
+        match (self, next) {
+            (Self::Offset(first), Self::Offset(second)) => Self::Offset(first + second),
+            (first, second) => Self::Transform(second.matrix().compose(first.matrix())),
+        }
+    }
+
+    fn matrix(self) -> TransformationMatrix {
+        match self {
+            Self::Offset(offset) => TransformationMatrix {
+                rotation_scale: TransformationMatrix::UNIT.rotation_scale,
+                translation: [offset.x.0, offset.y.0],
+            },
+            Self::Transform(transformation) => transformation,
+        }
+    }
+}
+
 /// A clip set in a space not aligned with the window: an entry of the
 /// window's transformed-clip stack.
 #[derive(Clone, Copy, Debug)]

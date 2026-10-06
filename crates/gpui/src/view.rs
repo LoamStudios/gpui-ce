@@ -1,9 +1,9 @@
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, AppContext as _, Bounds, ContentMask, Context,
-    Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, IsZero,
-    LayoutId, MouseMoveEvent, PaintIndex, Pixels, Point, PrepaintStateIndex, Render, RenderOnce,
-    ResolvedDirection, Style, StyleRefinement, TextStyle, TransformationMatrix, UnicodeBidi,
-    WeakEntity, px,
+    Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutId, MouseMoveEvent, PaintIndex, Pixels, Placement, Point, PrepaintStateIndex, Render,
+    RenderOnce, ResolvedDirection, Style, StyleRefinement, TextStyle, TransformationMatrix,
+    UnicodeBidi, WeakEntity, px,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -349,9 +349,9 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
-    /// How far the reused prepaint records were moved this frame, for paint
-    /// to move the paint records by the same amount.
-    reuse_offset: Point<Pixels>,
+    /// Where the reused prepaint records were placed this frame, for paint to
+    /// place the paint records the same way.
+    reuse_placement: Placement,
     /// The records have been moved since the view was last rendered, so the
     /// closures it registered during paint still hold the coordinates it was
     /// rendered at.
@@ -386,10 +386,13 @@ struct ViewElementCacheKey {
     /// another position; a clipped recording is missing what fell outside.
     unclipped: bool,
     /// The transform from the view's coordinates to the window's when it was
-    /// recorded (`Window::with_transform`). Records are reused only under the
-    /// same transform: under another they would be placed, and text in them
-    /// rasterized, for the wrong one.
+    /// recorded (`Window::with_transform`). Under another transform the
+    /// records are placed by the change between them.
     to_window: TransformationMatrix,
+    /// The view was recorded in a space aligned with the window: its records
+    /// are in window coordinates, and a placement that keeps them aligned
+    /// maps them exactly and rasterizes their text again.
+    aligned: bool,
 }
 
 /// Whether `bounds` lies entirely inside `content_mask`, edges included —
@@ -404,14 +407,56 @@ fn unclipped_by(bounds: Bounds<Pixels>, content_mask: &ContentMask<Pixels>) -> b
 }
 
 impl ViewElementState {
-    /// Whether the records can be reused at `bounds` under `content_mask`:
-    /// exactly as they are, or moved by the returned offset.
+    /// Whether the records can be reused at `bounds` under `content_mask`,
+    /// and where they go: exactly as they are, moved by an offset, or, under
+    /// another transform than they were recorded under, placed by the change.
     ///
     /// A move is rounded to whole device pixels: glyph sprites are snapped to
     /// the pixel and rasterized for that position, so moving them by a
-    /// fraction of a pixel would blur them. The view under the pointer is not
+    /// fraction of a pixel would blur them. A recording made under a rotation
+    /// is placed on the GPU, with its text as rasterized, so it is reused only
+    /// by a change that does not scale it. The view under the pointer is not
     /// moved: the closures it registered during paint hold the coordinates it
     /// was rendered at, so it is rendered again where it is instead.
+    fn reuse_placement(
+        &self,
+        bounds: Bounds<Pixels>,
+        content_mask: &ContentMask<Pixels>,
+        window: &Window,
+    ) -> Option<Placement> {
+        let key = &self.cache_key;
+        let space = window.element_space();
+        let placement = if key.to_window != space.to_window {
+            if !key.unclipped || key.bounds.size != bounds.size {
+                return None;
+            }
+            let recorded_origin = key.bounds.origin + key.records_offset;
+            let moved = bounds.origin - recorded_origin;
+            let transformation = space
+                .to_window
+                .compose(TransformationMatrix {
+                    rotation_scale: TransformationMatrix::UNIT.rotation_scale,
+                    translation: [moved.x.0, moved.y.0],
+                })
+                .compose(key.to_window.inverse()?);
+            let [[a, b], [c, d]] = transformation.rotation_scale;
+            if !(key.aligned && space.is_aligned()) && ((a * d - b * c).abs() - 1.).abs() > 1e-4 {
+                return None;
+            }
+            Placement::Transform(transformation)
+        } else {
+            Placement::Offset(self.reuse_offset(bounds, content_mask, window)?)
+        };
+        if (self.moved_since_render || !placement.is_zero())
+            && bounds.contains(&window.mouse_position())
+        {
+            return None;
+        }
+        Some(placement)
+    }
+
+    /// The offset the records move by under the transform they were recorded
+    /// under, if they can be reused at `bounds` under `content_mask`.
     fn reuse_offset(
         &self,
         bounds: Bounds<Pixels>,
@@ -434,11 +479,6 @@ impl ViewElementState {
         } else {
             return None;
         };
-        if (self.moved_since_render || !offset.is_zero())
-            && bounds.contains(&window.mouse_position())
-        {
-            return None;
-        }
         Some(offset)
     }
 }
@@ -574,37 +614,43 @@ impl<V: View> Element for ViewElement<V> {
                                 direction: window.resolved_direction(),
                                 unicode_bidi: window.resolved_unicode_bidi(),
                                 to_window: window.element_space().to_window,
+                                aligned: window.element_space().is_aligned(),
                             };
 
                             if request_layout.element.is_none()
                                 && let Some(mut element_state) = element_state
                                 && element_state.frame != window.next_frame.id
-                                && element_state.cache_key.to_window == cache_key.to_window
                                 && element_state.cache_key.text_style == cache_key.text_style
                                 && element_state.cache_key.direction == cache_key.direction
                                 && element_state.cache_key.unicode_bidi == cache_key.unicode_bidi
                                 && !window.dirty_views.contains(&entity_id)
                                 && !window.refreshing
-                                && let Some(offset) =
-                                    element_state.reuse_offset(bounds, &content_mask, window)
+                                && let Some(placement) =
+                                    element_state.reuse_placement(bounds, &content_mask, window)
                             {
                                 let prepaint_start = window.prepaint_index();
                                 window.reuse_prepaint_at(
                                     element_state.prepaint_range.clone(),
-                                    offset,
+                                    placement,
                                 );
                                 cx.entities
                                     .extend_accessed(&element_state.accessed_entities);
                                 let prepaint_end = window.prepaint_index();
                                 element_state.frame = window.next_frame.id;
                                 element_state.prepaint_range = prepaint_start..prepaint_end;
-                                element_state.reuse_offset = offset;
-                                element_state.moved_since_render |= !offset.is_zero();
+                                element_state.reuse_placement = placement;
+                                element_state.moved_since_render |= !placement.is_zero();
                                 // The records now describe the view here, clipped
-                                // by what clips it here.
-                                let records_origin = element_state.cache_key.bounds.origin
-                                    + element_state.cache_key.records_offset
-                                    + offset;
+                                // by what clips it here. A placement under another
+                                // transform puts them exactly where the view is.
+                                let records_origin = match placement {
+                                    Placement::Offset(offset) => {
+                                        element_state.cache_key.bounds.origin
+                                            + element_state.cache_key.records_offset
+                                            + offset
+                                    }
+                                    Placement::Transform(_) => bounds.origin,
+                                };
                                 element_state.cache_key = ViewElementCacheKey {
                                     records_offset: records_origin - bounds.origin,
                                     ..cache_key
@@ -660,7 +706,7 @@ impl<V: View> Element for ViewElement<V> {
                                     prepaint_range: prepaint_start..prepaint_end,
                                     paint_range: PaintIndex::default()..PaintIndex::default(),
                                     cache_key,
-                                    reuse_offset: Point::default(),
+                                    reuse_placement: Placement::default(),
                                     moved_since_render: false,
                                 },
                             )
@@ -713,7 +759,7 @@ impl<V: View> Element for ViewElement<V> {
                                 } else {
                                     window.reuse_paint_at(
                                         element_state.paint_range.clone(),
-                                        element_state.reuse_offset,
+                                        element_state.reuse_placement,
                                     );
                                 }
                                 let paint_end = window.paint_index();

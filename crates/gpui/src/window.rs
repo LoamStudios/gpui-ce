@@ -76,12 +76,55 @@ use crate::profiler;
 
 pub(crate) mod a11y;
 mod transform;
-pub(crate) use transform::{ElementSpace, HitboxClip, TransformedClip, transformed_bounds};
+use crate::scene::{GlyphSource, PlacedGlyph, UniformPlacement};
+pub(crate) use transform::{
+    ElementSpace, HitboxClip, Placement, TransformedClip, transformed_bounds,
+};
 mod prompts;
 
 use a11y::A11y;
 pub use a11y::A11ySubtreeBuilder;
 pub use prompts::*;
+
+/// A glyph rasterized into the atlas for its source; see [`rasterize_glyph`].
+struct RasterizedGlyph {
+    bounds: Bounds<ScaledPixels>,
+    tile: AtlasTile,
+    format: RasterizedGlyphFormat,
+    /// The source, with the subpixel variant it was rasterized for.
+    source: GlyphSource,
+}
+
+/// Rasterizes the glyph `source` describes, through the atlas, snapping its
+/// origin to the pixel grid: `None` for a glyph with no pixels.
+fn rasterize_glyph(
+    atlas: &Arc<dyn PlatformAtlas>,
+    text_system: &Arc<WindowTextSystem>,
+    mut source: GlyphSource,
+) -> Result<Option<RasterizedGlyph>> {
+    let (integer_origin, subpixel_variant) = if source.color {
+        quantize_color_glyph_origin(source.origin)
+    } else {
+        quantize_glyph_origin(source.origin)
+    };
+    source.params.subpixel_variant = subpixel_variant;
+    let params = &source.params;
+    let entry =
+        atlas.get_or_insert_glyph_with(params, &mut || text_system.rasterize_glyph(params))?;
+    let Some(tile) = entry.tile else {
+        return Ok(None);
+    };
+    debug_assert_eq!(entry.bounds.size, tile.bounds.size.map(Into::into));
+    Ok(Some(RasterizedGlyph {
+        bounds: Bounds {
+            origin: integer_origin + entry.bounds.origin.map(Into::into),
+            size: tile.bounds.size.map(Into::into),
+        },
+        tile,
+        format: entry.format,
+        source,
+    }))
+}
 
 fn quantize_glyph_origin(origin: Point<ScaledPixels>) -> (Point<ScaledPixels>, Point<u8>) {
     fn axis(value: ScaledPixels, variants: u8) -> (ScaledPixels, u8) {
@@ -1130,9 +1173,9 @@ pub(crate) struct DeferredDraw {
     absolute_offset: Point<Pixels>,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
-    /// How far the recorded ranges must move when this draw is reused from
-    /// the previous frame; zero once they have been replayed in this one.
-    reuse_offset: Point<Pixels>,
+    /// Where the recorded ranges go when this draw is reused from the
+    /// previous frame; nowhere once they have been replayed in this one.
+    reuse_placement: Placement,
 }
 
 pub(crate) struct Frame {
@@ -3713,7 +3756,7 @@ impl Window {
                     rem_size,
                     absolute_offset,
                     prepaint_range,
-                    reuse_offset,
+                    reuse_placement,
                 ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
@@ -3728,7 +3771,7 @@ impl Window {
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
                         deferred_draw.prepaint_range.clone(),
-                        deferred_draw.reuse_offset,
+                        deferred_draw.reuse_placement,
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
@@ -3746,7 +3789,7 @@ impl Window {
                     });
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
-                    self.reuse_prepaint_at(prepaint_range, reuse_offset);
+                    self.reuse_prepaint_at(prepaint_range, reuse_placement);
                 }
                 let prepaint_end = self.prepaint_index();
                 self.next_frame.deferred_draws[deferred_draw_ix].prepaint_range =
@@ -3797,14 +3840,14 @@ impl Window {
                 self.with_content_mask(content_mask, |window| {
                     window.reuse_paint_at(
                         deferred_draw.paint_range.clone(),
-                        deferred_draw.reuse_offset,
+                        deferred_draw.reuse_placement,
                     );
                 });
             }
             let paint_end = self.paint_index();
             deferred_draw.paint_range = paint_start..paint_end;
             // The records now live in this frame at their new position.
-            deferred_draw.reuse_offset = Point::default();
+            deferred_draw.reuse_placement = Placement::default();
         }
         self.next_frame.deferred_draws = deferred_draws;
         self.element_id_stack.clear();
@@ -3828,40 +3871,23 @@ impl Window {
         }
     }
 
-    /// Reuses the prepaint records in `range` of the rendered frame, moved by
-    /// `offset`. Everything positioned — hitboxes, deferred draws — moves,
-    /// and their content masks, which include whatever clipped them at the
-    /// old position, move with them and are then cut down to the mask in
-    /// effect here. The mask is cut down even for a zero offset: the records
-    /// may be reused in place under a mask that has since changed.
+    /// Reuses the prepaint records in `range` of the rendered frame, placed by
+    /// `placement`. Everything positioned — hitboxes, deferred draws — moves,
+    /// and their content masks, which include whatever clipped them where
+    /// they were, move with them and are then cut down to the mask in effect
+    /// here. The mask is cut down even for records that stay where they were:
+    /// they may be reused in place under a mask that has since changed.
     pub(crate) fn reuse_prepaint_at(
         &mut self,
         range: Range<PrepaintStateIndex>,
-        offset: Point<Pixels>,
+        placement: Placement,
     ) {
-        let clip = self.content_mask();
-        let moved_mask = |mask: ContentMask<Pixels>| mask.translate(offset).intersect(&clip);
-        // Hitboxes are in their elements' coordinates, as `offset` is; deferred
-        // draws are placed in the window's.
-        let window_offset = self.element_offset_in_window(offset);
-        let recording_clip = self.recording_clip;
-        let clipped_for_recording = |mask: ContentMask<Pixels>| match &recording_clip {
-            Some(clip) => mask.intersect(clip),
-            None => mask,
-        };
-        self.next_frame.hitboxes.extend(
-            self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
-                .iter()
-                .map(|hitbox| {
-                    let recorded_content_mask = moved_mask(hitbox.recorded_content_mask);
-                    Hitbox {
-                        bounds: hitbox.bounds + offset,
-                        content_mask: clipped_for_recording(recorded_content_mask),
-                        recorded_content_mask,
-                        ..hitbox.clone()
-                    }
-                }),
-        );
+        match placement {
+            Placement::Offset(offset) => self.reuse_hitboxes_moved(&range, offset),
+            Placement::Transform(transformation) => {
+                self.reuse_hitboxes_transformed(&range, &transformation)
+            }
+        }
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
                 [range.start.tooltips_index..range.end.tooltips_index]
@@ -3887,25 +3913,109 @@ impl Window {
             self.next_frame.focus = self.focus;
         }
 
+        // Deferred draws are placed in window coordinates.
+        let window_placement = match placement {
+            Placement::Offset(offset) => Placement::Offset(self.element_offset_in_window(offset)),
+            transform => transform,
+        };
         self.next_frame.deferred_draws.extend(
             self.rendered_frame.deferred_draws
                 [range.start.deferred_draws_index..range.end.deferred_draws_index]
                 .iter()
-                .map(|deferred_draw| DeferredDraw {
-                    current_view: deferred_draw.current_view,
-                    parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
-                    element_id_stack: deferred_draw.element_id_stack.clone(),
-                    text_style_stack: deferred_draw.text_style_stack.clone(),
-                    content_mask: deferred_draw
-                        .content_mask
-                        .map(|mask| mask.translate(window_offset)),
-                    rem_size: deferred_draw.rem_size,
-                    priority: deferred_draw.priority,
-                    element: None,
-                    absolute_offset: deferred_draw.absolute_offset + window_offset,
-                    prepaint_range: deferred_draw.prepaint_range.clone(),
-                    paint_range: deferred_draw.paint_range.clone(),
-                    reuse_offset: deferred_draw.reuse_offset + offset,
+                .map(|deferred_draw| {
+                    let (absolute_offset, content_mask) = match window_placement {
+                        Placement::Offset(offset) => (
+                            deferred_draw.absolute_offset + offset,
+                            deferred_draw
+                                .content_mask
+                                .map(|mask| mask.translate(offset)),
+                        ),
+                        Placement::Transform(transformation) => (
+                            transformation.apply(deferred_draw.absolute_offset),
+                            deferred_draw.content_mask.map(|mask| ContentMask {
+                                bounds: transformed_bounds(&transformation, mask.bounds),
+                                fade_out: Edges::default(),
+                            }),
+                        ),
+                    };
+                    DeferredDraw {
+                        current_view: deferred_draw.current_view,
+                        parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
+                        element_id_stack: deferred_draw.element_id_stack.clone(),
+                        text_style_stack: deferred_draw.text_style_stack.clone(),
+                        content_mask,
+                        rem_size: deferred_draw.rem_size,
+                        priority: deferred_draw.priority,
+                        element: None,
+                        absolute_offset,
+                        prepaint_range: deferred_draw.prepaint_range.clone(),
+                        paint_range: deferred_draw.paint_range.clone(),
+                        reuse_placement: deferred_draw.reuse_placement.then(window_placement),
+                    }
+                }),
+        );
+    }
+
+    /// Reuses the rendered frame's hitboxes in `range`, moved by `offset` in
+    /// their elements' coordinates.
+    fn reuse_hitboxes_moved(&mut self, range: &Range<PrepaintStateIndex>, offset: Point<Pixels>) {
+        let clip = self.content_mask();
+        let moved_mask = |mask: ContentMask<Pixels>| mask.translate(offset).intersect(&clip);
+        let recording_clip = self.element_recording_clip();
+        let clipped_for_recording = |mask: ContentMask<Pixels>| match &recording_clip {
+            Some(clip) => mask.intersect(clip),
+            None => mask,
+        };
+        self.next_frame.hitboxes.extend(
+            self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
+                .iter()
+                .map(|hitbox| {
+                    let recorded_content_mask = moved_mask(hitbox.recorded_content_mask);
+                    Hitbox {
+                        bounds: hitbox.bounds + offset,
+                        content_mask: clipped_for_recording(recorded_content_mask),
+                        recorded_content_mask,
+                        ..hitbox.clone()
+                    }
+                }),
+        );
+    }
+
+    /// Reuses the rendered frame's hitboxes in `range`, placed by
+    /// `transformation` of window coordinates. They keep their bounds, in
+    /// their elements' coordinates, and reach them through the placement;
+    /// the window's clip here becomes one of their clips.
+    fn reuse_hitboxes_transformed(
+        &mut self,
+        range: &Range<PrepaintStateIndex>,
+        transformation: &TransformationMatrix,
+    ) {
+        let inverse = transformation
+            .inverse()
+            .unwrap_or(TransformationMatrix::UNIT);
+        let window_clip = self
+            .recording_clip
+            .unwrap_or_else(|| self.window_content_mask());
+        self.next_frame.hitboxes.extend(
+            self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
+                .iter()
+                .map(|hitbox| {
+                    let to_element = hitbox
+                        .to_element
+                        .unwrap_or(TransformationMatrix::UNIT)
+                        .compose(inverse);
+                    let transformed_clips = hitbox
+                        .transformed_clips
+                        .iter()
+                        .flat_map(|clips| clips.iter())
+                        .map(|(bounds, to_clip)| (*bounds, to_clip.compose(inverse)))
+                        .chain([(window_clip.bounds, TransformationMatrix::UNIT)])
+                        .collect();
+                    Hitbox {
+                        to_element: Some(to_element),
+                        transformed_clips: Some(transformed_clips),
+                        ..hitbox.clone()
+                    }
                 }),
         );
     }
@@ -3924,7 +4034,7 @@ impl Window {
 
     /// Reuses the paint records in `range` of the rendered frame, with the
     /// scene primitives moved by `offset`; see [`Self::reuse_prepaint_at`].
-    pub(crate) fn reuse_paint_at(&mut self, range: Range<PaintIndex>, offset: Point<Pixels>) {
+    pub(crate) fn reuse_paint_at(&mut self, range: Range<PaintIndex>, placement: Placement) {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -3957,15 +4067,42 @@ impl Window {
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
         let clip = self.snapped_content_mask();
-        let device_offset = self
-            .element_offset_in_window(offset)
-            .scale(self.scale_factor());
-        self.next_frame.scene.replay_at(
-            range.start.scene_index..range.end.scene_index,
-            &self.rendered_frame.scene,
-            device_offset,
-            &clip,
-        );
+        let scale_factor = self.scale_factor();
+        match placement {
+            Placement::Offset(offset) => {
+                let device_offset = self.element_offset_in_window(offset).scale(scale_factor);
+                self.next_frame.scene.replay_at(
+                    range.start.scene_index..range.end.scene_index,
+                    &self.rendered_frame.scene,
+                    device_offset,
+                    &clip,
+                );
+            }
+            Placement::Transform(transformation) => {
+                let device_placement = TransformationMatrix {
+                    translation: transformation.translation.map(|value| value * scale_factor),
+                    ..transformation
+                };
+                let (atlas, text_system) = (&self.sprite_atlas, &self.text_system);
+                self.next_frame.scene.replay_placed(
+                    range.start.scene_index..range.end.scene_index,
+                    &self.rendered_frame.scene,
+                    &device_placement,
+                    &clip,
+                    &mut |source: &GlyphSource, placement: &UniformPlacement| {
+                        let mut source = source.clone();
+                        source.params.scale_factor *= placement.scale;
+                        source.origin = placement.point(source.origin);
+                        let glyph = rasterize_glyph(atlas, text_system, source).ok()??;
+                        Some(PlacedGlyph {
+                            bounds: glyph.bounds,
+                            tile: glyph.tile,
+                            source: glyph.source,
+                        })
+                    },
+                );
+            }
+        }
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -4251,7 +4388,12 @@ impl Window {
     /// it is, so its recording keeps its own clips.
     pub(crate) fn with_cached_view_recording<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         // Under a transform, the view is recorded as it is drawn, clipped.
-        if self.recording_clip.is_some() || !self.element_space().is_window() {
+        // A view under a rotation, or under a clip that is, is recorded as it
+        // is drawn, clipped: its clip is not one rectangle of the window.
+        if self.recording_clip.is_some()
+            || !self.element_space().is_aligned()
+            || !self.transformed_clips.is_empty()
+        {
             return f(self);
         }
         let clip = self.window_content_mask();
@@ -4278,10 +4420,24 @@ impl Window {
     /// `mask` cut down to the recording clip, if a cached view is being
     /// recorded: what applies in this frame to something recorded under it.
     fn clipped_for_recording(&self, mask: ContentMask<Pixels>) -> ContentMask<Pixels> {
-        match &self.recording_clip {
+        match &self.element_recording_clip() {
             Some(clip) => mask.intersect(clip),
             None => mask,
         }
+    }
+
+    /// The recording clip, if any, in the current element's coordinates.
+    fn element_recording_clip(&self) -> Option<ContentMask<Pixels>> {
+        let clip = self.recording_clip?;
+        let space = self.element_space();
+        Some(ContentMask {
+            bounds: space.element_bounds(clip.bounds),
+            fade_out: if space.is_window() {
+                clip.fade_out
+            } else {
+                Edges::default()
+            },
+        })
     }
 
     /// Obtain the current content mask, in the current element's coordinates.
@@ -4582,7 +4738,7 @@ impl Window {
             absolute_offset,
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
-            reuse_offset: Point::default(),
+            reuse_placement: Placement::default(),
         });
     }
 
@@ -5109,7 +5265,6 @@ impl Window {
             .paint_point(origin)
             .scale(self.scale_factor());
 
-        let (integer_origin, subpixel_variant) = quantize_glyph_origin(glyph_origin);
         let requested_mode = if self.should_use_subpixel_rendering(font_id, font_size) {
             GlyphRenderMode::Subpixel
         } else {
@@ -5122,77 +5277,89 @@ impl Window {
             font_id,
             glyph_id,
             font_size,
-            subpixel_variant,
+            subpixel_variant: Point::default(),
             scale_factor,
             raster_style,
         };
 
-        self.paint_glyph_from_atlas(integer_origin, params, color, element_opacity)
+        self.paint_glyph_from_atlas(glyph_origin, params, false, color, element_opacity)
     }
 
+    /// Paints a glyph whose origin, in device pixels, is `origin`, recording
+    /// where it came from so a replay at another scale can rasterize it again.
     fn paint_glyph_from_atlas(
         &mut self,
-        integer_origin: Point<ScaledPixels>,
+        origin: Point<ScaledPixels>,
         params: RenderGlyphParams,
+        color_glyph: bool,
         mask_color: Hsla,
         opacity: f32,
     ) -> Result<()> {
         let (transform, clip) = (self.scene_transform(), self.scene_clip());
-        let text_system = self.text_system().clone();
-        let entry = self
-            .sprite_atlas
-            .get_or_insert_glyph_with(&params, &mut || text_system.rasterize_glyph(&params))?;
-        let Some(tile) = entry.tile else {
+        let source = GlyphSource {
+            params,
+            origin,
+            color: color_glyph,
+        };
+        let Some(glyph) = rasterize_glyph(&self.sprite_atlas, &self.text_system, source)? else {
             return Ok(());
         };
-
-        debug_assert_eq!(entry.bounds.size, tile.bounds.size.map(Into::into));
-        let bounds = Bounds {
-            origin: integer_origin + entry.bounds.origin.map(Into::into),
-            size: tile.bounds.size.map(Into::into),
-        };
+        let (bounds, tile, format) = (glyph.bounds, glyph.tile, glyph.format);
         let content_mask = self.snapped_content_mask();
 
-        match entry.format {
+        let source = glyph.source;
+        match format {
             RasterizedGlyphFormat::AlphaMask => {
-                self.next_frame.scene.insert_primitive(MonochromeSprite {
-                    transform,
-                    clip,
-                    order: 0,
-                    padding: 0,
-                    bounds,
-                    content_mask,
-                    color: mask_color.opacity(opacity).into(),
-                    tile,
-                    transformation: TransformationMatrix::unit(),
-                });
+                self.next_frame.scene.insert_glyph(
+                    MonochromeSprite {
+                        transform,
+                        clip,
+                        order: 0,
+                        padding: 0,
+                        bounds,
+                        content_mask,
+                        color: mask_color.opacity(opacity).into(),
+                        tile,
+                        transformation: TransformationMatrix::unit(),
+                    }
+                    .into(),
+                    source,
+                );
             }
             RasterizedGlyphFormat::BgraSubpixelMask => {
-                self.next_frame.scene.insert_primitive(SubpixelSprite {
-                    transform,
-                    clip,
-                    order: 0,
-                    padding: 0,
-                    bounds,
-                    content_mask,
-                    color: mask_color.opacity(opacity).into(),
-                    tile,
-                    transformation: TransformationMatrix::unit(),
-                });
+                self.next_frame.scene.insert_glyph(
+                    SubpixelSprite {
+                        transform,
+                        clip,
+                        order: 0,
+                        padding: 0,
+                        bounds,
+                        content_mask,
+                        color: mask_color.opacity(opacity).into(),
+                        tile,
+                        transformation: TransformationMatrix::unit(),
+                    }
+                    .into(),
+                    source,
+                );
             }
             RasterizedGlyphFormat::BgraColor => {
-                self.next_frame.scene.insert_primitive(PolychromeSprite {
-                    transform,
-                    clip,
-                    order: 0,
-                    grayscale: false.into(),
-                    corner_smoothing: 0.0,
-                    bounds,
-                    corner_radii: Default::default(),
-                    content_mask,
-                    tile,
-                    opacity,
-                });
+                self.next_frame.scene.insert_glyph(
+                    PolychromeSprite {
+                        transform,
+                        clip,
+                        order: 0,
+                        grayscale: false.into(),
+                        corner_smoothing: 0.0,
+                        bounds,
+                        corner_radii: Default::default(),
+                        content_mask,
+                        tile,
+                        opacity,
+                    }
+                    .into(),
+                    source,
+                );
             }
         }
         Ok(())
@@ -5255,7 +5422,6 @@ impl Window {
             .element_space()
             .paint_point(origin)
             .scale(self.scale_factor());
-        let (integer_origin, subpixel_variant) = quantize_color_glyph_origin(glyph_origin);
         let raster_style = self.text_system().prepare_raster_style(
             font_id,
             glyph_id,
@@ -5266,12 +5432,12 @@ impl Window {
             font_id,
             glyph_id,
             font_size,
-            subpixel_variant,
+            subpixel_variant: Point::default(),
             scale_factor,
             raster_style,
         };
 
-        self.paint_glyph_from_atlas(integer_origin, params, color, self.element_opacity())
+        self.paint_glyph_from_atlas(glyph_origin, params, true, color, self.element_opacity())
     }
 
     /// Paint a monochrome SVG into the scene for the next frame at the current stacking context.

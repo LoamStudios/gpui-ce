@@ -231,10 +231,10 @@ fn hit_testing_and_mouse_events_follow_the_transform(cx: &mut TestAppContext) {
     );
 }
 
-/// A cached card inside an element rotated by `angle`.
-struct RotatedCard {
+/// A cached card inside an element under `transform`.
+struct TransformedCard {
     card: Entity<Card>,
-    angle: Rc<Cell<f32>>,
+    transform: Rc<Cell<kurbo::Affine>>,
 }
 
 struct Card {
@@ -244,60 +244,137 @@ struct Card {
 impl Render for Card {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         self.renders.set(self.renders.get() + 1);
-        div().size_full().bg(red())
+        div()
+            .size_full()
+            .bg(red())
+            .border_2()
+            .border_color(hsla(0.6, 1., 0.5, 1.))
+            .rounded(px(6.))
     }
 }
 
-impl Render for RotatedCard {
+impl Render for TransformedCard {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let mut style = crate::StyleRefinement::default();
         style.size.width = Some(px(50.).into());
-        style.size.height = Some(px(50.).into());
-        div()
-            .size(px(100.))
-            .rotate(crate::radians(self.angle.get()))
-            .child(self.card.clone().cached(style))
+        style.size.height = Some(px(40.).into());
+        div().size(px(400.)).relative().child(
+            div()
+                .absolute()
+                .left(px(100.))
+                .top(px(100.))
+                .size(px(100.))
+                .transform(self.transform.get())
+                .child(self.card.clone().cached(style)),
+        )
     }
 }
 
-#[crate::test]
-fn a_cached_view_is_reused_under_the_same_transform_only(cx: &mut TestAppContext) {
+/// The card's quad, with its corners in the viewport, after drawing the
+/// window, with the card notified first when `fresh`.
+fn card_quad(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    fresh: bool,
+) -> (Quad, [Point<Pixels>; 2]) {
+    cx.update_window(window, |root, window, cx| {
+        let root = root.downcast::<TransformedCard>().unwrap();
+        if fresh {
+            let card = root.read(cx).card.clone();
+            card.update(cx, |_, cx| cx.notify());
+        }
+        root.update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+        let scene = &window.rendered_frame.scene;
+        let quad = scene.quads[0];
+        let transformation = scene.transforms()[quad.transform as usize].transformation;
+        let corner =
+            |point: Point<ScaledPixels>| transformation.apply(point.map(|value| px(value.0)));
+        (
+            quad,
+            [
+                corner(quad.bounds.origin),
+                corner(quad.bounds.bottom_right()),
+            ],
+        )
+    })
+    .unwrap()
+}
+
+fn transformed_card(
+    cx: &mut TestAppContext,
+    transform: kurbo::Affine,
+) -> (AnyWindowHandle, Rc<Cell<usize>>, Rc<Cell<kurbo::Affine>>) {
     let renders = Rc::new(Cell::new(0));
-    let angle = Rc::new(Cell::new(0.3));
-    let window: AnyWindowHandle = cx
+    let transform = Rc::new(Cell::new(transform));
+    let window = cx
         .add_window({
-            let (renders, angle) = (renders.clone(), angle.clone());
-            move |_, cx| RotatedCard {
+            let (renders, transform) = (renders.clone(), transform.clone());
+            move |_, cx| TransformedCard {
                 card: cx.new(|_| Card { renders }),
-                angle,
+                transform,
             }
         })
         .into();
-    let draw = |cx: &mut TestAppContext| {
-        cx.update_window(window, |root, window, cx| {
-            root.downcast::<RotatedCard>()
-                .unwrap()
-                .update(cx, |_, cx| cx.notify());
-            window.draw(cx).clear(cx)
-        })
-        .unwrap();
-    };
-    assert_eq!(renders.get(), 1);
-    draw(cx);
-    assert_eq!(renders.get(), 1, "reused under the same rotation");
-    let (quad, transform_count) = cx
-        .update_window(window, |_, window, _| {
-            let scene = &window.rendered_frame.scene;
-            (scene.quads[0], scene.transforms().len())
-        })
-        .unwrap();
-    assert_ne!(quad.transform, 0);
-    assert!(
-        (quad.transform as usize) < transform_count,
-        "the reused quad refers to this frame's transform table"
-    );
+    (window, renders, transform)
+}
 
-    angle.set(0.6);
-    draw(cx);
-    assert_eq!(renders.get(), 2, "rendered again under another rotation");
+#[crate::test]
+fn a_cached_view_is_placed_under_a_new_zoom_as_if_painted_there(cx: &mut TestAppContext) {
+    let (window, renders, transform) = transformed_card(cx, kurbo::Affine::scale(1.));
+    card_quad(cx, window, false);
+    assert_eq!(renders.get(), 1);
+
+    transform.set(kurbo::Affine::scale(1.5));
+    let (reused, _) = card_quad(cx, window, false);
+    assert_eq!(renders.get(), 1, "zooming reuses the card");
+    assert_eq!(reused.transform, 0, "a zoom keeps the card aligned");
+
+    let (fresh, _) = card_quad(cx, window, true);
+    assert_eq!(renders.get(), 2);
+    let near = |a: f32, b: f32| (a - b).abs() < 0.51;
+    assert!(
+        near(reused.bounds.origin.x.0, fresh.bounds.origin.x.0)
+            && near(reused.bounds.origin.y.0, fresh.bounds.origin.y.0)
+            && near(reused.bounds.size.width.0, fresh.bounds.size.width.0)
+            && near(reused.bounds.size.height.0, fresh.bounds.size.height.0),
+        "placed where painting it there puts it: {:?} against {:?}",
+        reused.bounds,
+        fresh.bounds
+    );
+    assert_eq!(
+        reused.corner_radii, fresh.corner_radii,
+        "radii scale with it"
+    );
+    assert!(
+        near(reused.border_widths.top.0, fresh.border_widths.top.0),
+        "borders scale with it"
+    );
+}
+
+#[crate::test]
+fn a_cached_view_is_placed_under_a_new_rotation_by_the_gpu(cx: &mut TestAppContext) {
+    let (window, renders, transform) = transformed_card(cx, kurbo::Affine::rotate(0.3));
+    card_quad(cx, window, false);
+    assert_eq!(renders.get(), 1);
+
+    transform.set(kurbo::Affine::rotate(0.9));
+    let (reused, reused_corners) = card_quad(cx, window, false);
+    assert_eq!(renders.get(), 1, "turning reuses the card");
+    assert_ne!(reused.transform, 0);
+
+    let (_, fresh_corners) = card_quad(cx, window, true);
+    assert_eq!(renders.get(), 2);
+    for (reused, fresh) in reused_corners.into_iter().zip(fresh_corners) {
+        assert!(
+            (reused.x - fresh.x).abs() < px(0.01) && (reused.y - fresh.y).abs() < px(0.01),
+            "a corner lands at {reused:?}, where painting it there puts it at {fresh:?}"
+        );
+    }
+
+    // A recording made under a rotation is not reused under a change that
+    // scales it: its text would be stretched.
+    transform.set(kurbo::Affine::rotate(0.9) * kurbo::Affine::scale(2.));
+    card_quad(cx, window, false);
+    assert_eq!(renders.get(), 3, "rendered again under a scaling change");
 }

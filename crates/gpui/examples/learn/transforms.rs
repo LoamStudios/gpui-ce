@@ -64,7 +64,11 @@ impl Render for Transforms {
                     }),
                 )
                 .child(div().text_lg().child(format!("Card {index}")))
-                .child(div().text_sm().child(format!("{} clicks", self.clicks[index])))
+                .child(
+                    div()
+                        .text_sm()
+                        .child(format!("{} clicks", self.clicks[index])),
+                )
         };
 
         let rotated_frame = div()
@@ -95,7 +99,9 @@ impl Render for Transforms {
             .rounded_md()
             .bg(rgb(0xfef3c7))
             .text_color(rgb(0x451a03))
-            .transform(kurbo::Affine::scale(1.0 + 0.5 * (turn * 2.).sin().abs() as f64))
+            .transform(kurbo::Affine::scale(
+                1.0 + 0.5 * (turn * 2.).sin().abs() as f64,
+            ))
             .child("Scaled text stays crisp");
 
         div()
@@ -113,7 +119,13 @@ impl Render for Transforms {
                     .child(card(1, -turn * 1.3 + PI / 6., cx))
                     .child(card(2, PI / 2., cx)),
             )
-            .child(div().flex().gap_24().child(rotated_frame).child(scaled_group))
+            .child(
+                div()
+                    .flex()
+                    .gap_24()
+                    .child(rotated_frame)
+                    .child(scaled_group),
+            )
             .child(
                 div()
                     .text_sm()
