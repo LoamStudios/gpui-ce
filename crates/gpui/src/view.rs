@@ -5,7 +5,10 @@ use crate::{
     RenderOnce, ResolvedDirection, Style, StyleRefinement, TextStyle, TransformationMatrix,
     UnicodeBidi, WeakEntity, px,
 };
-use crate::{Empty, Window, window::SubframeId};
+use crate::{
+    Empty, Window,
+    window::{SubframeId, ViewChunk},
+};
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
@@ -350,6 +353,8 @@ struct ViewElementState {
     /// The view's part of the frame it was recorded in, which reusing the
     /// view takes whole.
     subframe: SubframeId,
+    /// The view's recording as a chunk, once it has been reused.
+    chunk: Option<ViewChunk>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
     /// Where the reused prepaint records were placed this frame, for paint to
@@ -716,6 +721,7 @@ impl<V: View> Element for ViewElement<V> {
                                     prepaint_range: prepaint_start..prepaint_end,
                                     paint_range: PaintIndex::default()..PaintIndex::default(),
                                     subframe,
+                                    chunk: None,
                                     cache_key,
                                     reuse_placement: Placement::default(),
                                     moved_since_render: false,
@@ -773,6 +779,7 @@ impl<V: View> Element for ViewElement<V> {
                                         window.reuse_paint_at(
                                             element_state.paint_range.clone(),
                                             element_state.reuse_placement,
+                                            Some(&mut element_state.chunk),
                                             cx,
                                         );
                                     }

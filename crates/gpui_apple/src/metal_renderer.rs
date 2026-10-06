@@ -192,6 +192,10 @@ impl SceneUniforms {
                 // the neutral (disabled) shader behavior.
                 premultiplied_alpha: ShaderBool::Disabled,
                 padding: 0,
+                placement: GlobalUniforms::unplaced(),
+                inverse_placement: GlobalUniforms::unplaced(),
+                placement_translation: vec2f(0.0, 0.0),
+                inverse_placement_translation: vec2f(0.0, 0.0),
             },
             // Metal text is gamma-corrected grayscale; font corrections stay neutral.
             font: FontRasterizationUniforms {
@@ -1108,7 +1112,42 @@ impl MetalRenderer {
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
 
-        for command in scene.render_commands() {
+        // The scenes being drawn: the window's, then each chunk being drawn
+        // inside it, innermost last.
+        let mut levels: SmallVec<[SceneLevel; 4]> = smallvec::smallvec![SceneLevel {
+            scene,
+            commands: scene.render_commands().iter(),
+            chunk: None,
+        }];
+        while let Some(level) = levels.last_mut() {
+            let Some(command) = level.commands.next() else {
+                levels.pop();
+                if !levels.is_empty() {
+                    let clip = levels
+                        .last()
+                        .unwrap()
+                        .chunk
+                        .as_ref()
+                        .map(|chunk| chunk.clip);
+                    set_chunk_scissor(command_encoder, targets.last().unwrap(), clip);
+                }
+                continue;
+            };
+            let scene = level.scene;
+            let (level_uniforms, path_uniforms, level_placement, level_clip) = match &level.chunk {
+                Some(chunk) => (
+                    Some(chunk.uniforms.clone()),
+                    chunk.path_uniforms.clone(),
+                    chunk.placement,
+                    Some(chunk.clip),
+                ),
+                None => (
+                    None,
+                    scene_uniforms.clone(),
+                    gpui::TransformationMatrix::unit(),
+                    None,
+                ),
+            };
             if hidden > 0 {
                 match command {
                     RenderCommand::BeginGroup { .. } => hidden += 1,
@@ -1124,7 +1163,9 @@ impl MetalRenderer {
                         *smoothed,
                         instance_buffer,
                         &mut instance_offset,
-                        &targets.last().unwrap().uniforms,
+                        level_uniforms
+                            .as_ref()
+                            .unwrap_or(&targets.last().unwrap().uniforms),
                         command_encoder,
                     ),
                 RenderCommand::Batch(PrimitiveBatch::Quads { range, smoothed }) => self.draw_quads(
@@ -1132,7 +1173,9 @@ impl MetalRenderer {
                     *smoothed,
                     instance_buffer,
                     &mut instance_offset,
-                    &targets.last().unwrap().uniforms,
+                    level_uniforms
+                        .as_ref()
+                        .unwrap_or(&targets.last().unwrap().uniforms),
                     command_encoder,
                 ),
                 RenderCommand::Batch(PrimitiveBatch::Paths {
@@ -1151,11 +1194,12 @@ impl MetalRenderer {
                         *rasterization_vertex_count,
                         instance_buffer,
                         &mut instance_offset,
-                        &scene_uniforms,
+                        &path_uniforms,
                         command_buffer,
                     );
 
                     command_encoder = targets.last().unwrap().encoder(command_buffer, None);
+                    set_chunk_scissor(command_encoder, targets.last().unwrap(), level_clip);
 
                     if did_draw {
                         self.draw_paths_from_intermediate(
@@ -1163,7 +1207,9 @@ impl MetalRenderer {
                             *sprite_count,
                             instance_buffer,
                             &mut instance_offset,
-                            &targets.last().unwrap().uniforms,
+                            level_uniforms
+                                .as_ref()
+                                .unwrap_or(&targets.last().unwrap().uniforms),
                             command_encoder,
                         )
                     } else {
@@ -1174,7 +1220,9 @@ impl MetalRenderer {
                     &scene.underlines[range.clone()],
                     instance_buffer,
                     &mut instance_offset,
-                    &targets.last().unwrap().uniforms,
+                    level_uniforms
+                        .as_ref()
+                        .unwrap_or(&targets.last().unwrap().uniforms),
                     command_encoder,
                 ),
                 RenderCommand::Batch(PrimitiveBatch::MonochromeSprites { texture_id, range }) => {
@@ -1183,7 +1231,9 @@ impl MetalRenderer {
                         &scene.monochrome_sprites[range.clone()],
                         instance_buffer,
                         &mut instance_offset,
-                        &targets.last().unwrap().uniforms,
+                        level_uniforms
+                            .as_ref()
+                            .unwrap_or(&targets.last().unwrap().uniforms),
                         command_encoder,
                     )
                 }
@@ -1197,13 +1247,17 @@ impl MetalRenderer {
                     *smoothed,
                     instance_buffer,
                     &mut instance_offset,
-                    &targets.last().unwrap().uniforms,
+                    level_uniforms
+                        .as_ref()
+                        .unwrap_or(&targets.last().unwrap().uniforms),
                     command_encoder,
                 ),
                 RenderCommand::Batch(PrimitiveBatch::Surfaces(range)) => self.draw_surfaces(
                     &scene.surfaces[range.clone()],
                     &scene.surface_opacities()[range.clone()],
-                    &targets.last().unwrap().uniforms,
+                    level_uniforms
+                        .as_ref()
+                        .unwrap_or(&targets.last().unwrap().uniforms),
                     command_encoder,
                 ),
                 RenderCommand::Batch(PrimitiveBatch::BackdropFilters(range)) => {
@@ -1281,6 +1335,53 @@ impl MetalRenderer {
                         command_encoder = targets.last().unwrap().encoder(command_buffer, None);
                     }
                     true
+                }
+                RenderCommand::Batch(PrimitiveBatch::Chunks(range)) => {
+                    let mut entered = SmallVec::<[SceneLevel; 4]>::new();
+                    let mut fits = true;
+                    for placed in &scene.chunks[range.clone()] {
+                        let chunk_scene = &placed.chunk.scene;
+                        let Some(tables) =
+                            SceneTables::upload(chunk_scene, instance_buffer, &mut instance_offset)
+                        else {
+                            fits = false;
+                            break;
+                        };
+                        let placement = level_placement.compose(placed.placement);
+                        let target = targets.last().unwrap();
+                        let uniforms = SceneUniforms {
+                            globals: target.uniforms.globals.placed(&placement),
+                            tables: tables.clone(),
+                            ..target.uniforms.clone()
+                        };
+                        let path_uniforms = SceneUniforms {
+                            globals: scene_uniforms.globals.placed(&placement),
+                            tables,
+                            ..scene_uniforms.clone()
+                        };
+                        let mut clip =
+                            transformed_bounds(&level_placement, placed.content_mask.bounds);
+                        if let Some(outer) = level_clip {
+                            clip = clip.intersect(&outer);
+                        }
+                        entered.push(SceneLevel {
+                            scene: chunk_scene,
+                            commands: chunk_scene.render_commands().iter(),
+                            chunk: Some(ChunkLevel {
+                                placement,
+                                uniforms,
+                                path_uniforms,
+                                clip,
+                            }),
+                        });
+                    }
+                    // The first chunk on top, to be drawn first.
+                    levels.extend(entered.into_iter().rev());
+                    if let Some(level) = levels.last() {
+                        let clip = level.chunk.as_ref().map(|chunk| chunk.clip);
+                        set_chunk_scissor(command_encoder, targets.last().unwrap(), clip);
+                    }
+                    fits
                 }
                 RenderCommand::Batch(PrimitiveBatch::SubpixelSprites { .. }) => unreachable!(),
                 RenderCommand::Batch(PrimitiveBatch::GroupBoundary(_)) => {
@@ -2358,6 +2459,11 @@ fn required_instance_buffer_size(scene: &Scene) -> usize {
             PrimitiveBatch::PolychromeSprites { range, .. } => {
                 reserve(mem::size_of::<PolychromeSprite>(), range.len())
             }
+            PrimitiveBatch::Chunks(range) => {
+                for chunk in &scene.chunks[range.clone()] {
+                    reserve(1, required_instance_buffer_size(&chunk.chunk.scene));
+                }
+            }
             PrimitiveBatch::Paths { .. }
             | PrimitiveBatch::SubpixelSprites { .. }
             | PrimitiveBatch::Surfaces(_)
@@ -2366,6 +2472,95 @@ fn required_instance_buffer_size(scene: &Scene) -> usize {
         }
     }
     required
+}
+
+/// A scene being drawn: the window's, or a chunk drawn inside it.
+struct SceneLevel<'a> {
+    scene: &'a Scene,
+    commands: std::slice::Iter<'a, RenderCommand>,
+    /// For a chunk: from its viewport to the window's, the uniforms it
+    /// draws with into the current target and into the path target, and
+    /// the window viewport rectangle it is clipped to.
+    chunk: Option<ChunkLevel>,
+}
+
+struct ChunkLevel {
+    placement: gpui::TransformationMatrix,
+    uniforms: SceneUniforms,
+    path_uniforms: SceneUniforms,
+    clip: Bounds<ScaledPixels>,
+}
+
+/// The viewport bounds that contain `bounds` moved by `transformation`.
+fn transformed_bounds(
+    transformation: &gpui::TransformationMatrix,
+    bounds: Bounds<ScaledPixels>,
+) -> Bounds<ScaledPixels> {
+    let corners = [
+        bounds.origin,
+        point(bounds.origin.x + bounds.size.width, bounds.origin.y),
+        point(bounds.origin.x, bounds.origin.y + bounds.size.height),
+        point(
+            bounds.origin.x + bounds.size.width,
+            bounds.origin.y + bounds.size.height,
+        ),
+    ]
+    .map(|corner| transformation.apply(corner.map(|value| gpui::px(value.0))));
+    let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for corner in corners {
+        left = left.min(f32::from(corner.x));
+        top = top.min(f32::from(corner.y));
+        right = right.max(f32::from(corner.x));
+        bottom = bottom.max(f32::from(corner.y));
+    }
+    Bounds {
+        origin: point(ScaledPixels(left), ScaledPixels(top)),
+        size: size(ScaledPixels(right - left), ScaledPixels(bottom - top)),
+    }
+}
+
+/// Clips what `encoder` draws into `target` to `clip`, a window viewport
+/// rectangle, or to nothing beyond the target.
+fn set_chunk_scissor(
+    encoder: &metal::RenderCommandEncoderRef,
+    target: &FrameTarget,
+    clip: Option<Bounds<ScaledPixels>>,
+) {
+    let (width, height) = (
+        target.bounds.size.width.0.max(0) as u64,
+        target.bounds.size.height.0.max(0) as u64,
+    );
+    let rect = match clip {
+        None => metal::MTLScissorRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
+        Some(clip) => {
+            let origin = (
+                target.bounds.origin.x.0 as f32,
+                target.bounds.origin.y.0 as f32,
+            );
+            let left = (clip.origin.x.0 - origin.0).floor().clamp(0., width as f32) as u64;
+            let top = (clip.origin.y.0 - origin.1)
+                .floor()
+                .clamp(0., height as f32) as u64;
+            let right = (clip.origin.x.0 + clip.size.width.0 - origin.0)
+                .ceil()
+                .clamp(left as f32, width as f32) as u64;
+            let bottom = (clip.origin.y.0 + clip.size.height.0 - origin.1)
+                .ceil()
+                .clamp(top as f32, height as f32) as u64;
+            metal::MTLScissorRect {
+                x: left,
+                y: top,
+                width: right - left,
+                height: bottom - top,
+            }
+        }
+    };
+    encoder.set_scissor_rect(rect);
 }
 
 // Align to multiples of 256 make Metal happy.

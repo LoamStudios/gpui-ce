@@ -192,6 +192,14 @@ mod source {
         pub target_size: Vec2f,
         pub premultiplied_alpha: ShaderBool,
         pub padding: u32,
+        /// Where what is drawn goes in the viewport: from the viewport of the
+        /// chunk being drawn, if any, by the matrix `[a, b, c, d]` (x' = a x +
+        /// b y, y' = c x + d y) and the translation; the identity otherwise.
+        pub placement: Vec4f,
+        /// The inverse of the placement, as a matrix and translation.
+        pub inverse_placement: Vec4f,
+        pub placement_translation: Vec2f,
+        pub inverse_placement_translation: Vec2f,
     }
 
     #[repr(C)]
@@ -852,9 +860,19 @@ mod source {
         vec2f((vertex_id & 1u32) as f32, 0.5 * (vertex_id & 2u32) as f32)
     }
 
+    /// `position` moved by `matrix`, `[a, b, c, d]`, and `translation`.
+    pub fn apply_affine(matrix: Vec4f, translation: Vec2f, position: Vec2f) -> Vec2f {
+        vec2f(
+            matrix.x * position.x + matrix.y * position.y + translation.x,
+            matrix.z * position.x + matrix.w * position.y + translation.y,
+        )
+    }
+
     pub fn viewport_to_clip_position(position: Vec2f) -> Vec4f {
         let globals = get!(GLOBALS);
-        let clip_position = (position - globals.target_origin) / globals.target_size
+        // A chunk's positions are in its own viewport: place them in this one.
+        let placed = apply_affine(globals.placement, globals.placement_translation, position);
+        let clip_position = (placed - globals.target_origin) / globals.target_size
             * vec2f(2.0, -2.0)
             + vec2f(-1.0, 1.0);
         vec4f(clip_position.x, clip_position.y, 0.0, 1.0)
@@ -863,7 +881,14 @@ mod source {
     /// The viewport position of a fragment, from its position in the render
     /// target, which may be a group's target placed anywhere in the viewport.
     pub fn scene_position(fragment_position: Vec2f) -> Vec2f {
-        fragment_position + get!(GLOBALS).target_origin
+        let globals = get!(GLOBALS);
+        // Inside a chunk, the position in the chunk's own viewport, where
+        // its masks, clips and paints are.
+        apply_affine(
+            globals.inverse_placement,
+            globals.inverse_placement_translation,
+            fragment_position + globals.target_origin,
+        )
     }
 
     pub fn rectangle_vertex(vertex_id: u32, bounds: Bounds) -> RectangleVertex {

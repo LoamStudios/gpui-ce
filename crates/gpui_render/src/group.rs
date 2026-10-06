@@ -132,3 +132,27 @@ mod tests {
         assert!(group_target_bounds(scaled(-200., 0., 100., 50.), viewport).is_none());
     }
 }
+
+impl crate::shaders::common::GlobalUniforms {
+    /// The placement matrix of what is drawn in this viewport: the identity.
+    pub fn unplaced() -> wgsl_rs::std::Vec4f {
+        wgsl_rs::std::vec4f(1.0, 0.0, 0.0, 1.0)
+    }
+
+    /// These uniforms for drawing a chunk placed by `placement`, from its
+    /// viewport to this one, in device pixels.
+    pub fn placed(mut self, placement: &gpui::TransformationMatrix) -> Self {
+        let inverse = placement
+            .inverse()
+            .unwrap_or(gpui::TransformationMatrix::unit());
+        let matrix = |matrix: &gpui::TransformationMatrix| {
+            let [[a, b], [c, d]] = matrix.rotation_scale;
+            wgsl_rs::std::vec4f(a, b, c, d)
+        };
+        self.placement = matrix(placement);
+        self.inverse_placement = matrix(&inverse);
+        self.placement_translation = vec2f(placement.translation[0], placement.translation[1]);
+        self.inverse_placement_translation = vec2f(inverse.translation[0], inverse.translation[1]);
+        self
+    }
+}

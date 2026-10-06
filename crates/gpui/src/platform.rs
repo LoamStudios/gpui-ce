@@ -935,6 +935,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn draw(&self, scene: &Scene);
     fn schedule_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+    /// Whether the window's renderer draws [`crate::SceneChunk`]s: until it
+    /// does, cached views are replayed primitive by primitive.
+    fn supports_scene_chunks(&self) -> bool {
+        false
+    }
     fn is_subpixel_rendering_supported(&self) -> bool;
 
     // macOS specific methods

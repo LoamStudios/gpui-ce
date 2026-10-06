@@ -208,6 +208,10 @@ fn write_shader_globals(renderer: &mut WgpuRenderer) -> FrameGlobals {
             renderer.target.alpha_mode() == wgpu::CompositeAlphaMode::PreMultiplied,
         ),
         padding: 0,
+        placement: GlobalUniforms::unplaced(),
+        inverse_placement: GlobalUniforms::unplaced(),
+        placement_translation: vec2f(0.0, 0.0),
+        inverse_placement_translation: vec2f(0.0, 0.0),
     };
     let paths = GlobalUniforms {
         premultiplied_alpha: ShaderBool::Disabled,
@@ -295,6 +299,7 @@ impl FrameRequirements {
                 PrimitiveBatch::Paths { .. }
                 | PrimitiveBatch::Surfaces(_)
                 | PrimitiveBatch::BackdropFilters(_)
+                | PrimitiveBatch::Chunks(_)
                 | PrimitiveBatch::GroupBoundary(_) => {}
             }
         }
@@ -698,6 +703,11 @@ fn encode_inline_batch(
         | PrimitiveBatch::BackdropFilters(_)
         | PrimitiveBatch::GroupBoundary(_) => {
             unreachable!("pass-interrupting batches are handled by FrameEncoder")
+        }
+        // Not made for this renderer: `supports_scene_chunks` is false.
+        PrimitiveBatch::Chunks(_) => {
+            debug_assert!(false, "a scene chunk reached the wgpu renderer");
+            Ok(())
         }
     }
 }

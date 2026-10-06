@@ -542,6 +542,10 @@ impl DirectXRenderer {
                 // premultiplies in-shader; scene geometry blends straight alpha as before.
                 premultiplied_alpha: ShaderBool::Disabled,
                 padding: 0,
+                placement: GlobalUniforms::unplaced(),
+                inverse_placement: GlobalUniforms::unplaced(),
+                placement_translation: vec2f(0.0, 0.0),
+                inverse_placement_translation: vec2f(0.0, 0.0),
             }],
         )
     }
@@ -865,6 +869,11 @@ impl DirectXRenderer {
                 }
                 RenderCommand::Batch(PrimitiveBatch::GroupBoundary(_)) => {
                     unreachable!("group boundaries are resolved by the render plan")
+                }
+                // Not made for this renderer: `supports_scene_chunks` is false.
+                RenderCommand::Batch(PrimitiveBatch::Chunks(_)) => {
+                    debug_assert!(false, "a scene chunk reached the DirectX renderer");
+                    Ok(())
                 }
             }
             .with_context(|| {

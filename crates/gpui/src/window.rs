@@ -1171,6 +1171,13 @@ impl Hitbox {
     }
 }
 
+/// A cached view's recording as a chunk, and where it was last drawn: from
+/// the chunk's viewport, in device pixels, to the window's.
+pub(crate) struct ViewChunk {
+    chunk: Rc<crate::SceneChunk>,
+    placement: TransformationMatrix,
+}
+
 /// How a cached view's subframe of hitboxes sits in the coordinates of what
 /// contains it.
 #[derive(Clone)]
@@ -4224,6 +4231,7 @@ impl Window {
                     window.reuse_paint_at(
                         deferred_draw.paint_range.clone(),
                         deferred_draw.reuse_placement,
+                        None,
                         cx,
                     );
                 });
@@ -4446,6 +4454,7 @@ impl Window {
         &mut self,
         range: Range<PaintIndex>,
         placement: Placement,
+        chunk: Option<&mut Option<ViewChunk>>,
         cx: &App,
     ) {
         self.next_frame.cursor_styles.extend(
@@ -4471,10 +4480,16 @@ impl Window {
                 [range.start.tab_handle_index..range.end.tab_handle_index],
         );
 
-        self.text_system
-            .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+        self.text_system.reuse_layouts(
+            range.start.line_layout_index.clone()..range.end.line_layout_index.clone(),
+        );
         let clip = self.snapped_content_mask();
         let scale_factor = self.scale_factor();
+        if let Some(chunk) = chunk
+            && self.reuse_chunk(&range, placement, chunk, &clip)
+        {
+            return;
+        }
         match placement {
             Placement::Offset(offset) => {
                 let device_offset = self.element_offset_in_window(offset).scale(scale_factor);
@@ -4518,6 +4533,81 @@ impl Window {
                 );
             }
         }
+    }
+
+    /// Draws a cached view's recording, `range` of the rendered frame's scene,
+    /// moved by `placement`, as a chunk: its chunk from before, placed
+    /// again, or, for a recording long enough to be worth one, a chunk made
+    /// from it. Returns whether it did.
+    fn reuse_chunk(
+        &mut self,
+        range: &Range<PaintIndex>,
+        placement: Placement,
+        chunk: &mut Option<ViewChunk>,
+        clip: &ContentMask<ScaledPixels>,
+    ) -> bool {
+        let scale_factor = self.scale_factor();
+        let moved = match placement {
+            Placement::Offset(offset) => {
+                let offset = self.element_offset_in_window(offset).scale(scale_factor);
+                TransformationMatrix {
+                    rotation_scale: TransformationMatrix::UNIT.rotation_scale,
+                    translation: [offset.x.0, offset.y.0],
+                }
+            }
+            Placement::Transform(transformation) => TransformationMatrix {
+                translation: transformation.translation.map(|value| value * scale_factor),
+                ..transformation
+            },
+        };
+        if chunk.is_none() {
+            if !self.platform_window.supports_scene_chunks() {
+                return false;
+            }
+            let operations = range.end.scene_index - range.start.scene_index;
+            if operations < crate::SceneChunk::MIN_OPERATIONS {
+                return false;
+            }
+            let mut scene = Scene::default();
+            let unbounded = ContentMask {
+                bounds: Bounds::new(
+                    point(
+                        ScaledPixels(-UNBOUNDED_EXTENT),
+                        ScaledPixels(-UNBOUNDED_EXTENT),
+                    ),
+                    size(
+                        ScaledPixels(2. * UNBOUNDED_EXTENT),
+                        ScaledPixels(2. * UNBOUNDED_EXTENT),
+                    ),
+                ),
+                ..Default::default()
+            };
+            scene.replay_at(
+                range.start.scene_index..range.end.scene_index,
+                &self.rendered_frame.scene,
+                Point::default(),
+                &unbounded,
+            );
+            let Some(made) = crate::SceneChunk::new(scene) else {
+                return false;
+            };
+            *chunk = Some(ViewChunk {
+                chunk: Rc::new(made),
+                placement: TransformationMatrix::UNIT,
+            });
+        }
+        let Some(chunk) = chunk else {
+            return false;
+        };
+        chunk.placement = moved.compose(chunk.placement);
+        self.next_frame
+            .scene
+            .insert_primitive(crate::Primitive::Chunk(crate::PlacedChunk::new(
+                chunk.chunk.clone(),
+                chunk.placement,
+                *clip,
+            )));
+        true
     }
 
     /// Push a text style onto the stack, and call a function with that style active.

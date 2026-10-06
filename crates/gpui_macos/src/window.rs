@@ -2161,6 +2161,11 @@ impl PlatformWindow for MacWindow {
         self.0.lock().renderer.sprite_atlas().clone()
     }
 
+    fn supports_scene_chunks(&self) -> bool {
+        // The Metal renderer draws chunks; wgpu doesn't yet.
+        cfg!(not(feature = "wgpu"))
+    }
+
     fn gpu_specs(&self) -> Option<gpui::GpuSpecs> {
         #[cfg(feature = "wgpu")]
         return Some(self.0.lock().renderer.gpu_specs());

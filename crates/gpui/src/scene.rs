@@ -77,6 +77,8 @@ pub struct Scene {
     surface_opacities: Vec<f32>,
     pub backdrop_filters: Vec<BackdropFilter>,
     pub group_boundaries: Vec<GroupBoundary>,
+    /// Chunks drawn in this scene, each as one unit.
+    pub chunks: Vec<PlacedChunk>,
     render_plan: ScenePlan,
     is_finished: bool,
     /// Clips what is drawn, but not what is recorded; see [`Self::set_clip`].
@@ -127,6 +129,7 @@ impl Scene {
         self.surface_opacities.clear();
         self.backdrop_filters.clear();
         self.group_boundaries.clear();
+        self.chunks.clear();
         self.render_plan.clear();
         self.clip = None;
         self.transforms.clear();
@@ -237,6 +240,11 @@ impl Scene {
                     region(filter.bounds, &filter.content_mask, 0);
                 }
             }
+            PrimitiveBatch::Chunks(range) => {
+                for chunk in &self.chunks[range.clone()] {
+                    region(chunk.bounds, &chunk.content_mask, 0);
+                }
+            }
             PrimitiveBatch::GroupBoundary(_) => {}
         }
     }
@@ -291,7 +299,8 @@ impl Scene {
                     filter.opacity *= opacity;
                 }
             }
-            PrimitiveBatch::GroupBoundary(_) => {}
+            // Never folded into: see `plan::foldable_batches`.
+            PrimitiveBatch::Chunks(_) | PrimitiveBatch::GroupBoundary(_) => {}
         }
     }
 
@@ -572,6 +581,7 @@ impl Scene {
                 .map(|value| ScaledPixels(value.0));
                 mask(&mut path.content_mask);
             }
+            Primitive::Chunk(chunk) => chunk.place(placement, content_mask),
             Primitive::Surface(_) | Primitive::BackdropFilter(_) | Primitive::GroupBoundary(_) => {
                 // Not transformed on the GPU: they take the viewport bounds
                 // that contain them.
@@ -993,6 +1003,7 @@ impl Scene {
             }
             Primitive::BackdropFilter(filter) => self.backdrop_filters.push(filter.clone()),
             Primitive::GroupBoundary(boundary) => self.group_boundaries.push(boundary.clone()),
+            Primitive::Chunk(chunk) => self.chunks.push(chunk.clone()),
         }
     }
 
@@ -1001,21 +1012,33 @@ impl Scene {
     pub(crate) fn atlas_tiles(
         &self,
     ) -> collections::FxHashSet<(crate::AtlasTextureId, crate::TileId)> {
-        self.paint_operations
-            .iter()
-            .filter_map(|operation| match operation {
-                PaintOperation::Primitive(primitive) | PaintOperation::Raster(primitive, _) => {
-                    match primitive {
-                        Primitive::MonochromeSprite(sprite) => Some(sprite.tile),
-                        Primitive::SubpixelSprite(sprite) => Some(sprite.tile),
-                        Primitive::PolychromeSprite(sprite) => Some(sprite.tile),
-                        _ => None,
-                    }
+        let mut tiles = collections::FxHashSet::default();
+        self.collect_atlas_tiles(&mut tiles);
+        tiles
+    }
+
+    fn collect_atlas_tiles(
+        &self,
+        tiles: &mut collections::FxHashSet<(crate::AtlasTextureId, crate::TileId)>,
+    ) {
+        for operation in &self.paint_operations {
+            let (PaintOperation::Primitive(primitive) | PaintOperation::Raster(primitive, _)) =
+                operation
+            else {
+                continue;
+            };
+            let tile = match primitive {
+                Primitive::MonochromeSprite(sprite) => sprite.tile,
+                Primitive::SubpixelSprite(sprite) => sprite.tile,
+                Primitive::PolychromeSprite(sprite) => sprite.tile,
+                Primitive::Chunk(chunk) => {
+                    chunk.chunk.scene.collect_atlas_tiles(tiles);
+                    continue;
                 }
-                _ => None,
-            })
-            .map(|tile| (tile.texture_id, tile.tile_id))
-            .collect()
+                _ => continue,
+            };
+            tiles.insert((tile.texture_id, tile.tile_id));
+        }
     }
 
     /// Sets the clip applied to what is drawn from here on, on top of each
@@ -1225,6 +1248,7 @@ impl Scene {
         self.surfaces = surfaces;
         self.surface_opacities = surface_opacities;
         self.backdrop_filters.sort_by_key(|filter| filter.order);
+        self.chunks.sort_by_key(|chunk| chunk.order);
         // Markers normally get distinct, monotonically-increasing orders (children overlap
         // their group bounds and so sort strictly between the start and end). The `!is_start`
         // tiebreak only matters for a degenerate empty group whose start and end tie: it keeps
@@ -1361,6 +1385,7 @@ pub(crate) enum PrimitiveKind {
     PolychromeSprite,
     Surface,
     BackdropFilter,
+    Chunk,
     // Highest discriminant: at an equal order, a group-end is emitted after the group's content
     // so the renderer composites the filtered group only once every child has been drawn.
     GroupEnd,
@@ -1479,7 +1504,7 @@ impl UniformPlacement {
             .compose(placement.inverse().unwrap_or(TransformationMatrix::UNIT))
     }
 
-    fn matrix(&self) -> TransformationMatrix {
+    pub(crate) fn matrix(&self) -> TransformationMatrix {
         TransformationMatrix {
             rotation_scale: [[self.scale, 0.], [0., self.scale]],
             translation: [self.translation.x.0, self.translation.y.0],
@@ -1541,6 +1566,105 @@ pub enum Primitive {
     Surface(PaintSurface),
     BackdropFilter(BackdropFilter),
     GroupBoundary(GroupBoundary),
+    Chunk(PlacedChunk),
+}
+
+/// A cached view's recording, finished as a scene of its own, which draws
+/// as one unit, by batches of its own, wherever the view is reused. It holds
+/// no groups, filters, surfaces or photos.
+pub struct SceneChunk {
+    /// The recording, finished.
+    pub scene: Scene,
+    /// The bounds its primitives cover, in its viewport.
+    pub bounds: Bounds<ScaledPixels>,
+}
+
+impl SceneChunk {
+    /// The most operations a cached view's recording holds and still draws
+    /// into its parent's batches when reused: more, and it draws as a chunk.
+    pub const MIN_OPERATIONS: usize = 256;
+
+    /// `scene`, finished, as a chunk, if it holds nothing a chunk can't.
+    pub(crate) fn new(mut scene: Scene) -> Option<Self> {
+        if !scene.group_boundaries.is_empty()
+            || !scene.backdrop_filters.is_empty()
+            || !scene.surfaces.is_empty()
+            || !scene.photo_paints.is_empty()
+        {
+            return None;
+        }
+        scene.finish();
+        let bounds = scene
+            .paint_operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PaintOperation::Primitive(primitive) | PaintOperation::Raster(primitive, _) => {
+                    Some(scene.viewport_bounds(primitive))
+                }
+                _ => None,
+            })
+            .reduce(|bounds, other| bounds.union(&other))?;
+        Some(Self { scene, bounds })
+    }
+}
+
+/// A chunk where it is drawn in a scene.
+#[derive(Clone)]
+pub struct PlacedChunk {
+    /// Where the chunk draws among this scene's primitives.
+    pub order: DrawOrder,
+    /// What it draws.
+    pub chunk: std::rc::Rc<SceneChunk>,
+    /// From the chunk's viewport positions, in device pixels, to this
+    /// scene's.
+    pub placement: TransformationMatrix,
+    /// The chunk's bounds, placed.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The viewport rectangle the chunk is clipped to, on top of what clips
+    /// its primitives inside it.
+    pub content_mask: ContentMask<ScaledPixels>,
+}
+
+impl PlacedChunk {
+    /// `chunk` drawn at `placement`, clipped to `content_mask`.
+    pub(crate) fn new(
+        chunk: std::rc::Rc<SceneChunk>,
+        placement: TransformationMatrix,
+        content_mask: ContentMask<ScaledPixels>,
+    ) -> Self {
+        let bounds =
+            crate::window::transformed_bounds(&placement, chunk.bounds.map(|value| px(value.0)))
+                .map(|value| ScaledPixels(value.0));
+        Self {
+            order: 0,
+            chunk,
+            placement,
+            bounds,
+            content_mask,
+        }
+    }
+
+    /// The chunk placed by `placement` too, after its own, and clipped to
+    /// `content_mask`, which is in the coordinates `placement` maps to.
+    fn place(
+        &mut self,
+        placement: &TransformationMatrix,
+        content_mask: &ContentMask<ScaledPixels>,
+    ) {
+        let mask = ContentMask {
+            bounds: crate::window::transformed_bounds(
+                placement,
+                self.content_mask.bounds.map(|value| px(value.0)),
+            )
+            .map(|value| ScaledPixels(value.0)),
+            fade_out: Edges::default(),
+        }
+        .intersect(content_mask);
+        *self = Self {
+            order: self.order,
+            ..Self::new(self.chunk.clone(), placement.compose(self.placement), mask)
+        };
+    }
 }
 
 #[expect(missing_docs)]
@@ -1557,6 +1681,7 @@ impl Primitive {
             Primitive::Surface(surface) => &surface.bounds,
             Primitive::BackdropFilter(filter) => &filter.bounds,
             Primitive::GroupBoundary(boundary) => &boundary.bounds,
+            Primitive::Chunk(chunk) => &chunk.bounds,
         }
     }
 
@@ -1572,6 +1697,7 @@ impl Primitive {
             Primitive::Surface(surface) => &mut surface.content_mask,
             Primitive::BackdropFilter(filter) => &mut filter.content_mask,
             Primitive::GroupBoundary(boundary) => &mut boundary.content_mask,
+            Primitive::Chunk(chunk) => &mut chunk.content_mask,
         }
     }
 
@@ -1587,6 +1713,7 @@ impl Primitive {
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::BackdropFilter(filter) => &filter.content_mask,
             Primitive::GroupBoundary(boundary) => &boundary.content_mask,
+            Primitive::Chunk(chunk) => &chunk.content_mask,
         }
     }
 
@@ -1602,6 +1729,7 @@ impl Primitive {
             Primitive::Surface(surface) => surface.order = order,
             Primitive::BackdropFilter(filter) => filter.order = order,
             Primitive::GroupBoundary(boundary) => boundary.order = order,
+            Primitive::Chunk(chunk) => chunk.order = order,
         }
     }
 
@@ -1690,6 +1818,7 @@ impl Primitive {
                 filters(&mut boundary.filters);
                 mask(&mut boundary.content_mask);
             }
+            Primitive::Chunk(chunk) => chunk.place(&placement.matrix(), content_mask),
         }
     }
 
@@ -1706,7 +1835,8 @@ impl Primitive {
             Primitive::Path(_)
             | Primitive::Surface(_)
             | Primitive::BackdropFilter(_)
-            | Primitive::GroupBoundary(_) => 0,
+            | Primitive::GroupBoundary(_)
+            | Primitive::Chunk(_) => 0,
         }
     }
 
@@ -1736,7 +1866,8 @@ impl Primitive {
             Primitive::Path(_)
             | Primitive::Surface(_)
             | Primitive::BackdropFilter(_)
-            | Primitive::GroupBoundary(_) => None,
+            | Primitive::GroupBoundary(_)
+            | Primitive::Chunk(_) => None,
         }
     }
 
@@ -1753,6 +1884,7 @@ impl Primitive {
             Primitive::Surface(surface) => surface.order,
             Primitive::BackdropFilter(filter) => filter.order,
             Primitive::GroupBoundary(boundary) => boundary.order,
+            Primitive::Chunk(chunk) => chunk.order,
         }
     }
 
@@ -1822,6 +1954,13 @@ impl Primitive {
                 boundary.bounds = boundary.bounds + geometry_offset;
                 moved(&mut boundary.content_mask);
             }
+            Primitive::Chunk(chunk) => chunk.place(
+                &TransformationMatrix {
+                    rotation_scale: TransformationMatrix::UNIT.rotation_scale,
+                    translation: [offset.x.0, offset.y.0],
+                },
+                content_mask,
+            ),
         }
     }
 }
@@ -1855,6 +1994,8 @@ struct BatchIterator<'a> {
     backdrop_filters_iter: Peekable<slice::Iter<'a, BackdropFilter>>,
     group_boundaries_start: usize,
     group_boundaries_iter: Peekable<slice::Iter<'a, GroupBoundary>>,
+    chunks_start: usize,
+    chunks_iter: Peekable<slice::Iter<'a, PlacedChunk>>,
 }
 
 impl<'a> BatchIterator<'a> {
@@ -1881,6 +2022,8 @@ impl<'a> BatchIterator<'a> {
             backdrop_filters_iter: scene.backdrop_filters.iter().peekable(),
             group_boundaries_start: 0,
             group_boundaries_iter: scene.group_boundaries.iter().peekable(),
+            chunks_start: 0,
+            chunks_iter: scene.chunks.iter().peekable(),
         }
     }
 }
@@ -1931,6 +2074,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.backdrop_filters_iter.peek().map(|f| f.order),
                 PrimitiveKind::BackdropFilter,
+            ),
+            (
+                self.chunks_iter.peek().map(|c| c.order),
+                PrimitiveKind::Chunk,
             ),
             (
                 self.group_boundaries_iter.peek().map(|b| b.order),
@@ -2149,6 +2296,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 Some(PrimitiveBatch::BackdropFilters(
                     backdrop_filters_start..backdrop_filters_end,
                 ))
+            }
+            PrimitiveKind::Chunk => {
+                let chunks_start = self.chunks_start;
+                let mut chunks_end = chunks_start + 1;
+                self.chunks_iter.next();
+                while self
+                    .chunks_iter
+                    .next_if(|chunk| precedes_limit(chunk.order, batch_kind, max_order_and_kind))
+                    .is_some()
+                {
+                    chunks_end += 1;
+                }
+                self.chunks_start = chunks_end;
+                Some(PrimitiveBatch::Chunks(chunks_start..chunks_end))
             }
             // Boundaries are emitted one at a time (never merged) so the renderer can switch
             // render targets at exactly the right point in the batch stream.

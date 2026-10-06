@@ -228,7 +228,11 @@ pub const RENDER_BUFFER_LAYOUTS: &[gpui::SceneBufferLayout] = &[
         target_origin,
         target_size,
         premultiplied_alpha,
-        padding
+        padding,
+        placement,
+        inverse_placement,
+        placement_translation,
+        inverse_placement_translation
     ),
     render_layout!(
         super::common::FontRasterizationUniforms,

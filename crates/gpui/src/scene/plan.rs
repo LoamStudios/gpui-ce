@@ -34,6 +34,9 @@ pub struct ScenePlanRequirements {
     pub surface_count: usize,
     pub backdrop_filter_count: usize,
     pub isolated_group_count: usize,
+    /// Chunks drawn, not counting those inside them, whose own requirements
+    /// are added to these.
+    pub chunk_count: usize,
     pub uses_path_target: bool,
     pub uses_offscreen_target: bool,
 }
@@ -206,6 +209,9 @@ impl ScenePlan {
             }
         }
 
+        for chunk in &scene.chunks {
+            requirements.include_chunk(chunk.chunk.scene.render_plan().requirements());
+        }
         requirements.command_count = commands.len();
         Self {
             commands,
@@ -272,7 +278,11 @@ fn foldable_batches(
         let RenderCommand::Batch(batch) = command else {
             return None;
         };
-        if matches!(batch, PrimitiveBatch::BackdropFilters(_)) {
+        // A chunk is drawn as it was recorded, so it can't be faded.
+        if matches!(
+            batch,
+            PrimitiveBatch::BackdropFilters(_) | PrimitiveBatch::Chunks(_)
+        ) {
             return None;
         }
         scene.for_each_primitive_region(batch, &mut |region| {
@@ -296,6 +306,15 @@ fn foldable_batches(
 }
 
 impl ScenePlanRequirements {
+    /// Adds what a chunk drawn in the scene needs.
+    fn include_chunk(&mut self, chunk: &ScenePlanRequirements) {
+        self.instance_batch_count += chunk.instance_batch_count;
+        self.path_rasterization_vertex_count += chunk.path_rasterization_vertex_count;
+        self.path_sprite_count += chunk.path_sprite_count;
+        self.chunk_count += chunk.chunk_count;
+        self.uses_path_target |= chunk.uses_path_target;
+    }
+
     fn include_batch(&mut self, batch: &PrimitiveBatch) {
         match batch {
             PrimitiveBatch::Shadows { range, .. }
@@ -325,6 +344,7 @@ impl ScenePlanRequirements {
                 self.backdrop_filter_count += range.len();
                 self.uses_offscreen_target |= !range.is_empty();
             }
+            PrimitiveBatch::Chunks(range) => self.chunk_count += range.len(),
             PrimitiveBatch::GroupBoundary(_) => {
                 unreachable!("group boundaries are compiled before requirements are collected")
             }
@@ -397,6 +417,8 @@ pub enum PrimitiveBatch {
     Surfaces(Range<usize>),
     BackdropFilters(Range<usize>),
     GroupBoundary(usize),
+    /// Chunks, each drawn as one unit, by its own batches, at its placement.
+    Chunks(Range<usize>),
 }
 
 /// Backend-neutral rendering work derived from a [`Scene`].
@@ -488,6 +510,7 @@ impl PrimitiveBatch {
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
             Self::BackdropFilters(range) => format!("backdrop filters ({})", range.len()),
             Self::GroupBoundary(index) => format!("group boundary ({index})"),
+            Self::Chunks(range) => format!("chunks ({})", range.len()),
         }
     }
 }
