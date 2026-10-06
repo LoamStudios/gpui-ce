@@ -73,6 +73,8 @@ const _: () = assert!(
     "the backdrop texture must follow the group texture"
 );
 const GROUP_SAMPLER_REGISTER: u32 = data_register(3);
+/// The group composite's mask texture: binding 4 of `MASK_TEXTURE` in `shaders/groups.rs`.
+const MASK_TEXTURE_REGISTER: u32 = data_register(4);
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -178,6 +180,9 @@ struct FrameTarget {
     bounds: Bounds<DevicePixels>,
     /// The viewport covering the whole texture, set by every draw into it.
     viewport: D3D11_VIEWPORT,
+    /// A masked group's mask, once drawn: its target, the viewport rectangle it covers, and
+    /// how it masks.
+    mask: Option<(ColorTarget, Bounds<DevicePixels>, MaskMode)>,
 }
 
 impl FrameTarget {
@@ -197,6 +202,7 @@ impl FrameTarget {
             },
             color,
             viewport,
+            mask: None,
         }
     }
 }
@@ -685,7 +691,10 @@ impl DirectXRenderer {
 
         // Give back what an error left on the stack; a finished frame leaves only the window's.
         while self.targets.len() > 1 {
-            if let Some(target) = self.targets.pop() {
+            if let Some(mut target) = self.targets.pop() {
+                if let Some((mask, _, _)) = target.mask.take() {
+                    self.give_back(mask);
+                }
                 self.give_back(target.color);
             }
         }
@@ -707,12 +716,23 @@ impl DirectXRenderer {
     fn encode_commands(&mut self, scene: &Scene, viewport_size: Size<DevicePixels>) -> Result<()> {
         // Whether each group being drawn has a target of its own.
         let mut isolated = SmallVec::<[bool; 8]>::new();
+        // How many of the groups being drawn are hidden: a mask, or a masked group, that got
+        // no target is not drawn at all, nor is what it holds.
+        let mut hidden = 0usize;
         let annotation = self
             .devices
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
         for command in scene.render_commands() {
+            if hidden > 0 {
+                match command {
+                    RenderCommand::BeginGroup { .. } => hidden += 1,
+                    RenderCommand::EndGroup { .. } => hidden -= 1,
+                    RenderCommand::Batch(_) => {}
+                }
+                continue;
+            }
             let _annotation = annotation
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(command.label())));
@@ -779,8 +799,16 @@ impl DirectXRenderer {
                     self.bind_current_target()?;
                     result
                 }
-                RenderCommand::BeginGroup { target, .. } => {
+                RenderCommand::BeginGroup {
+                    boundary_index,
+                    target,
+                } => {
                     let has_target = self.begin_group(target, viewport_size)?;
+                    let boundary = &scene.group_boundaries[*boundary_index];
+                    if !has_target && (boundary.masked || boundary.mask_mode.is_some()) {
+                        hidden = 1;
+                        continue;
+                    }
                     isolated.push(has_target);
                     Ok(())
                 }
@@ -844,15 +872,34 @@ impl DirectXRenderer {
     }
 
     /// Finishes a group drawn into a target of its own: composites it into its parent, which
-    /// the batches that follow draw into, and gives its texture back to the pool.
+    /// the batches that follow draw into, and gives its texture, and its mask's, back to the
+    /// pool. A mask is not composited but kept on its parent, the group it masks, which
+    /// samples it; a masked group whose mask drew nothing is dropped.
     fn end_group(&mut self, boundary: &GroupBoundary) -> Result<()> {
-        let group = self
+        let mut group = self
             .targets
             .pop()
             .context("an isolated group's target is on the stack")?;
-        let result = self
-            .composite_group(boundary, &group)
-            .and_then(|()| self.bind_current_target());
+        if let Some(mode) = boundary.mask_mode {
+            let parent = self
+                .targets
+                .last_mut()
+                .context("a mask's group is on the stack")?;
+            if let Some((stale, _, _)) = parent.mask.replace((group.color, group.bounds, mode)) {
+                self.give_back(stale);
+            }
+            return self.bind_current_target();
+        }
+        let result = if boundary.masked && group.mask.is_none() {
+            // Its mask is out of view: so is all of it.
+            self.bind_current_target()
+        } else {
+            self.composite_group(boundary, &group)
+                .and_then(|()| self.bind_current_target())
+        };
+        if let Some((mask, _, _)) = group.mask.take() {
+            self.give_back(mask);
+        }
         self.give_back(group.color);
         result
     }
@@ -1544,8 +1591,8 @@ impl DirectXRenderer {
 
     /// Composites `group`, an isolated group's finished target, into the current target, its
     /// parent: blurred by its filters, faded by its opacity, and mixed by its blend mode with a
-    /// copy of what is beneath it in the parent. Gives back the textures it takes; the caller
-    /// gives back the group's.
+    /// copy of what is beneath it in the parent, and cut to its mask, if it has one. Gives back
+    /// the textures it takes; the caller gives back the group's and its mask's.
     fn composite_group(&mut self, boundary: &GroupBoundary, group: &FrameTarget) -> Result<()> {
         let blurred = match BlurKernel::for_radius(boundary.max_blur_radius()) {
             Some(kernel) => self.blur(&group.color, kernel)?,
@@ -1567,11 +1614,19 @@ impl DirectXRenderer {
             boundary.opacity,
             boundary.blend_mode,
             backdrop.as_ref().map(|_| group.bounds),
-            None,
+            group
+                .mask
+                .as_ref()
+                .map(|(_, bounds, mode)| (*bounds, *mode)),
         );
-        // Normal blending never reads the backdrop; bind the source in its place.
+        // Normal blending never reads the backdrop, nor an unmasked group its mask; bind the
+        // source in their place.
         let backdrop_srv = backdrop.as_ref().map_or(&source, |backdrop| &backdrop.srv);
-        self.draw_group_composite(uniforms, &source, backdrop_srv)?;
+        let mask_srv = group
+            .mask
+            .as_ref()
+            .map_or(&source, |(mask, _, _)| &mask.srv);
+        self.draw_group_composite(uniforms, &source, backdrop_srv, mask_srv)?;
 
         if let Some((blurred, spare, _)) = blurred {
             self.give_back(blurred);
@@ -1623,13 +1678,14 @@ impl DirectXRenderer {
         Ok(Some(backdrop))
     }
 
-    /// Draws the group composite into the current target, sampling the group from `source` and
-    /// what is beneath it from `backdrop`.
+    /// Draws the group composite into the current target, sampling the group from `source`,
+    /// what is beneath it from `backdrop`, and its mask from `mask`.
     fn draw_group_composite(
         &self,
         uniforms: GroupUniforms,
         source: &Option<ID3D11ShaderResourceView>,
         backdrop: &Option<ID3D11ShaderResourceView>,
+        mask: &Option<ID3D11ShaderResourceView>,
     ) -> Result<()> {
         let target = self.targets.last().context("no render target is bound")?;
         let ctx = &self
@@ -1658,6 +1714,7 @@ impl DirectXRenderer {
             ctx.VSSetShaderResources(SCENE_TABLES_REGISTER, Some(&scene_tables));
             ctx.PSSetShaderResources(SCENE_TABLES_REGISTER, Some(&scene_tables));
             ctx.PSSetShaderResources(GROUP_TEXTURE_REGISTER, Some(&textures));
+            ctx.PSSetShaderResources(MASK_TEXTURE_REGISTER, Some(slice::from_ref(mask)));
             ctx.PSSetSamplers(
                 GROUP_SAMPLER_REGISTER,
                 Some(slice::from_ref(&self.globals.sampler)),
@@ -1666,6 +1723,7 @@ impl DirectXRenderer {
             ctx.DrawInstanced(4, 1, 0, 0);
             // Unbind the pooled textures, which later groups may draw into.
             ctx.PSSetShaderResources(GROUP_TEXTURE_REGISTER, Some(&unbound));
+            ctx.PSSetShaderResources(MASK_TEXTURE_REGISTER, Some(&unbound[..1]));
         }
         Ok(())
     }
