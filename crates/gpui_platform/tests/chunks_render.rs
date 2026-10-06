@@ -1,6 +1,8 @@
 //! Renders a cached view large enough to be drawn as a chunk, reused under a
 //! camera transform that moves and zooms it, and checks its pixels land
-//! where the transform puts them: its quads, and a path beside them.
+//! where the transform puts them: its quads, and a path beside them. Once
+//! the camera settles, the chunk is prepared at the scale it is drawn at, so
+//! its text is sharper than when it was stretched.
 //!
 //! Runs only with `GPUI_RUN_RENDERING_TESTS` set, in an offscreen window;
 //! `GPUI_RENDERING_TEST_OUTPUT=<path.png>` saves the image.
@@ -20,6 +22,8 @@ const PITCH: f32 = 20.;
 const CELL: f32 = 16.;
 /// A black triangle beside the cells, in the grid's coordinates.
 const TRIANGLE: [(f32, f32); 3] = [(420., 0.), (500., 0.), (460., 80.)];
+/// Where a line of text sits beside the cells, in the grid's coordinates.
+const TEXT_ORIGIN: (f32, f32) = (420., 100.);
 /// The grid's width, triangle included.
 const GRID_WIDTH: f32 = 520.;
 /// Where the grid sits on the page, away from the pointer at the origin.
@@ -49,6 +53,15 @@ impl Render for Grid {
                     .size(px(CELL))
                     .bg(rgb(cell_color(row, column)))
             }))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(TEXT_ORIGIN.0))
+                    .top(px(TEXT_ORIGIN.1))
+                    .text_size(px(14.))
+                    .text_color(rgb(0x000000))
+                    .child("Chunk text"),
+            )
             .child(
                 canvas(
                     |_, _, _| (),
@@ -126,7 +139,7 @@ fn render() {
     // Moved, the grid is reused and made a chunk; moved and zoomed, the
     // chunk is placed again.
     let final_camera = (1.5, 120., 40.);
-    for next in [(1., 30., 20.), final_camera] {
+    let mut draw = |next| {
         camera.set(next);
         cx.update_window(window, |root, window, cx| {
             root.downcast::<ChunksFixture>()
@@ -135,7 +148,24 @@ fn render() {
             window.draw(cx).clear(cx);
         })
         .expect("failed to draw the window");
-    }
+    };
+    draw((1., 30., 20.));
+    // Zoomed, the chunk is drawn stretched, and asks for another frame to
+    // be prepared at its scale once the camera holds still; capture it
+    // before that frame is drawn.
+    camera.set(final_camera);
+    let stretched = cx
+        .update_window(window, |root, window, cx| {
+            root.downcast::<ChunksFixture>()
+                .unwrap()
+                .update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear(cx);
+            window.render_to_image()
+        })
+        .expect("failed to draw the window")
+        .expect("failed to capture the rendered window");
+    // The camera holds still: the chunk is prepared at its scale.
+    cx.run_until_parked();
     // The grid's quads are drawn from its chunk, not the window's scene.
     let (window_quads, ..) = cx
         .update_window(window, |_, window, _| window.rendered_primitive_counts())
@@ -187,6 +217,37 @@ fn render() {
         failures.push(format!(
             "triangle: at ({x}, {y}) expected black, got {:?}",
             pixel(x, y).0
+        ));
+    }
+    // The text: drawn stretched, its edges are blurred over more pixels
+    // than once it is rasterized at its size.
+    let (zoom_f, camera_x_f, camera_y_f) = (zoom as f32, camera_x as f32, camera_y as f32);
+    let blurred = |image: &image::RgbaImage| {
+        let (left, top) = (
+            ((GRID_ORIGIN + TEXT_ORIGIN.0) * zoom_f + camera_x_f) * scale,
+            ((GRID_ORIGIN + TEXT_ORIGIN.1) * zoom_f + camera_y_f) * scale,
+        );
+        let (width, height) = (100. * zoom_f * scale, 24. * zoom_f * scale);
+        let mut count = 0;
+        for y in top as u32..(top + height) as u32 {
+            for x in left as u32..(left + width) as u32 {
+                let value = image.get_pixel(x, y).0[1];
+                if (40..215).contains(&value) {
+                    count += 1;
+                }
+            }
+        }
+        count
+    };
+    let (stretched_blur, prepared_blur) = (blurred(&stretched), blurred(&image));
+    if let Some(output) = std::env::var_os("GPUI_RENDERING_TEST_OUTPUT") {
+        let mut path = std::path::PathBuf::from(output);
+        path.set_extension("stretched.png");
+        stretched.save(path).expect("failed to save the image");
+    }
+    if prepared_blur == 0 || prepared_blur * 10 > stretched_blur * 8 {
+        failures.push(format!(
+            "text: {prepared_blur} partly covered pixels once prepared, {stretched_blur} stretched"
         ));
     }
     // Between cells, and where the grid was before it moved, is white.

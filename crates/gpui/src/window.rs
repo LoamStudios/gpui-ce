@@ -141,6 +141,32 @@ fn rasterize_glyph(
 /// Rasterizes the SVG `source` describes, through the atlas, fitted and
 /// centered in its bounds: its sprite's bounds and tile, or `None` for an SVG
 /// that could not be loaded.
+/// Rasterizes the glyphs and SVGs of a replay at the size it places them.
+fn placed_rasterizer<'a>(
+    atlas: &'a Arc<dyn PlatformAtlas>,
+    text_system: &'a Arc<WindowTextSystem>,
+    svg_renderer: &'a crate::SvgRenderer,
+) -> impl FnMut(RasterSource) -> Option<PlacedRaster> + 'a {
+    move |source| match source {
+        RasterSource::Glyph(source) => {
+            let glyph = rasterize_glyph(atlas, text_system, source).ok()??;
+            Some(PlacedRaster {
+                bounds: glyph.bounds,
+                tile: glyph.tile,
+                source: RasterSource::Glyph(glyph.source),
+            })
+        }
+        RasterSource::Svg(source) => {
+            let (bounds, tile) = rasterize_svg(atlas, svg_renderer, &source).ok()??;
+            Some(PlacedRaster {
+                bounds,
+                tile,
+                source: RasterSource::Svg(source),
+            })
+        }
+    }
+}
+
 fn rasterize_svg(
     atlas: &Arc<dyn PlatformAtlas>,
     svg_renderer: &crate::SvgRenderer,
@@ -1176,7 +1202,14 @@ impl Hitbox {
 pub(crate) struct ViewChunk {
     chunk: Rc<crate::SceneChunk>,
     placement: TransformationMatrix,
+    /// Where it was drawn the frame before, to tell when it has settled.
+    previous_placement: Option<TransformationMatrix>,
 }
+
+/// How far a chunk's scale may drift from the one it was prepared at while
+/// it moves, before it is prepared again, as a factor either way: drawn
+/// stretched until then, its text and icons blur.
+const CHUNK_STRETCH_LIMIT: f32 = 2.;
 
 /// How a cached view's subframe of hitboxes sits in the coordinates of what
 /// contains it.
@@ -1588,6 +1621,9 @@ pub struct Window {
     element_states: ElementStates,
     /// The subframes being drawn, innermost last.
     subframe_stack: Vec<SubframeId>,
+    /// A chunk drawn stretched this frame will be prepared at its scale once
+    /// its placement settles, which needs another frame.
+    chunk_settling: bool,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -2360,6 +2396,7 @@ impl Window {
             photos: crate::PhotoResidency::default(),
             element_states: ElementStates::default(),
             subframe_stack: Vec::new(),
+            chunk_settling: false,
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -3778,6 +3815,10 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.element_states.sweep(self.rendered_frame.id);
+        if mem::take(&mut self.chunk_settling) {
+            // Draw again, without rendering anything that hasn't changed.
+            self.invalidator.set_dirty(true);
+        }
         self.next_frame.clear();
         self.next_frame.id = self.rendered_frame.id + 1;
         self.atlas_eviction.frame_drawn(
@@ -4537,7 +4578,7 @@ impl Window {
         let clip = self.snapped_content_mask();
         let scale_factor = self.scale_factor();
         if let Some(chunk) = chunk
-            && self.reuse_chunk(&range, placement, chunk, &clip)
+            && self.reuse_chunk(&range, placement, chunk, &clip, cx)
         {
             return;
         }
@@ -4556,31 +4597,12 @@ impl Window {
                     translation: transformation.translation.map(|value| value * scale_factor),
                     ..transformation
                 };
-                let (atlas, text_system) = (&self.sprite_atlas, &self.text_system);
                 self.next_frame.scene.replay_placed(
                     range.start.scene_index..range.end.scene_index,
                     &self.rendered_frame.scene,
                     &device_placement,
                     &clip,
-                    &mut |source| match source {
-                        RasterSource::Glyph(source) => {
-                            let glyph = rasterize_glyph(atlas, text_system, source).ok()??;
-                            Some(PlacedRaster {
-                                bounds: glyph.bounds,
-                                tile: glyph.tile,
-                                source: RasterSource::Glyph(glyph.source),
-                            })
-                        }
-                        RasterSource::Svg(source) => {
-                            let (bounds, tile) =
-                                rasterize_svg(atlas, &cx.svg_renderer, &source).ok()??;
-                            Some(PlacedRaster {
-                                bounds,
-                                tile,
-                                source: RasterSource::Svg(source),
-                            })
-                        }
-                    },
+                    &mut placed_rasterizer(&self.sprite_atlas, &self.text_system, &cx.svg_renderer),
                 );
             }
         }
@@ -4596,6 +4618,7 @@ impl Window {
         placement: Placement,
         chunk: &mut Option<ViewChunk>,
         clip: &ContentMask<ScaledPixels>,
+        cx: &App,
     ) -> bool {
         let scale_factor = self.scale_factor();
         let moved = match placement {
@@ -4645,12 +4668,14 @@ impl Window {
             *chunk = Some(ViewChunk {
                 chunk: Rc::new(made),
                 placement: TransformationMatrix::UNIT,
+                previous_placement: None,
             });
         }
         let Some(chunk) = chunk else {
             return false;
         };
         chunk.placement = moved.compose(chunk.placement);
+        self.prepare_chunk_at_its_scale(chunk, cx);
         self.next_frame
             .scene
             .insert_primitive(crate::Primitive::Chunk(crate::PlacedChunk::new(
@@ -4659,6 +4684,55 @@ impl Window {
                 *clip,
             )));
         true
+    }
+
+    /// Prepares `chunk` again at the scale it is drawn at, so its text and
+    /// icons are rasterized for it rather than stretched, once its placement
+    /// has settled or has stretched it past [`CHUNK_STRETCH_LIMIT`]. A
+    /// placement that only zooms and moves is folded into the chunk; one that
+    /// turns it is left on the GPU.
+    fn prepare_chunk_at_its_scale(&mut self, chunk: &mut ViewChunk, cx: &App) {
+        let settled = chunk.previous_placement == Some(chunk.placement);
+        chunk.previous_placement = Some(chunk.placement);
+        let Some(uniform) = crate::scene::UniformPlacement::of(&chunk.placement) else {
+            return;
+        };
+        if (uniform.scale - 1.).abs() < 0.01 {
+            return;
+        }
+        let stretched =
+            uniform.scale > CHUNK_STRETCH_LIMIT || uniform.scale < 1. / CHUNK_STRETCH_LIMIT;
+        if !settled && !stretched {
+            // Draw once more, to prepare it if it has settled by then.
+            self.chunk_settling = true;
+            return;
+        }
+        let unbounded = ContentMask {
+            bounds: Bounds::new(
+                point(
+                    ScaledPixels(-UNBOUNDED_EXTENT),
+                    ScaledPixels(-UNBOUNDED_EXTENT),
+                ),
+                size(
+                    ScaledPixels(2. * UNBOUNDED_EXTENT),
+                    ScaledPixels(2. * UNBOUNDED_EXTENT),
+                ),
+            ),
+            ..Default::default()
+        };
+        let mut scene = Scene::default();
+        scene.replay_placed(
+            0..chunk.chunk.scene.paint_operations.len(),
+            &chunk.chunk.scene,
+            &chunk.placement,
+            &unbounded,
+            &mut placed_rasterizer(&self.sprite_atlas, &self.text_system, &cx.svg_renderer),
+        );
+        if let Some(prepared) = crate::SceneChunk::new(scene) {
+            chunk.chunk = Rc::new(prepared);
+            chunk.placement = TransformationMatrix::UNIT;
+            chunk.previous_placement = Some(chunk.placement);
+        }
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
