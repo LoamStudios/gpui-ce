@@ -16,6 +16,7 @@ use gpui_render::{
     path_types::{self, PathRasterizationVertex},
     shaders::{
         common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool, SurfaceColorFormat},
+        interface as shader_interface,
         surface::SurfaceUniforms,
     },
 };
@@ -43,12 +44,36 @@ use std::{cell::Cell, mem, ptr, sync::Arc};
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
 
-// Buffer slots declared by the generated MSL. Group 0 globals land at 0/1, the group 1 data
-// binding at 2, Naga's runtime-array sizes buffer at 3.
-const GLOBALS_SLOT: u64 = 0;
-const FONT_SLOT: u64 = 1;
-const DATA_SLOT: u64 = 2;
-const SIZES_SLOT: u64 = 3;
+// Buffer slots declared by the generated MSL: group 0 (globals, font rasterization, and the
+// scene's transform and clip tables), then the group 1 data binding, then Naga's runtime-array
+// sizes buffer.
+const fn buffer_slot(group: u32, binding: u32) -> u64 {
+    shader_interface::native_slot(group, binding) as u64
+}
+const GLOBALS_SLOT: u64 = buffer_slot(
+    shader_interface::GLOBAL_BIND_GROUP,
+    shader_interface::GLOBAL_UNIFORMS_BINDING,
+);
+const FONT_SLOT: u64 = buffer_slot(
+    shader_interface::GLOBAL_BIND_GROUP,
+    shader_interface::FONT_RASTERIZATION_BINDING,
+);
+const TRANSFORMS_SLOT: u64 = buffer_slot(
+    shader_interface::GLOBAL_BIND_GROUP,
+    shader_interface::TRANSFORMS_BINDING,
+);
+const CLIPS_SLOT: u64 = buffer_slot(
+    shader_interface::GLOBAL_BIND_GROUP,
+    shader_interface::CLIPS_BINDING,
+);
+const DATA_SLOT: u64 = buffer_slot(
+    shader_interface::DATA_BIND_GROUP,
+    shader_interface::DATA_BUFFER_BINDING,
+);
+const SIZES_SLOT: u64 = shader_interface::MSL_BUFFER_SIZES_SLOT as u64;
+/// Placeholder runtime-array sizes: the generated MSL declares them but never reads them.
+const BUFFER_SIZES: [u8; shader_interface::MSL_BUFFER_SIZES_BYTES as usize] =
+    [0; shader_interface::MSL_BUFFER_SIZES_BYTES as usize];
 const PRIMARY_TEXTURE_SLOT: u64 = 0;
 const SECONDARY_TEXTURE_SLOT: u64 = 1;
 const SAMPLER_SLOT: u64 = 0;
@@ -56,14 +81,78 @@ const SAMPLER_SLOT: u64 = 0;
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
 
-/// Per-frame global uniforms bound by every pipeline.
+/// Per-frame group-0 resources bound by every pipeline: global uniforms, and the scene's
+/// transform and clip tables.
 struct SceneUniforms {
     globals: GlobalUniforms,
     font: FontRasterizationUniforms,
+    tables: SceneTables,
+}
+
+/// Where this frame's transform and clip tables live in its instance buffer.
+struct SceneTables {
+    buffer: metal::Buffer,
+    transforms_offset: u64,
+    clips_offset: u64,
+}
+
+impl SceneTables {
+    /// Copies the scene's tables to the front of the frame's instance buffer, advancing
+    /// `instance_offset` past them. Returns `None` if they do not fit.
+    fn upload(
+        scene: &Scene,
+        instance_buffer: &InstanceBuffer,
+        instance_offset: &mut usize,
+    ) -> Option<Self> {
+        let transforms_offset = write_table(scene.transforms(), instance_buffer, instance_offset)?;
+        let clips_offset = write_table(scene.clips(), instance_buffer, instance_offset)?;
+        Some(Self {
+            buffer: instance_buffer.metal_buffer.clone(),
+            transforms_offset: transforms_offset as u64,
+            clips_offset: clips_offset as u64,
+        })
+    }
+}
+
+/// Copies `entries` into the instance buffer at the next aligned offset, which it returns.
+fn write_table<T: Copy>(
+    entries: &[T],
+    instance_buffer: &InstanceBuffer,
+    instance_offset: &mut usize,
+) -> Option<usize> {
+    align_offset(instance_offset);
+    let offset = *instance_offset;
+    let bytes_len = mem::size_of_val(entries);
+    let next_offset = offset.checked_add(bytes_len)?;
+    if next_offset > instance_buffer.size {
+        return None;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(
+            entries.as_ptr() as *const u8,
+            (instance_buffer.metal_buffer.contents() as *mut u8).add(offset),
+            bytes_len,
+        );
+    }
+    *instance_offset = next_offset;
+    Some(offset)
+}
+
+/// Bytes the scene's transform and clip tables take at the front of the instance buffer.
+fn scene_table_bytes(scene: &Scene) -> usize {
+    let mut required = 0;
+    for bytes in [
+        mem::size_of_val(scene.transforms()),
+        mem::size_of_val(scene.clips()),
+    ] {
+        align_offset(&mut required);
+        required += bytes;
+    }
+    required
 }
 
 impl SceneUniforms {
-    fn new(viewport_size: Size<DevicePixels>) -> Self {
+    fn new(viewport_size: Size<DevicePixels>, tables: SceneTables) -> Self {
         Self {
             globals: GlobalUniforms {
                 viewport_size: vec2f(
@@ -83,6 +172,7 @@ impl SceneUniforms {
                 uses_blue_green_red_subpixel_order: ShaderBool::Disabled,
                 padding: 0,
             },
+            tables,
         }
     }
 }
@@ -115,29 +205,29 @@ fn bind_scene_uniforms(encoder: &metal::RenderCommandEncoderRef, uniforms: &Scen
         mem::size_of::<FontRasterizationUniforms>() as u64,
         &uniforms.font as *const FontRasterizationUniforms as *const _,
     );
+    let tables = &uniforms.tables;
+    for (slot, offset) in [
+        (TRANSFORMS_SLOT, tables.transforms_offset),
+        (CLIPS_SLOT, tables.clips_offset),
+    ] {
+        encoder.set_vertex_buffer(slot, Some(&tables.buffer), offset);
+        encoder.set_fragment_buffer(slot, Some(&tables.buffer), offset);
+    }
 }
 
-/// Binds an instance slice and the byte length used by Naga's runtime-array size ABI.
-fn bind_instances<T>(
+/// Binds a frame's instances from `offset`, and the runtime-array sizes Naga's MSL declares
+/// beside them.
+fn bind_instances(
     encoder: &metal::RenderCommandEncoderRef,
     buffer: &metal::BufferRef,
     offset: usize,
-    instances: &[T],
 ) {
-    bind_instance_bytes(encoder, buffer, offset, mem::size_of_val(instances));
-}
-
-fn bind_instance_bytes(
-    encoder: &metal::RenderCommandEncoderRef,
-    buffer: &metal::BufferRef,
-    offset: usize,
-    byte_len: usize,
-) {
-    let byte_len = u32::try_from(byte_len).expect("Metal instance binding exceeds 4 GiB");
+    let sizes_len = BUFFER_SIZES.len() as u64;
+    let sizes = BUFFER_SIZES.as_ptr() as *const _;
     encoder.set_vertex_buffer(DATA_SLOT, Some(buffer), offset as u64);
     encoder.set_fragment_buffer(DATA_SLOT, Some(buffer), offset as u64);
-    encoder.set_vertex_bytes(SIZES_SLOT, 4, &byte_len as *const u32 as *const _);
-    encoder.set_fragment_bytes(SIZES_SLOT, 4, &byte_len as *const u32 as *const _);
+    encoder.set_vertex_bytes(SIZES_SLOT, sizes_len, sizes);
+    encoder.set_fragment_bytes(SIZES_SLOT, sizes_len, sizes);
 }
 
 /// Creates the CAMetalLayer that backs a window's view. The renderer drawing
@@ -897,7 +987,15 @@ impl MetalRenderer {
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
         let mut instance_offset = 0;
-        let scene_uniforms = SceneUniforms::new(viewport_size);
+        let tables =
+            SceneTables::upload(scene, instance_buffer, &mut instance_offset).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "scene too large: {} transforms, {} clips",
+                    scene.transforms().len(),
+                    scene.clips().len()
+                )
+            })?;
+        let scene_uniforms = SceneUniforms::new(viewport_size, tables);
 
         // Render the scene into an offscreen color texture (so filters can sample it), then
         // blit it to `texture`. Owned clones keep the textures borrowable without borrowing
@@ -1441,11 +1539,10 @@ impl MetalRenderer {
             command_encoder.end_encoding();
             return false;
         }
-        bind_instance_bytes(
+        bind_instances(
             command_encoder,
             &instance_buffer.metal_buffer,
             *instance_offset,
-            vertices_bytes_len,
         );
         command_encoder.draw_primitives(
             metal::MTLPrimitiveType::Triangle,
@@ -1499,7 +1596,6 @@ impl MetalRenderer {
             command_encoder,
             &instance_buffer.metal_buffer,
             *instance_offset,
-            shadows,
         );
 
         command_encoder.draw_primitives_instanced(
@@ -1549,7 +1645,6 @@ impl MetalRenderer {
             command_encoder,
             &instance_buffer.metal_buffer,
             *instance_offset,
-            quads,
         );
 
         command_encoder.draw_primitives_instanced(
@@ -1612,11 +1707,10 @@ impl MetalRenderer {
             return false;
         }
 
-        bind_instance_bytes(
+        bind_instances(
             command_encoder,
             &instance_buffer.metal_buffer,
             *instance_offset,
-            sprite_bytes_len,
         );
         command_encoder.draw_primitives_instanced(
             metal::MTLPrimitiveType::TriangleStrip,
@@ -1664,7 +1758,6 @@ impl MetalRenderer {
             command_encoder,
             &instance_buffer.metal_buffer,
             *instance_offset,
-            underlines,
         );
 
         command_encoder.draw_primitives_instanced(
@@ -1714,7 +1807,6 @@ impl MetalRenderer {
             command_encoder,
             &instance_buffer.metal_buffer,
             *instance_offset,
-            sprites,
         );
         // Generated native shaders derive tile coordinates from the atlas size in the
         // vertex stage; bind the same texture to both stages, as WGPU and DirectX do.
@@ -1775,7 +1867,6 @@ impl MetalRenderer {
             command_encoder,
             &instance_buffer.metal_buffer,
             *instance_offset,
-            sprites,
         );
         command_encoder.set_vertex_texture(PRIMARY_TEXTURE_SLOT, Some(&texture));
         command_encoder.set_fragment_texture(PRIMARY_TEXTURE_SLOT, Some(&texture));
@@ -2040,7 +2131,7 @@ fn build_blur_pipeline_state(
 }
 
 fn required_instance_buffer_size(scene: &Scene) -> usize {
-    let mut required = 0;
+    let mut required = scene_table_bytes(scene);
     let mut reserve = |element_size: usize, count: usize| {
         if count > 0 {
             align_offset(&mut required);
@@ -2916,5 +3007,168 @@ mod tests {
             }),
             "triangle edges are antialiased",
         );
+    }
+
+    /// Scenes whose primitives refer to the transform and clip tables. Each would paint
+    /// somewhere else, or nothing, if a table were not bound or not uploaded.
+    mod scene_tables {
+        use super::*;
+        use gpui::{SceneClip, SceneTransform};
+
+        const TARGET: Size<DevicePixels> = Size {
+            width: DevicePixels(100),
+            height: DevicePixels(100),
+        };
+        const BLACK: [u8; 4] = [0, 0, 0, 255];
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+
+        fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+            Bounds {
+                origin: gpui::point(ScaledPixels(x), ScaledPixels(y)),
+                size: size(ScaledPixels(width), ScaledPixels(height)),
+            }
+        }
+
+        fn viewport_mask() -> ContentMask<ScaledPixels> {
+            ContentMask {
+                bounds: bounds(0.0, 0.0, 100.0, 100.0),
+                ..Default::default()
+            }
+        }
+
+        fn green_background() -> gpui::Background {
+            solid_background(gpui::rgb_to_hsla(gpui::rgb(0x00ff00)))
+        }
+
+        /// A quarter turn clockwise about the viewport's centre, (50, 50): a point at
+        /// (x, y) lands at (100 - y, x).
+        fn quarter_turn() -> SceneTransform {
+            let transformation = TransformationMatrix {
+                rotation_scale: [[0.0, -1.0], [1.0, 0.0]],
+                translation: [100.0, 0.0],
+            };
+            SceneTransform {
+                transformation,
+                inverse: transformation.inverse().expect("a rotation is invertible"),
+            }
+        }
+
+        /// A horizontal bar, x 10..40 and y 40..60, turned into a vertical bar, x 40..60
+        /// and y 10..40.
+        fn turned_bar(scene: &mut Scene) {
+            let transform = scene.push_transform(quarter_turn());
+            scene.insert_primitive(Quad {
+                transform,
+                bounds: bounds(10.0, 40.0, 30.0, 20.0),
+                content_mask: viewport_mask(),
+                background: green_background(),
+                ..Default::default()
+            });
+        }
+
+        /// A full-viewport quad clipped to x 30..70 and y 40..60 in the quarter turn's
+        /// space, which covers x 40..60 and y 30..70 in the viewport.
+        fn clipped_fill(scene: &mut Scene) {
+            let transform = scene.push_transform(quarter_turn());
+            let clip = scene.push_clip(SceneClip {
+                bounds: bounds(30.0, 40.0, 40.0, 20.0),
+                corner_radii: Corners::default(),
+                transform,
+                parent: 0,
+            });
+            scene.insert_primitive(Quad {
+                clip,
+                bounds: bounds(0.0, 0.0, 100.0, 100.0),
+                content_mask: viewport_mask(),
+                background: green_background(),
+                ..Default::default()
+            });
+        }
+
+        fn render(mut scene: Scene) -> RgbaImage {
+            scene.finish();
+            MetalHeadlessRenderer::new()
+                .render_scene_to_image(&scene, TARGET)
+                .expect("headless render")
+        }
+
+        fn assert_pixels(image: &RgbaImage, expected: [u8; 4], points: &[(u32, u32)], what: &str) {
+            for &(x, y) in points {
+                assert_eq!(pixel(image, x, y), expected, "{what} at ({x}, {y})");
+            }
+        }
+
+        #[test]
+        fn transformed_quad_lands_where_its_transform_puts_it() {
+            let mut scene = Scene::default();
+            turned_bar(&mut scene);
+            let image = render(scene);
+            assert_pixels(
+                &image,
+                GREEN,
+                &[(50, 15), (45, 25), (55, 35)],
+                "the transformed bar must cover",
+            );
+            assert_pixels(
+                &image,
+                BLACK,
+                &[(15, 50), (25, 45), (35, 55), (50, 50)],
+                "the untransformed bar must not cover",
+            );
+        }
+
+        #[test]
+        fn transformed_clip_removes_pixels_outside_it() {
+            let mut scene = Scene::default();
+            clipped_fill(&mut scene);
+            let image = render(scene);
+            assert_pixels(
+                &image,
+                GREEN,
+                &[(50, 35), (45, 50), (55, 65)],
+                "the transformed clip must keep",
+            );
+            // Inside the clip's rectangle before its transform, but outside it after.
+            assert_pixels(
+                &image,
+                BLACK,
+                &[(35, 50), (65, 45), (10, 10), (90, 90)],
+                "the transformed clip must remove",
+            );
+        }
+
+        /// Tables larger than the instance pool's default buffer, which must grow to hold
+        /// them ahead of the frame's instances.
+        #[test]
+        fn large_tables_stay_addressable() {
+            let mut scene = Scene::default();
+            let decoy = SceneTransform {
+                transformation: TransformationMatrix {
+                    rotation_scale: [[1.0, 0.0], [0.0, 1.0]],
+                    translation: [1000.0, 1000.0],
+                },
+                inverse: TransformationMatrix {
+                    rotation_scale: [[1.0, 0.0], [0.0, 1.0]],
+                    translation: [-1000.0, -1000.0],
+                },
+            };
+            for _ in 0..50_000 {
+                scene.push_transform(decoy);
+            }
+            turned_bar(&mut scene);
+            for _ in 0..300 {
+                scene.push_clip(SceneClip::default());
+            }
+            clipped_fill(&mut scene);
+            assert!(scene_table_bytes(&scene) > InstanceBufferPool::default().buffer_size);
+            let image = render(scene);
+            assert_pixels(&image, GREEN, &[(50, 15), (55, 65)], "the scene must cover");
+            assert_pixels(
+                &image,
+                BLACK,
+                &[(15, 50), (90, 90)],
+                "the scene must not cover",
+            );
+        }
     }
 }
