@@ -10,8 +10,9 @@ use gpui_render::{
     artifacts::{Dx11DrawConstants, Dx11DrawConstantsBinding},
     blur::{
         BlurAxis, BlurKernel, BlurUniforms, FilterCompositeClip,
-        GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, downsampled_dimension,
+        GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, ScissorRectangle, downsampled_dimension,
     },
+    group::{GroupUniforms, group_target_bounds},
     path_types::{PathRasterizationVertex, PathSprite},
     shaders::{
         common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool, SurfaceColorFormat},
@@ -64,6 +65,14 @@ const DATA_REGISTER: u32 = data_register(shader_interface::DATA_BUFFER_BINDING);
 const PRIMARY_TEXTURE_REGISTER: u32 = data_register(shader_interface::PRIMARY_TEXTURE_BINDING);
 const PRIMARY_SAMPLER_REGISTER: u32 = data_register(shader_interface::PRIMARY_SAMPLER_BINDING);
 const SURFACE_SAMPLER_REGISTER: u32 = data_register(shader_interface::SURFACE_SAMPLER_BINDING);
+/// The group composite's textures, its group's and the backdrop's, and its sampler: bindings
+/// 1, 2 and 3 of `GROUP_TEXTURE`, `BACKDROP_TEXTURE` and `GROUP_SAMPLER` in `shaders/groups.rs`.
+const GROUP_TEXTURE_REGISTER: u32 = data_register(shader_interface::PRIMARY_TEXTURE_BINDING);
+const _: () = assert!(
+    data_register(shader_interface::SECONDARY_TEXTURE_BINDING) == GROUP_TEXTURE_REGISTER + 1,
+    "the backdrop texture must follow the group texture"
+);
+const GROUP_SAMPLER_REGISTER: u32 = data_register(3);
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -91,11 +100,10 @@ pub(crate) struct DirectXRenderer {
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
 
-    /// The render target currently bound for the main scene this frame (the offscreen
-    /// `scene_color` when blur filters are present, a content-filter group texture inside such a
-    /// group, or the swapchain otherwise). `draw_paths_to_intermediate` restores to this after
-    /// its own pass so paths land on the correct target.
-    active_render_target: Option<ID3D11RenderTargetView>,
+    /// The targets this frame is drawing into: the window's (the offscreen `scene_color` when
+    /// the scene reads back what it has painted, the swapchain's buffer otherwise), then one for
+    /// each isolated group being drawn. Batches draw into the last.
+    targets: Vec<FrameTarget>,
     path_rasterization_vertices: Vec<PathRasterizationVertex>,
     path_sprites: Vec<PathSprite>,
 }
@@ -120,8 +128,13 @@ struct DirectXResources {
     // Path intermediates are absent until a scene contains a path batch.
     path: Option<PathResources>,
 
-    // Offscreen targets are absent until a scene actually needs a blur/filter pass.
-    blur: Option<BlurResources>,
+    // The window's offscreen target, absent until a scene reads back what it has painted:
+    // backdrop filters blur it, and blend modes mix groups with it.
+    scene_color: Option<ColorTarget>,
+
+    // Targets for isolated groups, the blurs of groups and backdrops, and copies of what is
+    // beneath a blended group.
+    target_pool: TexturePool,
 
     // Views for capture textures that are referenced by the current scene. Keeping the
     // underlying texture alive makes its COM pointer a stable cache key.
@@ -158,82 +171,33 @@ impl PathResources {
     }
 }
 
-/// Offscreen render targets used by the blur filters. The scene is rendered into `scene_color`
-/// (so filters can sample it), `ping`/`pong` are half-resolution scratch for the separable
-/// gaussian, and `groups` isolate content-filter (`filter`) subtrees — one per nesting level
-/// (indexed by isolation depth), up to [`MAX_FILTER_DEPTH`], so nested content blurs isolate
-/// correctly; deeper nests render inline.
-struct BlurResources {
-    #[expect(dead_code)]
-    scene_color: ID3D11Texture2D,
-    scene_color_rtv: Option<ID3D11RenderTargetView>,
-    scene_color_srv: Option<ID3D11ShaderResourceView>,
-    #[expect(dead_code)]
-    ping: ID3D11Texture2D,
-    ping_rtv: Option<ID3D11RenderTargetView>,
-    ping_srv: Option<ID3D11ShaderResourceView>,
-    #[expect(dead_code)]
-    pong: ID3D11Texture2D,
-    pong_rtv: Option<ID3D11RenderTargetView>,
-    pong_srv: Option<ID3D11ShaderResourceView>,
-    // Kept alive for the lifetime of their views; indexed by isolation depth.
-    groups: Vec<ID3D11Texture2D>,
-    group_rtvs: Vec<Option<ID3D11RenderTargetView>>,
-    group_srvs: Vec<Option<ID3D11ShaderResourceView>>,
+/// A texture a frame draws into: the window's, or an isolated group's.
+struct FrameTarget {
+    color: ColorTarget,
+    /// The viewport rectangle the texture covers.
+    bounds: Bounds<DevicePixels>,
+    /// The viewport covering the whole texture, set by every draw into it.
+    viewport: D3D11_VIEWPORT,
 }
 
-impl BlurResources {
-    fn new(
-        device: &ID3D11Device,
-        width: u32,
-        height: u32,
-        isolated_target_count: usize,
-    ) -> Result<Self> {
-        let half_w = downsampled_dimension(width);
-        let half_h = downsampled_dimension(height);
-        let (scene_color, scene_color_rtv, scene_color_srv) =
-            create_color_target(device, width, height)?;
-        let (ping, ping_rtv, ping_srv) = create_color_target(device, half_w, half_h)?;
-        let (pong, pong_rtv, pong_srv) = create_color_target(device, half_w, half_h)?;
-        let mut groups = Vec::with_capacity(isolated_target_count);
-        let mut group_rtvs = Vec::with_capacity(isolated_target_count);
-        let mut group_srvs = Vec::with_capacity(isolated_target_count);
-        for _ in 0..isolated_target_count {
-            let (group, group_rtv, group_srv) = create_color_target(device, width, height)?;
-            groups.push(group);
-            group_rtvs.push(group_rtv);
-            group_srvs.push(group_srv);
+impl FrameTarget {
+    fn new(color: ColorTarget, origin: Point<DevicePixels>) -> Self {
+        let viewport = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: color.size.width.0 as f32,
+            Height: color.size.height.0 as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        Self {
+            bounds: Bounds {
+                origin,
+                size: color.size,
+            },
+            color,
+            viewport,
         }
-        Ok(Self {
-            scene_color,
-            scene_color_rtv,
-            scene_color_srv,
-            ping,
-            ping_rtv,
-            ping_srv,
-            pong,
-            pong_rtv,
-            pong_srv,
-            groups,
-            group_rtvs,
-            group_srvs,
-        })
-    }
-
-    fn ensure_isolated_targets(
-        &mut self,
-        device: &ID3D11Device,
-        width: u32,
-        height: u32,
-        isolated_target_count: usize,
-    ) -> Result<()> {
-        while self.groups.len() < isolated_target_count {
-            let (group, group_rtv, group_srv) = create_color_target(device, width, height)?;
-            self.groups.push(group);
-            self.group_rtvs.push(group_rtv);
-            self.group_srvs.push(group_srv);
-        }
-        Ok(())
     }
 }
 
@@ -260,6 +224,16 @@ struct DirectXRenderPipelines {
     blur_params_buffer: ID3D11Buffer,
     blur_blend_replace: ID3D11BlendState,
     blur_blend_composite: ID3D11BlendState,
+    group_composite: GroupCompositePipeline,
+}
+
+/// The generated `group_composite` pipeline: one draw per isolated group, compositing its
+/// target into its parent's (premultiplied).
+struct GroupCompositePipeline {
+    vertex: ID3D11VertexShader,
+    fragment: ID3D11PixelShader,
+    params_buffer: ID3D11Buffer,
+    blend: ID3D11BlendState,
 }
 
 /// The generated `surfaces` pipeline: one draw per surface, per-draw uniforms.
@@ -446,7 +420,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
-            active_render_target: None,
+            targets: Vec::new(),
             path_rasterization_vertices: Vec::new(),
             path_sprites: Vec::new(),
         })
@@ -463,17 +437,7 @@ impl DirectXRenderer {
             .as_ref()
             .expect("devices missing")
             .device_context;
-        update_buffer(
-            device_context,
-            self.globals.globals_buffer.as_ref().unwrap(),
-            &[GlobalUniforms {
-                viewport_size: vec2f(resources.viewport.Width, resources.viewport.Height),
-                // DirectComposition wants premultiplied output, but path rasterization
-                // premultiplies in-shader; scene geometry blends straight alpha as before.
-                premultiplied_alpha: ShaderBool::Disabled,
-                padding: 0,
-            }],
-        )?;
+        self.write_globals(resources.window_bounds())?;
         update_buffer(
             device_context,
             self.globals.font_buffer.as_ref().unwrap(),
@@ -503,6 +467,58 @@ impl DirectXRenderer {
             device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
         }
         Ok(())
+    }
+
+    /// Points the global uniforms at a target covering `bounds` of the viewport. Shaders place
+    /// what they draw relative to the target's origin, so this changes with the target.
+    fn write_globals(&self, bounds: Bounds<DevicePixels>) -> Result<()> {
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let device_context = &self
+            .devices
+            .as_ref()
+            .context("devices missing")?
+            .device_context;
+        update_buffer(
+            device_context,
+            self.globals
+                .globals_buffer
+                .as_ref()
+                .context("globals buffer missing")?,
+            &[GlobalUniforms {
+                viewport_size: vec2f(resources.viewport.Width, resources.viewport.Height),
+                target_origin: vec2f(bounds.origin.x.0 as f32, bounds.origin.y.0 as f32),
+                target_size: vec2f(bounds.size.width.0 as f32, bounds.size.height.0 as f32),
+                // DirectComposition wants premultiplied output, but path rasterization
+                // premultiplies in-shader; scene geometry blends straight alpha as before.
+                premultiplied_alpha: ShaderBool::Disabled,
+                padding: 0,
+            }],
+        )
+    }
+
+    /// Binds the current target for the batches that follow: its view, its viewport and the
+    /// globals describing it.
+    fn bind_current_target(&self) -> Result<()> {
+        let target = self.targets.last().context("no render target is bound")?;
+        let device_context = &self
+            .devices
+            .as_ref()
+            .context("devices missing")?
+            .device_context;
+        unsafe {
+            device_context.OMSetRenderTargets(Some(slice::from_ref(&target.color.rtv)), None);
+            device_context.RSSetViewports(Some(slice::from_ref(&target.viewport)));
+        }
+        self.write_globals(target.bounds)
+    }
+
+    /// The viewport of the target batches draw into.
+    fn current_viewport(&self) -> Result<D3D11_VIEWPORT> {
+        Ok(self
+            .targets
+            .last()
+            .context("no render target is bound")?
+            .viewport)
     }
 
     #[inline]
@@ -619,82 +635,78 @@ impl DirectXRenderer {
 
         self.upload_scene_buffers(scene)?;
 
-        // Only route through the offscreen scene texture when the scene contains blur filters;
-        // otherwise render straight to the swapchain exactly as before.
+        // Render the scene into an offscreen texture when backdrop filters or blend modes read
+        // what is already painted, then blit it to the swapchain; otherwise render straight to
+        // the swapchain, with no extra blit.
         let use_offscreen = scene.requires_offscreen_rendering();
         let requirements = scene.render_plan().requirements();
-        let device = &self.devices.as_ref().context("devices missing")?.device;
+        let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_mut().context("resources missing")?;
         resources.retain_surface_views(&scene.surfaces);
         if requirements.uses_path_target {
-            resources.ensure_path_resources(device)?;
+            resources.ensure_path_resources(&devices.device)?;
         }
-        if use_offscreen {
-            resources.ensure_blur_resources(device, requirements.isolated_target_count)?;
-        }
-
-        // Clone the views we need (AddRef) so the loop can rebind render targets without holding a
-        // borrow of `self` across the `&mut self` draw_* calls.
-        let (scene_rtv, scene_srv, group_rtvs, group_srvs, swapchain_rtv) = {
-            let r = self.resources.as_ref().context("resources missing")?;
-            if let Some(blur) = r.blur.as_ref() {
-                (
-                    blur.scene_color_rtv.clone(),
-                    blur.scene_color_srv.clone(),
-                    blur.group_rtvs
-                        .iter()
-                        .cloned()
-                        .collect::<SmallVec<[_; MAX_FILTER_GROUP_DEPTH]>>(),
-                    blur.group_srvs
-                        .iter()
-                        .cloned()
-                        .collect::<SmallVec<[_; MAX_FILTER_GROUP_DEPTH]>>(),
-                    r.render_target_view.clone(),
-                )
-            } else {
-                debug_assert!(!use_offscreen);
-                (
-                    None,
-                    None,
-                    SmallVec::new(),
-                    SmallVec::new(),
-                    r.render_target_view.clone(),
-                )
-            }
-        };
-        let ctx = self
-            .devices
-            .as_ref()
-            .context("devices missing")?
-            .device_context
-            .clone();
-
-        if use_offscreen {
+        let swapchain_rtv = resources.render_target_view.clone();
+        let viewport_size = resources.viewport_size();
+        let window = if use_offscreen {
+            let scene_color = resources.ensure_scene_color(&devices.device)?.clone();
             unsafe {
-                if let Some(rtv) = scene_rtv.as_ref() {
-                    ctx.ClearRenderTargetView(rtv, &[0.0; 4]);
-                }
-                ctx.OMSetRenderTargets(Some(slice::from_ref(&scene_rtv)), None);
+                devices.device_context.ClearRenderTargetView(
+                    scene_color
+                        .rtv
+                        .as_ref()
+                        .context("scene color view missing")?,
+                    &[0.0; 4],
+                );
             }
-            self.active_render_target = scene_rtv.clone();
+            scene_color
         } else {
-            self.active_render_target = swapchain_rtv.clone();
-        }
-
-        // Current target for the main scene + a parent stack for content-filter groups.
-        let mut current_rtv = self.active_render_target.clone();
-        let mut current_srv = if use_offscreen {
-            scene_srv.clone()
-        } else {
-            None
+            ColorTarget {
+                texture: resources
+                    .render_target
+                    .clone()
+                    .context("render target missing")?,
+                rtv: swapchain_rtv.clone(),
+                // The swapchain's buffer is only ever drawn into and copied from.
+                srv: None,
+                size: viewport_size,
+            }
         };
-        let mut filter_stack = SmallVec::<
-            [(
-                Option<ID3D11RenderTargetView>,
-                Option<ID3D11ShaderResourceView>,
-            ); MAX_FILTER_GROUP_DEPTH],
-        >::new();
+        let scene_srv = window.srv.clone();
 
+        self.targets.clear();
+        self.targets.push(FrameTarget::new(
+            window,
+            point(DevicePixels(0), DevicePixels(0)),
+        ));
+        let result = self
+            .bind_current_target()
+            .and_then(|()| self.encode_commands(scene, viewport_size));
+
+        // Give back what an error left on the stack; a finished frame leaves only the window's.
+        while self.targets.len() > 1 {
+            if let Some(target) = self.targets.pop() {
+                self.give_back(target.color);
+            }
+        }
+        self.targets.clear();
+        if let Some(resources) = self.resources.as_mut() {
+            resources.target_pool.end_frame();
+        }
+        result?;
+
+        // Present the offscreen scene by blitting it into the swapchain.
+        if use_offscreen {
+            self.dx_blit(&scene_srv, &swapchain_rtv)?;
+        }
+        Ok(())
+    }
+
+    /// Draws the scene's render commands into the targets on the stack, starting with the
+    /// window's.
+    fn encode_commands(&mut self, scene: &Scene, viewport_size: Size<DevicePixels>) -> Result<()> {
+        // Whether each group being drawn has a target of its own.
+        let mut isolated = SmallVec::<[bool; 8]>::new();
         let annotation = self
             .devices
             .as_ref()
@@ -753,79 +765,34 @@ impl DirectXRenderer {
                     let result = (|| {
                         for filter in &scene.backdrop_filters[range.clone()] {
                             self.dx_blur_and_composite(
-                                &current_srv,
-                                &current_rtv,
                                 filter.bounds,
                                 filter.content_mask.bounds,
                                 filter.corner_radii,
                                 filter.corner_smoothing,
                                 filter.max_blur_radius(),
                                 filter.opacity,
-                                true,
                             )?;
                         }
                         Ok::<(), anyhow::Error>(())
                     })();
-                    // Restore the current target for subsequent batches.
-                    unsafe {
-                        ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
-                    }
+                    // The blurs drew elsewhere; draw into the current target again.
+                    self.bind_current_target()?;
                     result
                 }
-                RenderCommand::BeginFilter {
-                    target: FilterRenderTarget::Isolated(target_index),
-                    ..
-                } => {
-                    filter_stack.push((current_rtv.clone(), current_srv.clone()));
-                    current_rtv = group_rtvs[target_index.as_usize()].clone();
-                    current_srv = group_srvs[target_index.as_usize()].clone();
-                    self.active_render_target = current_rtv.clone();
-                    unsafe {
-                        if let Some(rtv) = current_rtv.as_ref() {
-                            ctx.ClearRenderTargetView(rtv, &[0.0; 4]);
-                        }
-                        ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
-                    }
+                RenderCommand::BeginGroup { target, .. } => {
+                    let has_target = self.begin_group(target, viewport_size)?;
+                    isolated.push(has_target);
                     Ok(())
                 }
-                RenderCommand::EndFilter {
-                    boundary_index,
-                    target: FilterRenderTarget::Isolated(_),
-                    ..
-                } => {
-                    let boundary = &scene.filter_boundaries[*boundary_index];
-                    let (parent_rtv, parent_srv) = filter_stack
-                        .pop()
-                        .expect("render plan emitted an unmatched isolated filter end");
-                    let result = self.dx_blur_and_composite(
-                        &current_srv,
-                        &parent_rtv,
-                        boundary.bounds,
-                        boundary.content_mask.bounds,
-                        boundary.corner_radii,
-                        boundary.corner_smoothing,
-                        boundary.max_blur_radius(),
-                        boundary.opacity,
-                        false,
-                    );
-                    current_rtv = parent_rtv;
-                    current_srv = parent_srv;
-                    self.active_render_target = current_rtv.clone();
-                    unsafe {
-                        ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
+                RenderCommand::EndGroup { boundary_index, .. } => {
+                    if isolated.pop() == Some(true) {
+                        self.end_group(&scene.group_boundaries[*boundary_index])
+                    } else {
+                        Ok(())
                     }
-                    result
                 }
-                RenderCommand::BeginFilter {
-                    target: FilterRenderTarget::Inline,
-                    ..
-                }
-                | RenderCommand::EndFilter {
-                    target: FilterRenderTarget::Inline,
-                    ..
-                } => Ok(()),
-                RenderCommand::Batch(PrimitiveBatch::FilterBoundary(_)) => {
-                    unreachable!("filter boundaries are resolved by the render plan")
+                RenderCommand::Batch(PrimitiveBatch::GroupBoundary(_)) => {
+                    unreachable!("group boundaries are resolved by the render plan")
                 }
             }
             .with_context(|| {
@@ -843,13 +810,57 @@ impl DirectXRenderer {
                 )
             })?;
         }
-
-        // Present the offscreen scene by blitting it into the swapchain.
-        if use_offscreen {
-            self.dx_blit(&scene_srv, &swapchain_rtv)?;
-        }
-        self.active_render_target = None;
         Ok(())
+    }
+
+    /// Starts drawing a group: into a target of its own, cleared to transparent, when the plan
+    /// isolates it and the pool has room for one; in place otherwise. Returns whether it has a
+    /// target of its own.
+    fn begin_group(
+        &mut self,
+        target: &GroupTarget,
+        viewport_size: Size<DevicePixels>,
+    ) -> Result<bool> {
+        let GroupTarget::Isolated { region } = target else {
+            return Ok(false);
+        };
+        let Some(bounds) = group_target_bounds(*region, viewport_size) else {
+            return Ok(false);
+        };
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        let Some(color) = resources.target_pool.take(&devices.device, bounds.size) else {
+            return Ok(false);
+        };
+        unsafe {
+            devices.device_context.ClearRenderTargetView(
+                color.rtv.as_ref().context("group target view missing")?,
+                &[0.0; 4],
+            );
+        }
+        self.targets.push(FrameTarget::new(color, bounds.origin));
+        self.bind_current_target()?;
+        Ok(true)
+    }
+
+    /// Finishes a group drawn into a target of its own: composites it into its parent, which
+    /// the batches that follow draw into, and gives its texture back to the pool.
+    fn end_group(&mut self, boundary: &GroupBoundary) -> Result<()> {
+        let group = self
+            .targets
+            .pop()
+            .context("an isolated group's target is on the stack")?;
+        let result = self
+            .composite_group(boundary, &group)
+            .and_then(|()| self.bind_current_target());
+        self.give_back(group.color);
+        result
+    }
+
+    fn give_back(&mut self, target: ColorTarget) {
+        if let Some(resources) = self.resources.as_mut() {
+            resources.target_pool.give_back(target);
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1035,7 +1046,7 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    /// Frame-wide bindings for the batch draws of the current frame.
+    /// Frame-wide bindings for the batch draws of the current frame, into the current target.
     fn frame_bindings(&self) -> Result<FrameBindings<'_>> {
         Ok(FrameBindings {
             device_context: &self
@@ -1044,9 +1055,9 @@ impl DirectXRenderer {
                 .context("devices missing")?
                 .device_context,
             viewport: &self
-                .resources
-                .as_ref()
-                .context("resources missing")?
+                .targets
+                .last()
+                .context("no render target is bound")?
                 .viewport,
             globals: &self.globals,
         })
@@ -1102,6 +1113,9 @@ impl DirectXRenderer {
             .path
             .as_ref()
             .context("path resources were not prepared")?;
+        // The intermediate covers the window, whatever target the sprites are drawn into, so
+        // paths are rasterized with the window's globals and viewport.
+        self.write_globals(resources.window_bounds())?;
         // Clear intermediate MSAA texture
         unsafe {
             devices.device_context.ClearRenderTargetView(
@@ -1120,7 +1134,11 @@ impl DirectXRenderer {
             &self.path_rasterization_vertices,
         )?;
         self.pipelines.path_rasterization_pipeline.draw_vertices(
-            &self.frame_bindings()?,
+            &FrameBindings {
+                device_context: &devices.device_context,
+                viewport: &resources.viewport,
+                globals: &self.globals,
+            },
             u32::try_from(rasterization_vertex_count)
                 .context("path rasterization vertex count exceeds the D3D11 draw limit")?,
         )?;
@@ -1134,19 +1152,9 @@ impl DirectXRenderer {
                 0,
                 RENDER_TARGET_FORMAT,
             );
-            // Restore the active render target (the offscreen scene/group target when blurring,
-            // otherwise the swapchain) so the path sprites land on the correct surface.
-            let restore_target = if self.active_render_target.is_some() {
-                &self.active_render_target
-            } else {
-                &resources.render_target_view
-            };
-            devices
-                .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(restore_target)), None);
         }
-
-        Ok(())
+        // Draw the path sprites into the current target again.
+        self.bind_current_target()
     }
 
     fn draw_paths_from_intermediate(
@@ -1252,6 +1260,7 @@ impl DirectXRenderer {
         if surfaces.is_empty() {
             return Ok(());
         }
+        let viewport = self.current_viewport()?;
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_mut().context("resources missing")?;
         let ctx = &devices.device_context;
@@ -1304,7 +1313,7 @@ impl DirectXRenderer {
 
             unsafe {
                 ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-                ctx.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+                ctx.RSSetViewports(Some(slice::from_ref(&viewport)));
                 ctx.VSSetShader(&self.pipelines.surfaces.vertex, None);
                 ctx.PSSetShader(&self.pipelines.surfaces.fragment, None);
                 ctx.VSSetConstantBuffers(0, Some(&cbuffers));
@@ -1373,115 +1382,58 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    /// Blur `source_srv` (full-resolution) using the half-res ping/pong textures and composite the
-    /// result into `target_rtv`, clipped to `bounds`/`corner_radii`/`content_mask` and modulated
-    /// by `opacity`. Shared by the backdrop and content-filter paths.
+    /// Blurs what the current target holds under `bounds`, the backdrop of a backdrop filter,
+    /// and composites the result back into it, clipped to `bounds`, `corner_radii` and
+    /// `content_mask`, and faded by `opacity`. The blur runs at half resolution in textures
+    /// taken from the pool for it.
     #[allow(clippy::too_many_arguments)]
     fn dx_blur_and_composite(
-        &self,
-        source_srv: &Option<ID3D11ShaderResourceView>,
-        target_rtv: &Option<ID3D11RenderTargetView>,
+        &mut self,
         bounds: Bounds<ScaledPixels>,
         content_mask: Bounds<ScaledPixels>,
         corner_radii: Corners<ScaledPixels>,
         corner_smoothing: f32,
         blur_radius: f32,
         opacity: f32,
-        // Backdrop clips to the rounded rect; content (`filter`) bleeds past its bounds.
-        clip_rounded: bool,
     ) -> Result<()> {
-        let full_width = self.width;
-        let full_height = self.height;
-        let blur_size = [
-            downsampled_dimension(full_width) as f32,
-            downsampled_dimension(full_height) as f32,
-        ];
-        let clip = if clip_rounded {
-            FilterCompositeClip::RoundedBounds
-        } else {
-            FilterCompositeClip::ContentShape
-        };
-        let half_vp = D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: blur_size[0],
-            Height: blur_size[1],
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        };
-        let (full_vp, ping_rtv, ping_srv, pong_rtv, pong_srv) = {
-            let r = self.resources.as_ref().context("resources missing")?;
-            let blur = r
-                .blur
-                .as_ref()
-                .context("blur resources were not prepared")?;
-            (
-                r.viewport,
-                blur.ping_rtv.clone(),
-                blur.ping_srv.clone(),
-                blur.pong_rtv.clone(),
-                blur.pong_srv.clone(),
-            )
-        };
         let Some(kernel) = BlurKernel::for_radius(blur_radius) else {
             return Ok(());
         };
-
-        // Downsample source -> ping, then separable gaussian ping -> pong -> ping.
-        self.dx_blur_pass(
-            &self.pipelines.blur_downsample_vertex,
-            &self.pipelines.blur_downsample_fragment,
-            &self.pipelines.blur_blend_replace,
-            &ping_rtv,
-            source_srv,
-            BlurUniforms::downsample([full_width as f32, full_height as f32], blur_size),
-            &half_vp,
-            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-            3,
-            true,
-        )?;
-        self.dx_blur_pass(
-            &self.pipelines.blur_vertex,
-            &self.pipelines.blur_fragment,
-            &self.pipelines.blur_blend_replace,
-            &pong_rtv,
-            &ping_srv,
-            BlurUniforms::gaussian(BlurAxis::Horizontal, blur_size, kernel),
-            &half_vp,
-            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-            3,
-            true,
-        )?;
-        self.dx_blur_pass(
-            &self.pipelines.blur_vertex,
-            &self.pipelines.blur_fragment,
-            &self.pipelines.blur_blend_replace,
-            &ping_rtv,
-            &pong_srv,
-            BlurUniforms::gaussian(BlurAxis::Vertical, blur_size, kernel),
-            &half_vp,
-            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-            3,
-            true,
-        )?;
-
-        // Content blur bleeds ~3·radius past the box; composite over a dilated rect.
-        let composite_bounds = if clip_rounded {
-            bounds
-        } else {
-            bounds.dilate(ScaledPixels(
-                GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS * blur_radius,
-            ))
+        let target = self.targets.last().context("no render target is bound")?;
+        let full_width = target.bounds.size.width.0.max(0) as u32;
+        let full_height = target.bounds.size.height.0.max(0) as u32;
+        let origin = target
+            .bounds
+            .origin
+            .map(|value| ScaledPixels(value.0 as f32));
+        // Nothing the blur could reach is in this target.
+        let scissor = ScissorRectangle::for_blurred_bounds(
+            Bounds {
+                origin: bounds.origin - origin,
+                size: bounds.size,
+            },
+            GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS * blur_radius,
+            full_width,
+            full_height,
+        );
+        if scissor.is_empty() {
+            return Ok(());
+        }
+        let source = target.color.clone();
+        let Some((ping, pong, blur_size)) = self.blur(&source, kernel)? else {
+            return Ok(());
         };
+
         let composite_uniforms = BlurUniforms::composite(
-            composite_bounds,
+            bounds,
             content_mask,
             corner_radii,
             corner_smoothing,
             opacity,
-            clip,
+            FilterCompositeClip::RoundedBounds,
             blur_size,
             [full_width as f32, full_height as f32],
+            [origin.x.0, origin.y.0],
         );
         let (composite_vertex, composite_fragment) = if composite_uniforms.corner_smoothing > 0.0 {
             (
@@ -1494,19 +1446,226 @@ impl DirectXRenderer {
                 &self.pipelines.blur_composite_fragment,
             )
         };
-        // Composite the blurred result into the target (preserving its contents).
+        // Composite the blurred result into the target (preserving its contents), with the
+        // target's globals, which are still bound.
         self.dx_blur_pass(
             composite_vertex,
             composite_fragment,
             &self.pipelines.blur_blend_composite,
-            target_rtv,
-            &ping_srv,
+            &source.rtv,
+            &ping.srv,
             composite_uniforms,
-            &full_vp,
+            &self.current_viewport()?,
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
             4,
             false,
         )?;
+        self.give_back(ping);
+        self.give_back(pong);
+        Ok(())
+    }
+
+    /// Blurs the whole of `source` into two half-resolution textures taken from the pool: the
+    /// first holds the result, the second is spare. Returns them with their size, or `None` if
+    /// the pool has no room.
+    fn blur(
+        &mut self,
+        source: &ColorTarget,
+        kernel: BlurKernel,
+    ) -> Result<Option<(ColorTarget, ColorTarget, [f32; 2])>> {
+        let full_width = source.size.width.0.max(0) as u32;
+        let full_height = source.size.height.0.max(0) as u32;
+        let blur_size = [
+            downsampled_dimension(full_width) as f32,
+            downsampled_dimension(full_height) as f32,
+        ];
+        let half_size = size(
+            DevicePixels(blur_size[0] as i32),
+            DevicePixels(blur_size[1] as i32),
+        );
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        let pool = &mut resources.target_pool;
+        let Some(ping) = pool.take(&devices.device, half_size) else {
+            return Ok(None);
+        };
+        let Some(pong) = pool.take(&devices.device, half_size) else {
+            pool.give_back(ping);
+            return Ok(None);
+        };
+        let half_viewport = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: blur_size[0],
+            Height: blur_size[1],
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+
+        // Downsample source -> ping, then separable gaussian ping -> pong -> ping.
+        self.dx_blur_pass(
+            &self.pipelines.blur_downsample_vertex,
+            &self.pipelines.blur_downsample_fragment,
+            &self.pipelines.blur_blend_replace,
+            &ping.rtv,
+            &source.srv,
+            BlurUniforms::downsample([full_width as f32, full_height as f32], blur_size),
+            &half_viewport,
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+            3,
+            true,
+        )?;
+        self.dx_blur_pass(
+            &self.pipelines.blur_vertex,
+            &self.pipelines.blur_fragment,
+            &self.pipelines.blur_blend_replace,
+            &pong.rtv,
+            &ping.srv,
+            BlurUniforms::gaussian(BlurAxis::Horizontal, blur_size, kernel),
+            &half_viewport,
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+            3,
+            true,
+        )?;
+        self.dx_blur_pass(
+            &self.pipelines.blur_vertex,
+            &self.pipelines.blur_fragment,
+            &self.pipelines.blur_blend_replace,
+            &ping.rtv,
+            &pong.srv,
+            BlurUniforms::gaussian(BlurAxis::Vertical, blur_size, kernel),
+            &half_viewport,
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+            3,
+            true,
+        )?;
+        Ok(Some((ping, pong, blur_size)))
+    }
+
+    /// Composites `group`, an isolated group's finished target, into the current target, its
+    /// parent: blurred by its filters, faded by its opacity, and mixed by its blend mode with a
+    /// copy of what is beneath it in the parent. Gives back the textures it takes; the caller
+    /// gives back the group's.
+    fn composite_group(&mut self, boundary: &GroupBoundary, group: &FrameTarget) -> Result<()> {
+        let blurred = match BlurKernel::for_radius(boundary.max_blur_radius()) {
+            Some(kernel) => self.blur(&group.color, kernel)?,
+            None => None,
+        };
+        // The blur covers the same viewport rectangle as the group, at half resolution.
+        let source = blurred
+            .as_ref()
+            .map_or(&group.color.srv, |(blurred, _, _)| &blurred.srv)
+            .clone();
+        let backdrop = if boundary.blend_mode != BlendMode::Normal {
+            self.copy_backdrop(group.bounds)?
+        } else {
+            None
+        };
+        let uniforms = GroupUniforms::composite(
+            group.bounds,
+            boundary.content_mask.bounds,
+            boundary.opacity,
+            boundary.blend_mode,
+            backdrop.as_ref().map(|_| group.bounds),
+        );
+        // Normal blending never reads the backdrop; bind the source in its place.
+        let backdrop_srv = backdrop.as_ref().map_or(&source, |backdrop| &backdrop.srv);
+        self.draw_group_composite(uniforms, &source, backdrop_srv)?;
+
+        if let Some((blurred, spare, _)) = blurred {
+            self.give_back(blurred);
+            self.give_back(spare);
+        }
+        if let Some(backdrop) = backdrop {
+            self.give_back(backdrop);
+        }
+        Ok(())
+    }
+
+    /// Copies what the current target holds under `bounds` into a texture taken from the pool,
+    /// which covers `bounds`: what a blend mode mixes a group with. `None` if none of `bounds`
+    /// is in the target or the pool has no room.
+    fn copy_backdrop(&mut self, bounds: Bounds<DevicePixels>) -> Result<Option<ColorTarget>> {
+        let parent = self.targets.last().context("no render target is bound")?;
+        let copied = bounds.intersect(&parent.bounds);
+        if copied.is_empty() {
+            return Ok(None);
+        }
+        let source_origin = copied.origin - parent.bounds.origin;
+        let destination_origin = copied.origin - bounds.origin;
+        let parent_texture = parent.color.texture.clone();
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        let Some(backdrop) = resources.target_pool.take(&devices.device, bounds.size) else {
+            return Ok(None);
+        };
+        let region = D3D11_BOX {
+            left: source_origin.x.0 as u32,
+            top: source_origin.y.0 as u32,
+            front: 0,
+            right: (source_origin.x.0 + copied.size.width.0) as u32,
+            bottom: (source_origin.y.0 + copied.size.height.0) as u32,
+            back: 1,
+        };
+        unsafe {
+            devices.device_context.CopySubresourceRegion(
+                &backdrop.texture,
+                0,
+                destination_origin.x.0 as u32,
+                destination_origin.y.0 as u32,
+                0,
+                &parent_texture,
+                0,
+                Some(&region),
+            );
+        }
+        Ok(Some(backdrop))
+    }
+
+    /// Draws the group composite into the current target, sampling the group from `source` and
+    /// what is beneath it from `backdrop`.
+    fn draw_group_composite(
+        &self,
+        uniforms: GroupUniforms,
+        source: &Option<ID3D11ShaderResourceView>,
+        backdrop: &Option<ID3D11ShaderResourceView>,
+    ) -> Result<()> {
+        let target = self.targets.last().context("no render target is bound")?;
+        let ctx = &self
+            .devices
+            .as_ref()
+            .context("devices missing")?
+            .device_context;
+        let pipeline = &self.pipelines.group_composite;
+        update_buffer(ctx, &pipeline.params_buffer, &[uniforms])?;
+        let cbuffers = self.globals.cbuffers();
+        let params = [Some(pipeline.params_buffer.clone())];
+        let scene_tables = self.globals.scene_tables();
+        let textures = [source.clone(), backdrop.clone()];
+        let unbound: [Option<ID3D11ShaderResourceView>; 2] = [None, None];
+        unsafe {
+            ctx.OMSetRenderTargets(Some(slice::from_ref(&target.color.rtv)), None);
+            ctx.RSSetViewports(Some(slice::from_ref(&target.viewport)));
+            ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            ctx.VSSetShader(&pipeline.vertex, None);
+            ctx.PSSetShader(&pipeline.fragment, None);
+            ctx.VSSetConstantBuffers(0, Some(&cbuffers));
+            ctx.PSSetConstantBuffers(0, Some(&cbuffers));
+            ctx.VSSetConstantBuffers(DATA_REGISTER, Some(&params));
+            ctx.PSSetConstantBuffers(DATA_REGISTER, Some(&params));
+            // A composite clipped to a rounded rectangle finds it through the transform table.
+            ctx.VSSetShaderResources(SCENE_TABLES_REGISTER, Some(&scene_tables));
+            ctx.PSSetShaderResources(SCENE_TABLES_REGISTER, Some(&scene_tables));
+            ctx.PSSetShaderResources(GROUP_TEXTURE_REGISTER, Some(&textures));
+            ctx.PSSetSamplers(
+                GROUP_SAMPLER_REGISTER,
+                Some(slice::from_ref(&self.globals.sampler)),
+            );
+            ctx.OMSetBlendState(&pipeline.blend, None, 0xFFFFFFFF);
+            ctx.DrawInstanced(4, 1, 0, 0);
+            // Unbind the pooled textures, which later groups may draw into.
+            ctx.PSSetShaderResources(GROUP_TEXTURE_REGISTER, Some(&unbound));
+        }
         Ok(())
     }
 
@@ -1612,7 +1771,8 @@ impl DirectXResources {
             render_target: Some(render_target),
             render_target_view,
             path: None,
-            blur: None,
+            scene_color: None,
+            target_pool: TexturePool::new(RENDER_TARGET_FORMAT),
             surface_views: FxHashMap::default(),
             viewport,
         })
@@ -1630,36 +1790,41 @@ impl DirectXResources {
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
         // Intermediate textures are size-dependent and recreated lazily if a later scene needs
-        // them. Ordinary scenes therefore pay neither the allocation nor resize cost.
+        // them. Ordinary scenes therefore pay neither the allocation nor resize cost. Group
+        // targets are sized to their groups, not the window, so the pool keeps them.
         self.path = None;
-        self.blur = None;
+        self.scene_color = None;
         self.viewport = viewport;
         Ok(())
     }
 
-    fn ensure_blur_resources(
-        &mut self,
-        device: &ID3D11Device,
-        isolated_target_count: usize,
-    ) -> Result<()> {
-        if self.blur.is_none() {
-            self.blur = Some(BlurResources::new(
+    /// The window's size, in device pixels.
+    fn viewport_size(&self) -> Size<DevicePixels> {
+        size(
+            DevicePixels(self.viewport.Width as i32),
+            DevicePixels(self.viewport.Height as i32),
+        )
+    }
+
+    /// The viewport rectangle the window's target covers: all of it.
+    fn window_bounds(&self) -> Bounds<DevicePixels> {
+        Bounds {
+            origin: point(DevicePixels(0), DevicePixels(0)),
+            size: self.viewport_size(),
+        }
+    }
+
+    fn ensure_scene_color(&mut self, device: &ID3D11Device) -> Result<&ColorTarget> {
+        if self.scene_color.is_none() {
+            self.scene_color = Some(ColorTarget::new(
                 device,
-                self.viewport.Width as u32,
-                self.viewport.Height as u32,
-                isolated_target_count,
+                RENDER_TARGET_FORMAT,
+                self.viewport_size(),
             )?);
         }
-        let blur = self
-            .blur
-            .as_mut()
-            .expect("blur resources were inserted above");
-        blur.ensure_isolated_targets(
-            device,
-            self.viewport.Width as u32,
-            self.viewport.Height as u32,
-            isolated_target_count,
-        )
+        self.scene_color
+            .as_ref()
+            .context("scene color target was inserted above")
     }
 
     fn ensure_path_resources(&mut self, device: &ID3D11Device) -> Result<()> {
@@ -1718,7 +1883,7 @@ impl DirectXRenderPipelines {
             "path_sprite_pipeline",
             ShaderModule::PathSprite,
             4,
-            create_blend_state_for_path_sprite(device)?,
+            create_premultiplied_blend_state(device)?,
         )?;
         let underline_pipeline = PipelineState::new(
             device,
@@ -1769,7 +1934,16 @@ impl DirectXRenderPipelines {
         let blur_blend_replace = create_blend_state_no_blend(device)?;
         // Premultiplied (One / InvSrcAlpha) — the composite outputs a premultiplied blurred sample;
         // straight-alpha blending would darken the faded edges.
-        let blur_blend_composite = create_blend_state_for_path_sprite(device)?;
+        let blur_blend_composite = create_premultiplied_blend_state(device)?;
+
+        let group_composite = ShaderModule::GroupComposite.bytecode()?;
+        let group_composite = GroupCompositePipeline {
+            vertex: create_vertex_shader(device, group_composite.vertex)?,
+            fragment: create_fragment_shader(device, group_composite.fragment)?,
+            params_buffer: create_constant_buffer(device, std::mem::size_of::<GroupUniforms>())?,
+            // The composite outputs the group premultiplied, as its target holds it.
+            blend: create_premultiplied_blend_state(device)?,
+        };
 
         let surface = ShaderModule::Surface.bytecode()?;
         let surfaces = SurfacePipeline {
@@ -1800,6 +1974,7 @@ impl DirectXRenderPipelines {
             blur_params_buffer,
             blur_blend_replace,
             blur_blend_composite,
+            group_composite,
         })
     }
 }
@@ -2265,45 +2440,6 @@ fn create_path_intermediate_texture(
     Ok((texture, Some(shader_resource_view.unwrap())))
 }
 
-/// Create a color texture usable as both a render target and a shader resource, returning both
-/// views. Used for the blur offscreen targets.
-#[inline]
-fn create_color_target(
-    device: &ID3D11Device,
-    width: u32,
-    height: u32,
-) -> Result<(
-    ID3D11Texture2D,
-    Option<ID3D11RenderTargetView>,
-    Option<ID3D11ShaderResourceView>,
-)> {
-    let texture = unsafe {
-        let mut output = None;
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: width.max(1),
-            Height: height.max(1),
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: RENDER_TARGET_FORMAT,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        device.CreateTexture2D(&desc, None, Some(&mut output))?;
-        output.unwrap()
-    };
-    let mut rtv = None;
-    unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut rtv))? };
-    let mut srv = None;
-    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut srv))? };
-    Ok((texture, rtv, srv))
-}
-
 #[inline]
 fn create_path_intermediate_msaa_texture_and_view(
     device: &ID3D11Device,
@@ -2382,7 +2518,8 @@ fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
     desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+    // Source-over alpha, so that a group's target holds the coverage of what it draws.
+    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
     unsafe {
         let mut state = None;
@@ -2423,27 +2560,8 @@ pub(crate) fn create_premultiplied_blend_state(device: &ID3D11Device) -> Result<
     desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
     desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    // Source-over alpha, so that a group's target holds the coverage of what it draws.
     desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
-    unsafe {
-        let mut state = None;
-        device.CreateBlendState(&desc, Some(&mut state))?;
-        Ok(state.unwrap())
-    }
-}
-
-#[inline]
-fn create_blend_state_for_path_sprite(device: &ID3D11Device) -> Result<ID3D11BlendState> {
-    // If the feature level is set to greater than D3D_FEATURE_LEVEL_9_3, the display
-    // device performs the blend in linear space, which is ideal.
-    let mut desc = D3D11_BLEND_DESC::default();
-    desc.RenderTarget[0].BlendEnable = true.into();
-    desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-    desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
-    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-    desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
     unsafe {
         let mut state = None;
@@ -2623,6 +2741,7 @@ pub(crate) mod shader_resources {
         Blur,
         BlurComposite,
         SmoothedBlurComposite,
+        GroupComposite,
     }
 
     impl ShaderModule {
@@ -2644,6 +2763,7 @@ pub(crate) mod shader_resources {
                 Self::Blur => "blur",
                 Self::BlurComposite => "blur_composite",
                 Self::SmoothedBlurComposite => "smoothed_blur_composite",
+                Self::GroupComposite => "group_composite",
             };
             NATIVE_SHADERS
                 .iter()
