@@ -16,6 +16,10 @@
 //! (`Entity::cached`), so an item that has not changed size is reused from
 //! the previous frame rather than built again.
 //!
+//! With `--transform`, each item is a cached view laid out once, at page
+//! scale, and the camera is one transform on the page: zooming and panning
+//! change only that transform, so every item is reused, placed under it.
+//!
 //! With `--pan=<zoom>`, the camera holds that zoom and pans across the grid
 //! instead of zooming, so items move without changing: what a cached item is
 //! reused for.
@@ -26,6 +30,7 @@
 //! cargo run -p gpui-ce --release --example canvas_scale -- 100000 --paint  # quads only
 //! cargo run -p gpui-ce --release --example canvas_scale -- --cached        # cached items
 //! cargo run -p gpui-ce --release --example canvas_scale -- --cached --pan=0.4
+//! cargo run -p gpui-ce --release --example canvas_scale -- --transform    # a camera transform
 //! ```
 //!
 //! The run lasts one zoom out and back (or one pan), then prints frame times
@@ -44,7 +49,7 @@ use std::{
 use gpui::{
     App, BorderStyle, Bounds, Context, Entity, MacActivationPolicy, MouseButton, Position, Render,
     SharedString, StyleRefinement, Window, WindowBounds, WindowKind, WindowOptions, canvas, div,
-    hsla, point, prelude::*, px, quad, size,
+    hsla, kurbo, point, prelude::*, px, quad, size,
 };
 use gpui_platform::application;
 
@@ -71,6 +76,9 @@ enum Draw {
     Elements,
     /// An entity per item, drawn as a cached view.
     Cached,
+    /// An entity per item, drawn as a cached view at page scale, under a
+    /// camera transform.
+    Transformed,
     /// Quads painted by one element.
     Quads,
 }
@@ -92,18 +100,28 @@ static ITEM_RENDERS: AtomicUsize = AtomicUsize::new(0);
 struct Item {
     index: usize,
     zoom: Rc<Cell<f32>>,
+    /// Whether it is drawn at page scale, under the camera's transform.
+    page_scale: bool,
 }
 
 impl Render for Item {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         ITEM_RENDERS.fetch_add(1, Ordering::Relaxed);
         let zoom = self.zoom.get();
-        item(div(), self.index, zoom).size_full()
+        let labelled = labelled(zoom);
+        let scale = if self.page_scale { 1.0 } else { zoom };
+        item(div(), self.index, scale, labelled).size_full()
     }
 }
 
-/// An item's look and behaviour, shared by the built and the cached items.
-fn item(element: gpui::Div, index: usize, zoom: f32) -> gpui::Stateful<gpui::Div> {
+/// Whether an item shows its label at `zoom`.
+fn labelled(zoom: f32) -> bool {
+    ITEM_W * zoom >= LABEL_WIDTH
+}
+
+/// An item's look and behaviour, shared by the built and the cached items,
+/// with its lengths scaled by `zoom`.
+fn item(element: gpui::Div, index: usize, zoom: f32, labelled: bool) -> gpui::Stateful<gpui::Div> {
     let hue = (index * 37 % 360) as f32 / 360.0;
     element
         .id(("item", index))
@@ -113,7 +131,7 @@ fn item(element: gpui::Div, index: usize, zoom: f32) -> gpui::Stateful<gpui::Div
         .rounded(px((6.0 * zoom).max(1.0)))
         .hover(move |style| style.bg(hsla(hue, 0.7, 0.8, 1.0)))
         .on_mouse_down(MouseButton::Left, |_, _, _| {})
-        .when(ITEM_W * zoom >= LABEL_WIDTH, |item| {
+        .when(labelled, |item| {
             item.p(px(4.0 * zoom))
                 .text_size(px(12.0 * zoom))
                 .text_color(hsla(0.0, 0.0, 0.1, 1.0))
@@ -137,6 +155,9 @@ struct Stage {
     /// The item entities made so far, for `Draw::Cached`.
     entities: Vec<Option<Entity<Item>>>,
     zoom: Rc<Cell<f32>>,
+    /// Whether items showed their labels last frame, for `Draw::Transformed`,
+    /// whose items are told when that changes.
+    labelled: bool,
     started: Instant,
     last_frame: Option<Instant>,
     samples: Rc<RefCell<Vec<Sample>>>,
@@ -151,6 +172,7 @@ impl Stage {
             motion,
             entities: Vec::new(),
             zoom: Rc::new(Cell::new(1.0)),
+            labelled: true,
             started: Instant::now(),
             last_frame: None,
             samples: Rc::new(RefCell::new(Vec::new())),
@@ -188,6 +210,7 @@ impl Stage {
             match self.draw {
                 Draw::Elements => "one element each",
                 Draw::Cached => "one cached view each",
+                Draw::Transformed => "one cached view each, under a camera transform",
                 Draw::Quads => "painted as quads",
             },
             match self.motion {
@@ -197,7 +220,7 @@ impl Stage {
             samples.len(),
             self.started.elapsed().as_secs_f32()
         );
-        if self.draw == Draw::Cached {
+        if matches!(self.draw, Draw::Cached | Draw::Transformed) {
             println!(
                 "canvas_scale: cached items rendered {:.1} times per frame",
                 ITEM_RENDERS.load(Ordering::Relaxed) as f64 / samples.len().max(1) as f64
@@ -279,6 +302,19 @@ impl Render for Stage {
         let item_w = ITEM_W * zoom;
         let item_h = ITEM_H * zoom;
 
+        if self.draw == Draw::Transformed {
+            return self
+                .render_transformed(
+                    zoom,
+                    point(left, top),
+                    (first_column..last_column, first_row..last_row),
+                    frame_start,
+                    interval,
+                    cx,
+                )
+                .into_any_element();
+        }
+
         if self.draw == Draw::Quads {
             let items = self.items;
             let samples = self.samples.clone();
@@ -334,13 +370,7 @@ impl Render for Stage {
                 let x = (column as f32 * pitch_x - left) * zoom;
                 let y = (row as f32 * pitch_y - top) * zoom;
                 if self.draw == Draw::Cached {
-                    if self.entities.len() < self.items {
-                        self.entities.resize_with(self.items, || None);
-                    }
-                    let zoom = self.zoom.clone();
-                    let entity = self.entities[index]
-                        .get_or_insert_with(|| cx.new(|_| Item { index, zoom }))
-                        .clone();
+                    let entity = self.entity(index, false, cx);
                     let mut style = StyleRefinement::default();
                     style.position = Some(Position::Absolute);
                     style.inset.left = Some(px(x).into());
@@ -350,7 +380,7 @@ impl Render for Stage {
                     children.push(entity.cached(style).into_any_element());
                 } else {
                     children.push(
-                        item(div(), index, zoom)
+                        item(div(), index, zoom, labelled(zoom))
                             .absolute()
                             .left(px(x))
                             .top(px(y))
@@ -398,6 +428,109 @@ impl Render for Stage {
     }
 }
 
+impl Stage {
+    /// Item `index`'s entity, made the first time it is in view.
+    fn entity(&mut self, index: usize, page_scale: bool, cx: &mut Context<Self>) -> Entity<Item> {
+        if self.entities.len() < self.items {
+            self.entities.resize_with(self.items, || None);
+        }
+        let zoom = self.zoom.clone();
+        self.entities[index]
+            .get_or_insert_with(|| {
+                cx.new(|_| Item {
+                    index,
+                    zoom,
+                    page_scale,
+                })
+            })
+            .clone()
+    }
+
+    /// The items in `cells` at page scale, at their page positions, under one
+    /// transform that zooms by `zoom` about the page point `camera` at the
+    /// window's top-left.
+    fn render_transformed(
+        &mut self,
+        zoom: f32,
+        camera: gpui::Point<f32>,
+        cells: (std::ops::Range<usize>, std::ops::Range<usize>),
+        frame_start: Instant,
+        interval: Option<Duration>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        // Items render their labels or not as the zoom crosses the width
+        // that shows them: tell the ones made so far when it does.
+        if labelled(zoom) != self.labelled {
+            self.labelled = labelled(zoom);
+            for entity in self.entities.iter().flatten() {
+                entity.update(cx, |_, cx| cx.notify());
+            }
+        }
+
+        let (pitch_x, pitch_y) = (ITEM_W + GAP, ITEM_H + GAP);
+        let mut children = Vec::new();
+        for row in cells.1 {
+            for column in cells.0.clone() {
+                let index = row * COLUMNS + column;
+                if index >= self.items {
+                    break;
+                }
+                let entity = self.entity(index, true, cx);
+                let mut style = StyleRefinement::default();
+                style.position = Some(Position::Absolute);
+                style.inset.left = Some(px(column as f32 * pitch_x).into());
+                style.inset.top = Some(px(row as f32 * pitch_y).into());
+                style.size.width = Some(px(ITEM_W).into());
+                style.size.height = Some(px(ITEM_H).into());
+                children.push(entity.cached(style).into_any_element());
+            }
+        }
+        let visible = children.len();
+
+        // The page is a zero-sized element at the window's origin, so its
+        // transform, applied about its center, maps page points directly.
+        let camera = kurbo::Affine::scale(zoom as f64)
+            * kurbo::Affine::translate((-camera.x as f64, -camera.y as f64));
+        let samples = self.samples.clone();
+        let recorder = canvas(
+            |_, _, _| {},
+            move |_, _, _, _| {
+                samples.borrow_mut().push(Sample {
+                    visible,
+                    cpu: frame_start.elapsed(),
+                    interval,
+                });
+            },
+        )
+        .absolute()
+        .size_0();
+
+        div()
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            .bg(hsla(0.12, 0.1, 0.96, 1.0))
+            .child(
+                div()
+                    .absolute()
+                    .size_0()
+                    .transform(camera)
+                    .children(children),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_2()
+                    .left_2()
+                    .px_2()
+                    .bg(hsla(0.0, 0.0, 1.0, 0.85))
+                    .text_size(px(13.))
+                    .child(format!("{visible} items · zoom {zoom:.3}")),
+            )
+            .child(recorder)
+    }
+}
+
 fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
@@ -420,6 +553,8 @@ fn run_example() {
         Draw::Quads
     } else if args.iter().any(|arg| arg == "--cached") {
         Draw::Cached
+    } else if args.iter().any(|arg| arg == "--transform") {
+        Draw::Transformed
     } else {
         Draw::Elements
     };
