@@ -38,6 +38,103 @@ pub struct LineLayout {
     pub platform_layout: Arc<dyn PlatformTextLayout>,
 }
 
+impl Default for LineLayout {
+    /// The layout of no text.
+    fn default() -> Self {
+        Self {
+            font_size: Pixels::ZERO,
+            width: Pixels::ZERO,
+            ascent: Pixels::ZERO,
+            descent: Pixels::ZERO,
+            visual_lines: SmallVec::new(),
+            paint_fragments: Vec::new(),
+            len: 0,
+            platform_layout: Arc::new(EmptyTextLayout),
+        }
+    }
+}
+
+/// The native layout of no text: one empty row, with its caret at the start.
+#[derive(Debug)]
+struct EmptyTextLayout;
+
+impl PlatformTextLayout for EmptyTextLayout {
+    fn len(&self) -> usize {
+        0
+    }
+
+    fn line_count(&self) -> usize {
+        1
+    }
+
+    fn size(&self) -> Size<Pixels> {
+        Size::default()
+    }
+
+    fn byte_index_from_pixel_point(&self, _: Point<Pixels>, _: Pixels) -> Result<usize, usize> {
+        Err(0)
+    }
+
+    fn caret_from_pixel_point(
+        &self,
+        _: Point<Pixels>,
+        _: Pixels,
+    ) -> Result<CaretPosition, CaretPosition> {
+        Err(CaretPosition::attached_to_next_cluster(0))
+    }
+
+    fn caret_bounds(&self, caret: CaretPosition, line_height: Pixels) -> Option<Bounds<Pixels>> {
+        (caret.index == 0).then(|| Bounds {
+            origin: Point::default(),
+            size: Size {
+                width: Pixels::ZERO,
+                height: line_height,
+            },
+        })
+    }
+
+    fn normalized_caret(&self, _: CaretPosition) -> CaretPosition {
+        CaretPosition::attached_to_next_cluster(0)
+    }
+
+    fn adjacent_visual_caret(&self, _: CaretPosition, _: VisualDirection) -> Option<CaretPosition> {
+        None
+    }
+
+    fn selection_bounds(&self, _: Range<usize>, _: Pixels) -> Vec<Bounds<Pixels>> {
+        Vec::new()
+    }
+
+    fn logical_cluster_before(&self, _: CaretPosition) -> Option<Range<usize>> {
+        None
+    }
+
+    fn logical_cluster_after(&self, _: CaretPosition) -> Option<Range<usize>> {
+        None
+    }
+
+    fn caret_movement(
+        &self,
+        _: CaretPosition,
+        _: TextMovement,
+        vertical_navigation_x: Option<Pixels>,
+    ) -> CaretMovement {
+        CaretMovement {
+            result: CaretPosition::attached_to_next_cluster(0),
+            vertical_navigation_x,
+        }
+    }
+
+    fn selection_from_pixel_point(
+        &self,
+        _: Point<Pixels>,
+        _: Pixels,
+        _: TextSelectionKind,
+    ) -> Range<usize> {
+        0..0
+    }
+}
+
 /// Font metrics used to construct the vertical extents of an inline line.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct InlineTextMetrics {

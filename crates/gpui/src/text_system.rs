@@ -188,6 +188,28 @@ impl TextSystem {
         Ok(result * font_size)
     }
 
+    /// The width of `text` laid out on one line in `font` at `font_size`, with characters `font`
+    /// lacks drawn from fallback fonts. Not cached; for measuring outside a frame.
+    pub fn line_width(&self, text: &str, font: &Font, font_size: Pixels) -> Pixels {
+        let runs = [TextRun {
+            len: text.len(),
+            font: font.clone(),
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+            letter_spacing: None,
+        }];
+        self.platform_text_system
+            .layout_text(TextLayoutRequest {
+                text,
+                font_size,
+                runs: &runs,
+                options: TextLayoutOptions::default(),
+            })
+            .width
+    }
+
     /// Get the number of font size units per 'em square',
     /// Per MDN: "an abstract square whose height is the intended distance between
     /// lines of type in the same type size"
@@ -204,6 +226,22 @@ impl TextSystem {
     /// in single spaced text.
     pub fn descent(&self, font_id: FontId, font_size: Pixels) -> Pixels {
         self.read_metrics(font_id, |metrics| metrics.descent(font_size))
+    }
+
+    /// The font that resolved to `id`, if any did.
+    pub fn get_font_for_id(&self, id: FontId) -> Option<Font> {
+        self.font_ids_by_font
+            .read()
+            .iter()
+            .find_map(|(font, result)| match result {
+                Ok(font_id) if *font_id == id => Some(font.clone()),
+                _ => None,
+            })
+    }
+
+    /// Get the height of a capital letter in the given font and size.
+    pub fn cap_height(&self, font_id: FontId, font_size: Pixels) -> Pixels {
+        self.read_metrics(font_id, |metrics| metrics.cap_height(font_size))
     }
 
     /// Get the x-height for the given font and font size.
@@ -1133,6 +1171,45 @@ mod layout_cache_tests {
 
     fn window_text_system() -> WindowTextSystem {
         WindowTextSystem::new(Arc::new(TextSystem::new(Arc::new(TestTextSystem))))
+    }
+
+    #[test]
+    fn a_shaped_line_maps_between_byte_indices_and_x() {
+        let system = window_text_system();
+        let text = SharedString::from("abc");
+        let run = TextRun {
+            len: text.len(),
+            ..Default::default()
+        };
+        let line = system.shape_line(text, px(16.0), &[run]);
+        let em = line.x_for_index(1);
+        assert!(em > Pixels::ZERO);
+
+        assert_eq!(line.x_for_index(0), Pixels::ZERO);
+        assert_eq!(line.x_for_index(2), em * 2.);
+        assert_eq!(line.x_for_index(3), line.width());
+        assert_eq!(line.x_for_index(9), line.width());
+
+        assert_eq!(line.index_for_x(em * 1.5), Some(1));
+        assert_eq!(line.index_for_x(line.width()), None);
+        assert_eq!(line.index_for_x(-em), None);
+
+        assert_eq!(line.closest_index_for_x(em * 1.4), 1);
+        assert_eq!(line.closest_index_for_x(em * 1.6), 2);
+        assert_eq!(line.closest_index_for_x(em * 9.), 3);
+
+        assert_eq!(line.clone().with_len(1).len(), 1);
+    }
+
+    #[test]
+    fn an_empty_shaped_line_has_one_caret_stop() {
+        let line = ShapedLine::default();
+        assert_eq!(line.len(), 0);
+        assert_eq!(line.width(), Pixels::ZERO);
+        assert_eq!(line.x_for_index(0), Pixels::ZERO);
+        assert_eq!(line.index_for_x(px(4.)), None);
+        assert_eq!(line.closest_index_for_x(px(4.)), 0);
+        assert_eq!(line.with_len(2).len(), 2);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::{
-    App, Bounds, InlineLayout, LineLayout, PaintFragment, Pixels, Point, Result, ShapedTextLayout,
-    SharedString, TextAlign, TextSystem, VisualLine, Window, fill, point, size,
+    App, Bounds, CaretPosition, InlineLayout, LineLayout, PaintFragment, Pixels, Point, Result,
+    ShapedTextLayout, SharedString, TextAlign, TextSystem, VisualLine, Window, fill, point, size,
 };
 use derive_more::{Deref, DerefMut};
 use std::sync::{
@@ -12,7 +12,7 @@ static GLYPH_PAINT_ERRORS: AtomicUsize = AtomicUsize::new(0);
 const MAX_LOGGED_GLYPH_PAINT_ERRORS: usize = 20;
 
 /// A line of text that has been shaped and decorated.
-#[derive(Clone, Debug, Deref, DerefMut)]
+#[derive(Clone, Debug, Default, Deref, DerefMut)]
 pub struct ShapedLine {
     #[deref]
     #[deref_mut]
@@ -34,6 +34,58 @@ impl ShapedLine {
     /// incrementally advancing a "pen" when painting multiple fragments on the same row.
     pub fn width(&self) -> Pixels {
         self.layout.width
+    }
+
+    /// The height of the line's one visual row: its ascent and descent.
+    fn row_height(&self) -> Pixels {
+        self.layout.ascent + self.layout.descent
+    }
+
+    /// The x position of the caret before the cluster at byte `index`, or the line's width past
+    /// its end.
+    pub fn x_for_index(&self, index: usize) -> Pixels {
+        if index >= self.len() {
+            return self.width();
+        }
+        self.layout
+            .platform_layout
+            .caret_bounds(
+                CaretPosition::attached_to_next_cluster(index),
+                self.row_height(),
+            )
+            .map_or(self.width(), |bounds| bounds.origin.x)
+    }
+
+    /// The byte index of the cluster under `x`, or `None` past either end of the line.
+    pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
+        if x < Pixels::ZERO || x >= self.width() {
+            return None;
+        }
+        let row_height = self.row_height();
+        let index = self
+            .layout
+            .platform_layout
+            .byte_index_from_pixel_point(point(x, row_height / 2.), row_height);
+        Some(index.unwrap_or_else(|index| index))
+    }
+
+    /// The cluster boundary closest to `x`, for moving a caret between lines.
+    pub fn closest_index_for_x(&self, x: Pixels) -> usize {
+        let row_height = self.row_height();
+        let caret = self
+            .layout
+            .platform_layout
+            .caret_from_pixel_point(point(x, row_height / 2.), row_height);
+        caret.unwrap_or_else(|caret| caret).index.min(self.len())
+    }
+
+    /// This line, reporting `len` as its length, for drawing one text in place of another (as
+    /// for whitespace indicators).
+    pub fn with_len(mut self, len: usize) -> Self {
+        let mut layout = LineLayout::clone(&self.layout);
+        layout.len = len;
+        self.layout = Arc::new(layout);
+        self
     }
 
     /// Paint the line of text to the window.
