@@ -1952,6 +1952,22 @@ pub trait PlatformAtlas {
     ) -> Result<GlyphAtlasEntry>;
     fn remove(&self, key: &AtlasKey);
 
+    /// The bytes of texture memory the atlas holds.
+    fn texture_bytes(&self) -> usize {
+        0
+    }
+
+    /// Forgets the glyph and SVG tiles `keep` rejects, so they are rasterized
+    /// again when next asked for, and returns them. Their space stays
+    /// allocated, since a frame still on the GPU may sample it, until they
+    /// are passed to [`Self::free`].
+    fn evict(&self, _keep: &mut dyn FnMut(&AtlasTile) -> bool) -> Vec<AtlasTile> {
+        Vec::new()
+    }
+
+    /// Releases the space of tiles [`Self::evict`] returned, for new tiles.
+    fn free(&self, _tiles: &[AtlasTile]) {}
+
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
@@ -2060,7 +2076,7 @@ impl AtlasTextureKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct TileId(pub u32);

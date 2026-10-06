@@ -50,7 +50,7 @@ use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
     cmp,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
     marker::PhantomData,
@@ -161,6 +161,63 @@ fn rasterize_svg(
         .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
         .map_size(|size| size.ceil());
     Ok(Some((bounds, tile)))
+}
+
+/// Keeps a window's atlas from growing without bound as rasters fall out of
+/// use, as glyphs and SVGs do at each new size a zoom shows them at.
+///
+/// Once the atlas's textures pass a budget, the glyph and SVG tiles the
+/// frame just drawn does not use are evicted: a later frame that wants one
+/// rasterizes it again, and a cached view replays only what that frame drew.
+/// Their space is freed some frames later, once no frame still on the GPU
+/// can sample it.
+struct AtlasEviction {
+    /// The texture memory past which unused tiles are evicted.
+    threshold: usize,
+    /// Evicted tiles, with the frame from which their space can be freed.
+    pending: VecDeque<(usize, Vec<AtlasTile>)>,
+}
+
+impl AtlasEviction {
+    /// The texture memory an atlas may hold before tiles are evicted.
+    const BUDGET: usize = 64 << 20;
+    /// How many frames may still be on the GPU when another is drawn.
+    const FRAMES_IN_FLIGHT: usize = 3;
+
+    fn frame_drawn(&mut self, atlas: &dyn PlatformAtlas, scene: &Scene, frame: usize) {
+        while self
+            .pending
+            .front()
+            .is_some_and(|(free_at, _)| *free_at <= frame)
+        {
+            if let Some((_, tiles)) = self.pending.pop_front() {
+                atlas.free(&tiles);
+            }
+        }
+
+        let bytes = atlas.texture_bytes();
+        if bytes <= self.threshold {
+            return;
+        }
+        let drawn = scene.atlas_tiles();
+        let evicted = atlas.evict(&mut |tile| drawn.contains(&(tile.texture_id, tile.tile_id)));
+        if !evicted.is_empty() {
+            self.pending
+                .push_back((frame + Self::FRAMES_IN_FLIGHT, evicted));
+        }
+        // Space freed is reused before textures grow, so the next eviction
+        // waits for the atlas to double, not to pass the budget again.
+        self.threshold = bytes.saturating_mul(2).max(Self::BUDGET);
+    }
+}
+
+impl Default for AtlasEviction {
+    fn default() -> Self {
+        Self {
+            threshold: Self::BUDGET,
+            pending: VecDeque::new(),
+        }
+    }
 }
 
 fn quantize_glyph_origin(origin: Point<ScaledPixels>) -> (Point<ScaledPixels>, Point<u8>) {
@@ -1374,6 +1431,7 @@ pub struct Window {
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
+    atlas_eviction: AtlasEviction,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -2142,6 +2200,7 @@ impl Window {
             is_resizable,
             is_minimizable,
             sprite_atlas,
+            atlas_eviction: AtlasEviction::default(),
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -2330,6 +2389,142 @@ where
                 ),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod atlas_eviction_tests {
+    use super::*;
+    use crate::{AtlasKey, AtlasTextureId, AtlasTextureKind, TileId};
+
+    /// An atlas that holds as many bytes as it is told, and records what it
+    /// is asked to evict and free.
+    #[derive(Default)]
+    struct FakeAtlas {
+        bytes: Cell<usize>,
+        tiles: RefCell<Vec<AtlasTile>>,
+        freed: RefCell<Vec<AtlasTile>>,
+    }
+
+    impl PlatformAtlas for FakeAtlas {
+        fn get_or_insert_with<'a>(
+            &self,
+            _: &AtlasKey,
+            _: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
+        ) -> Result<Option<AtlasTile>> {
+            unimplemented!()
+        }
+
+        fn get_or_insert_glyph_with(
+            &self,
+            _: &RenderGlyphParams,
+            _: &mut dyn FnMut() -> Result<crate::ValidatedRasterizedGlyph>,
+        ) -> Result<crate::GlyphAtlasEntry> {
+            unimplemented!()
+        }
+
+        fn remove(&self, _: &AtlasKey) {}
+
+        fn texture_bytes(&self) -> usize {
+            self.bytes.get()
+        }
+
+        fn evict(&self, keep: &mut dyn FnMut(&AtlasTile) -> bool) -> Vec<AtlasTile> {
+            let (kept, evicted) = self.tiles.take().into_iter().partition(|tile| keep(tile));
+            *self.tiles.borrow_mut() = kept;
+            evicted
+        }
+
+        fn free(&self, tiles: &[AtlasTile]) {
+            self.freed.borrow_mut().extend_from_slice(tiles);
+        }
+    }
+
+    fn tile(id: u32) -> AtlasTile {
+        AtlasTile {
+            texture_id: AtlasTextureId {
+                index: 0,
+                kind: AtlasTextureKind::Monochrome,
+            },
+            tile_id: TileId(id),
+            padding: 0,
+            bounds: Bounds::default(),
+        }
+    }
+
+    /// A scene that records a glyph drawn from `tile`.
+    fn scene_drawing(tile: AtlasTile) -> Scene {
+        let mut scene = Scene::default();
+        scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            padding: 0,
+            bounds: Bounds::new(
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                size(ScaledPixels(10.), ScaledPixels(10.)),
+            ),
+            content_mask: ContentMask {
+                bounds: Bounds::new(
+                    point(ScaledPixels(0.), ScaledPixels(0.)),
+                    size(ScaledPixels(100.), ScaledPixels(100.)),
+                ),
+                ..Default::default()
+            },
+            color: Default::default(),
+            tile,
+            transformation: TransformationMatrix::unit(),
+            transform: 0,
+            clip: 0,
+        });
+        scene
+    }
+
+    #[test]
+    fn tiles_a_frame_does_not_record_are_evicted_past_the_budget_and_freed_later() {
+        let atlas = FakeAtlas::default();
+        *atlas.tiles.borrow_mut() = vec![tile(1), tile(2)];
+        let scene = scene_drawing(tile(1));
+        let mut eviction = AtlasEviction::default();
+
+        atlas.bytes.set(AtlasEviction::BUDGET);
+        eviction.frame_drawn(&atlas, &scene, 1);
+        assert_eq!(
+            atlas.tiles.borrow().len(),
+            2,
+            "nothing is evicted within the budget"
+        );
+
+        atlas.bytes.set(AtlasEviction::BUDGET + 1);
+        eviction.frame_drawn(&atlas, &scene, 2);
+        assert_eq!(
+            *atlas.tiles.borrow(),
+            vec![tile(1)],
+            "the unused tile is evicted"
+        );
+        assert!(atlas.freed.borrow().is_empty(), "but not yet freed");
+
+        for frame in 3..2 + AtlasEviction::FRAMES_IN_FLIGHT {
+            eviction.frame_drawn(&atlas, &scene, frame);
+            assert!(
+                atlas.freed.borrow().is_empty(),
+                "frame {frame} may still be drawing"
+            );
+        }
+        eviction.frame_drawn(&atlas, &scene, 2 + AtlasEviction::FRAMES_IN_FLIGHT);
+        assert_eq!(
+            *atlas.freed.borrow(),
+            vec![tile(2)],
+            "freed once no frame can sample it"
+        );
+
+        // The atlas stays over the budget with what is in use: evicting again
+        // waits for it to double.
+        atlas.tiles.borrow_mut().push(tile(3));
+        atlas.bytes.set(2 * (AtlasEviction::BUDGET + 1));
+        eviction.frame_drawn(&atlas, &scene, 10);
+        assert_eq!(atlas.tiles.borrow().len(), 2, "not every frame");
+        atlas.bytes.set(2 * (AtlasEviction::BUDGET + 1) + 1);
+        eviction.frame_drawn(&atlas, &scene, 11);
+        assert_eq!(*atlas.tiles.borrow(), vec![tile(1)]);
     }
 }
 
@@ -3414,6 +3609,11 @@ impl Window {
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
         self.next_frame.id = self.rendered_frame.id + 1;
+        self.atlas_eviction.frame_drawn(
+            &*self.sprite_atlas,
+            &self.rendered_frame.scene,
+            self.rendered_frame.id,
+        );
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;

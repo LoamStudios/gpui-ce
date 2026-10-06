@@ -604,6 +604,28 @@ impl Scene {
         }
     }
 
+    /// The atlas tiles this scene records: those it draws, and those a cached
+    /// view recorded whole may draw when replayed.
+    pub(crate) fn atlas_tiles(
+        &self,
+    ) -> collections::FxHashSet<(crate::AtlasTextureId, crate::TileId)> {
+        self.paint_operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PaintOperation::Primitive(primitive) | PaintOperation::Raster(primitive, _) => {
+                    match primitive {
+                        Primitive::MonochromeSprite(sprite) => Some(sprite.tile),
+                        Primitive::SubpixelSprite(sprite) => Some(sprite.tile),
+                        Primitive::PolychromeSprite(sprite) => Some(sprite.tile),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .map(|tile| (tile.texture_id, tile.tile_id))
+            .collect()
+    }
+
     /// Sets the clip applied to what is drawn from here on, on top of each
     /// primitive's own mask, and returns the one it replaces. Primitives are
     /// still recorded, and ordered, as if unclipped: this is how a cached view

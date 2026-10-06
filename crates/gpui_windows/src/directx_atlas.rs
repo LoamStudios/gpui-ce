@@ -126,12 +126,55 @@ impl PlatformAtlas for DirectXAtlas {
         let Some(tile) = lock.tiles_by_key.remove(key) else {
             return;
         };
-        let id = tile.texture_id;
+        lock.deallocate(tile);
+    }
 
+    fn texture_bytes(&self) -> usize {
+        let lock = self.0.lock();
+        lock.monochrome_textures
+            .textures
+            .iter()
+            .chain(&lock.polychrome_textures.textures)
+            .chain(&lock.subpixel_textures.textures)
+            .flatten()
+            .map(|texture| {
+                let size = texture.allocator.size();
+                size.width as usize * size.height as usize * texture.bytes_per_pixel as usize
+            })
+            .sum()
+    }
+
+    fn evict(&self, keep: &mut dyn FnMut(&AtlasTile) -> bool) -> Vec<AtlasTile> {
+        let mut lock = self.0.lock();
+        let lock = &mut *lock;
+        let mut evicted = Vec::new();
+        lock.tiles_by_key.retain(|key, tile| {
+            if matches!(key, AtlasKey::Image(_)) || keep(tile) {
+                return true;
+            }
+            lock.glyph_cache.remove(key);
+            evicted.push(*tile);
+            false
+        });
+        evicted
+    }
+
+    fn free(&self, tiles: &[AtlasTile]) {
+        let mut lock = self.0.lock();
+        for tile in tiles {
+            lock.deallocate(*tile);
+        }
+    }
+}
+
+impl DirectXAtlasState {
+    /// Releases `tile`'s space, and its texture once no tile is left in it.
+    fn deallocate(&mut self, tile: AtlasTile) {
+        let id = tile.texture_id;
         let textures = match id.kind {
-            AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
-            AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
-            AtlasTextureKind::Subpixel => &mut lock.subpixel_textures,
+            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
+            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+            AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
         };
 
         let Some(texture_slot) = textures.textures.get_mut(id.index as usize) else {
@@ -148,9 +191,7 @@ impl PlatformAtlas for DirectXAtlas {
             }
         }
     }
-}
 
-impl DirectXAtlasState {
     fn insert_tile(
         &mut self,
         key: AtlasKey,

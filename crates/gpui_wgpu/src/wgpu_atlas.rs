@@ -167,9 +167,54 @@ impl PlatformAtlas for WgpuAtlas {
         let Some(tile) = lock.tiles_by_key.remove(key) else {
             return;
         };
-        let id = tile.texture_id;
+        lock.deallocate(tile);
+    }
 
-        let Some(texture_slot) = lock.storage[id.kind].textures.get_mut(id.index as usize) else {
+    fn texture_bytes(&self) -> usize {
+        let lock = self.0.lock();
+        let storage = &lock.storage;
+        [
+            &storage.monochrome_textures,
+            &storage.subpixel_textures,
+            &storage.polychrome_textures,
+        ]
+        .into_iter()
+        .flat_map(|list| list.textures.iter().flatten())
+        .map(|texture| {
+            let size = texture.allocator.size();
+            size.width as usize * size.height as usize * texture.bytes_per_pixel() as usize
+        })
+        .sum()
+    }
+
+    fn evict(&self, keep: &mut dyn FnMut(&AtlasTile) -> bool) -> Vec<AtlasTile> {
+        let mut lock = self.0.lock();
+        let lock = &mut *lock;
+        let mut evicted = Vec::new();
+        lock.tiles_by_key.retain(|key, tile| {
+            if matches!(key, AtlasKey::Image(_)) || keep(tile) {
+                return true;
+            }
+            lock.glyph_cache.remove(key);
+            evicted.push(*tile);
+            false
+        });
+        evicted
+    }
+
+    fn free(&self, tiles: &[AtlasTile]) {
+        let mut lock = self.0.lock();
+        for tile in tiles {
+            lock.deallocate(*tile);
+        }
+    }
+}
+
+impl WgpuAtlasState {
+    /// Releases `tile`'s space, and its texture once no tile is left in it.
+    fn deallocate(&mut self, tile: AtlasTile) {
+        let id = tile.texture_id;
+        let Some(texture_slot) = self.storage[id.kind].textures.get_mut(id.index as usize) else {
             return;
         };
 
@@ -177,9 +222,9 @@ impl PlatformAtlas for WgpuAtlas {
             texture.allocator.deallocate(tile.tile_id.into());
             texture.decrement_ref_count();
             if texture.is_unreferenced() {
-                lock.pending_uploads
+                self.pending_uploads
                     .retain(|upload| upload.id != texture.id);
-                lock.storage[id.kind]
+                self.storage[id.kind]
                     .free_list
                     .push(texture.id.index as usize);
             } else {
@@ -187,9 +232,7 @@ impl PlatformAtlas for WgpuAtlas {
             }
         }
     }
-}
 
-impl WgpuAtlasState {
     fn insert_tile(
         &mut self,
         key: AtlasKey,
@@ -557,6 +600,76 @@ mod tests {
         atlas.remove(&big_key_a);
         let tile_b = insert(&big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
+        Ok(())
+    }
+
+    #[test]
+    fn evicted_tiles_are_built_again_and_freed_for_reuse() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let size = Size {
+            width: DevicePixels(700),
+            height: DevicePixels(700),
+        };
+        let svg = |path: &'static str| {
+            AtlasKey::Svg(gpui::RenderSvgParams {
+                path: path.into(),
+                size,
+            })
+        };
+        let builds = std::cell::Cell::new(0);
+        let insert = |key: &AtlasKey| {
+            atlas
+                .get_or_insert_with(key, &mut || {
+                    builds.set(builds.get() + 1);
+                    let channels = match key.texture_kind() {
+                        AtlasTextureKind::Monochrome => 1,
+                        _ => 4,
+                    };
+                    let bytes = vec![0u8; channels * 700 * 700];
+                    Ok(Some((size, Cow::Owned(bytes))))
+                })
+                .expect("allocation should succeed")
+                .expect("callback returns Some")
+        };
+
+        let image = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(1),
+            frame_index: 0,
+        });
+        let image_tile = insert(&image);
+        let kept = insert(&svg("kept"));
+        let unused = insert(&svg("unused"));
+        let bytes = atlas.texture_bytes();
+        assert!(bytes > 0);
+
+        let evicted = atlas.evict(&mut |tile| *tile == kept);
+        assert_eq!(
+            evicted,
+            vec![unused],
+            "only the unused raster, never an image"
+        );
+        assert_eq!(insert(&image), image_tile);
+        assert_eq!(insert(&svg("kept")), kept);
+        assert_eq!(builds.get(), 3, "kept tiles are still found");
+
+        // An evicted tile is built again, without taking the space it
+        // still holds until it is freed.
+        let rebuilt = insert(&svg("unused"));
+        assert_eq!(builds.get(), 4, "an evicted raster is built again");
+        assert_ne!(
+            (rebuilt.texture_id, rebuilt.tile_id),
+            (unused.texture_id, unused.tile_id)
+        );
+        atlas.remove(&svg("unused"));
+        atlas.free(&evicted);
+        let reused = insert(&svg("another"));
+        assert_eq!(
+            (reused.texture_id, reused.bounds),
+            (unused.texture_id, unused.bounds),
+            "freed space is used again"
+        );
+        assert_eq!(atlas.texture_bytes(), bytes, "without growing the atlas");
         Ok(())
     }
 
