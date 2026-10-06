@@ -55,11 +55,18 @@ const fn global_register(binding: u32) -> u32 {
 const fn data_register(binding: u32) -> u32 {
     shader_interface::native_slot(shader_interface::DATA_BIND_GROUP, binding)
 }
-/// The scene's transform and clip tables, bound together from this register.
+/// The scene's transform, clip, paint and colour-stop tables, bound together from this
+/// register in that order.
 const SCENE_TABLES_REGISTER: u32 = global_register(shader_interface::TRANSFORMS_BINDING);
 const _: () = assert!(
-    global_register(shader_interface::CLIPS_BINDING) == SCENE_TABLES_REGISTER + 1,
-    "the clip table must follow the transform table"
+    global_register(shader_interface::CLIPS_BINDING) == SCENE_TABLES_REGISTER + 1
+        && global_register(shader_interface::PAINTS_BINDING) == SCENE_TABLES_REGISTER + 2
+        && global_register(shader_interface::COLOR_STOPS_BINDING) == SCENE_TABLES_REGISTER + 3,
+    "the clip, paint and colour-stop tables must follow the transform table"
+);
+const _: () = assert!(
+    SCENE_TABLES_REGISTER + 4 <= DATA_REGISTER,
+    "the scene tables must not reach group 1's registers"
 );
 const DATA_REGISTER: u32 = data_register(shader_interface::DATA_BUFFER_BINDING);
 const PRIMARY_TEXTURE_REGISTER: u32 = data_register(shader_interface::PRIMARY_TEXTURE_BINDING);
@@ -218,7 +225,7 @@ struct DirectXRenderPipelines {
     poly_sprites: PipelineState<PolychromeSprite>,
     surfaces: SurfacePipeline,
     // Blur: not the generic PipelineState, since these sample a texture instead of
-    // reading a structured instance buffer; parameters live in a cbuffer at b2.
+    // reading a structured instance buffer; parameters live in a cbuffer at [`DATA_REGISTER`].
     blur_downsample_vertex: ID3D11VertexShader,
     blur_downsample_fragment: ID3D11PixelShader,
     blur_vertex: ID3D11VertexShader,
@@ -258,6 +265,8 @@ struct DirectXGlobalElements {
     sampler: Option<ID3D11SamplerState>,
     transforms: SceneTableBuffer<SceneTransform>,
     clips: SceneTableBuffer<SceneClip>,
+    paints: SceneTableBuffer<ScenePaint>,
+    color_stops: SceneTableBuffer<SceneColorStop>,
 }
 
 impl DirectXGlobalElements {
@@ -266,9 +275,15 @@ impl DirectXGlobalElements {
         [self.globals_buffer.clone(), self.font_buffer.clone()]
     }
 
-    /// The transform and clip tables, for registers from [`SCENE_TABLES_REGISTER`].
-    fn scene_tables(&self) -> [Option<ID3D11ShaderResourceView>; 2] {
-        [self.transforms.view.clone(), self.clips.view.clone()]
+    /// The transform, clip, paint and colour-stop tables, for registers from
+    /// [`SCENE_TABLES_REGISTER`].
+    fn scene_tables(&self) -> [Option<ID3D11ShaderResourceView>; 4] {
+        [
+            self.transforms.view.clone(),
+            self.clips.view.clone(),
+            self.paints.view.clone(),
+            self.color_stops.view.clone(),
+        ]
     }
 }
 
@@ -1041,6 +1056,14 @@ impl DirectXRenderer {
         self.globals
             .clips
             .update(&devices.device, &devices.device_context, scene.clips())?;
+        self.globals
+            .paints
+            .update(&devices.device, &devices.device_context, scene.paints())?;
+        self.globals.color_stops.update(
+            &devices.device,
+            &devices.device_context,
+            scene.color_stops(),
+        )?;
 
         if !scene.shadows.is_empty() {
             self.pipelines.shadow_pipeline.update_buffer(
@@ -1377,7 +1400,7 @@ impl DirectXRenderer {
     }
 
     /// Run a single blur pass: a full-screen (or composite) draw sampling `source_srv` into
-    /// `target_rtv`, with `params` in the blur constant buffer (register b2).
+    /// `target_rtv`, with `params` in the blur constant buffer (at [`DATA_REGISTER`]).
     #[allow(clippy::too_many_arguments)]
     fn dx_blur_pass(
         &self,
@@ -2094,6 +2117,8 @@ impl DirectXGlobalElements {
             sampler,
             transforms: SceneTableBuffer::new(device, "scene_transforms")?,
             clips: SceneTableBuffer::new(device, "scene_clips")?,
+            paints: SceneTableBuffer::new(device, "scene_paints")?,
+            color_stops: SceneTableBuffer::new(device, "scene_color_stops")?,
         })
     }
 }
