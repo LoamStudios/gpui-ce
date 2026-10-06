@@ -2162,8 +2162,8 @@ impl PlatformWindow for MacWindow {
     }
 
     fn supports_scene_chunks(&self) -> bool {
-        // The Metal renderer draws chunks; wgpu doesn't yet.
-        cfg!(not(feature = "wgpu"))
+        // Both the Metal and the wgpu renderer draw chunks.
+        true
     }
 
     fn gpu_specs(&self) -> Option<gpui::GpuSpecs> {

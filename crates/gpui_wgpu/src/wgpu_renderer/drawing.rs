@@ -1,6 +1,6 @@
 use gpui::{
-    AtlasTextureId, MonochromeSprite, Path, PolychromeSprite, Quad, ScaledPixels, Shadow,
-    SubpixelSprite, Underline,
+    AtlasTextureId, Bounds, MonochromeSprite, Path, PolychromeSprite, Quad, ScaledPixels, Shadow,
+    SubpixelSprite, TransformationMatrix, Underline,
 };
 
 use crate::WgpuTextureInfo;
@@ -184,15 +184,35 @@ impl WgpuRenderer {
         self.draw_bound_instances(values, pipeline, &bind_group, instances, pass)
     }
 
+    /// Copies `paths` from the intermediate they were rasterized into. Those of a chunk,
+    /// rasterized where `placement` puts them, are copied from there, which the pass's
+    /// globals must not place again.
     pub(super) fn draw_paths_from_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        placement: Option<&TransformationMatrix>,
         instances: &mut InstanceUpload,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> frame::DrawResult {
         let sprite_count = path_types::sprite_count(paths);
-        let Some(sprite_slice) = instances.write_iter(sprite_count, path_types::sprites(paths))
-        else {
+        let sprite_slice = match placement {
+            None => instances.write_iter(sprite_count, path_types::sprites(paths)),
+            // Each pixel must be copied once, for transparent paths: placed sprites that
+            // may overlap, as turned ones can, are copied as one.
+            Some(placement) if !placement.is_axis_aligned() && sprite_count > 1 => {
+                let bounds = path_types::sprites(paths)
+                    .map(|sprite| placed_sprite_bounds(placement, sprite))
+                    .reduce(|bounds, other| bounds.union(&other));
+                instances.write_iter(1, bounds.map(|bounds| path_types::PathSprite { bounds }))
+            }
+            Some(placement) => instances.write_iter(
+                sprite_count,
+                path_types::sprites(paths).map(|sprite| path_types::PathSprite {
+                    bounds: placed_sprite_bounds(placement, sprite),
+                }),
+            ),
+        };
+        let Some(sprite_slice) = sprite_slice else {
             return Err(frame::DrawError::CapacityPlanningInvariant);
         };
         let resources = self.resources();
@@ -210,13 +230,15 @@ impl WgpuRenderer {
         Ok(())
     }
 
-    /// Rasterizes `paths` into the viewport-sized intermediate texture, drawn with the
-    /// globals at `globals_offset`, which describe that texture.
+    /// Rasterizes `paths` into the viewport-sized intermediate texture, drawn with
+    /// `globals`, the group-0 bind group of the scene they are in, at `globals_offset`,
+    /// globals which describe that texture.
     pub(super) fn draw_paths_to_intermediate(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         paths: &[Path<ScaledPixels>],
         instances: &mut InstanceUpload,
+        globals: &wgpu::BindGroup,
         globals_offset: u32,
     ) -> frame::DrawResult {
         let vertex_count = path_types::rasterization_vertex_count(paths);
@@ -262,11 +284,19 @@ impl WgpuRenderer {
         pass.set_pipeline(&resources.pipelines.path_rasterization);
         pass.set_bind_group(
             shader_interface::GLOBAL_BIND_GROUP,
-            &resources.globals_bind_group,
+            globals,
             &[globals_offset],
         );
         vertex_slice.set_data_bind_group(&mut pass, resources.instances.bind_group());
         pass.draw(vertex_slice.range(), 0..1);
         Ok(())
     }
+}
+
+/// The viewport bounds a path sprite of a chunk covers, placed by `placement`.
+fn placed_sprite_bounds(
+    placement: &TransformationMatrix,
+    sprite: path_types::PathSprite,
+) -> Bounds<ScaledPixels> {
+    frame::transformed_bounds(placement, sprite.bounds)
 }

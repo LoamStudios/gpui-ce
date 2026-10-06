@@ -7,7 +7,8 @@ use super::{
 };
 use gpui::{
     Bounds, DevicePixels, GroupTarget, MaskMode, MonochromeSprite, PolychromeSprite,
-    PrimitiveBatch, Quad, RenderCommand, Scene, Shadow, SubpixelSprite, Underline, point,
+    PrimitiveBatch, Quad, RenderCommand, ScaledPixels, Scene, Shadow, SubpixelSprite,
+    TransformationMatrix, Underline, point, size,
 };
 use gpui_render::group::group_target_bounds;
 use gpui_render::shaders::{
@@ -102,6 +103,11 @@ impl PreparedTargets {
         if !renderer.ensure_uniform_capacity(requirements.uniforms) {
             return None;
         }
+        // After the target globals are sized: the chunks' bind groups reference them.
+        if !renderer.resources_mut().upload_chunk_tables(scene) {
+            renderer.resources().finish_frame_uploads();
+            return None;
+        }
 
         if requirements.uses_path_target {
             renderer.ensure_path_textures();
@@ -174,7 +180,9 @@ struct FrameGlobals {
     /// The window target's globals, which an isolated group's are made from.
     window: GlobalUniforms,
     window_offset: u32,
-    /// The path intermediate's globals: it covers the viewport, as the window does.
+    /// The path intermediate's globals: it covers the viewport, as the window does. A
+    /// chunk's paths are rasterized with them, placed.
+    paths: GlobalUniforms,
     paths_offset: u32,
 }
 
@@ -231,12 +239,15 @@ fn write_shader_globals(renderer: &mut WgpuRenderer) -> FrameGlobals {
     FrameGlobals {
         window,
         window_offset: target_globals.write(&window),
+        paths,
         paths_offset: target_globals.write(&paths),
     }
 }
 
 /// The window's target and the path intermediate have globals every frame.
 const FRAME_TARGET_GLOBALS: u64 = 2;
+/// A chunk drawn has globals placing it in its target and in the path intermediate.
+const CHUNK_TARGET_GLOBALS: u64 = 2;
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct FrameRequirements {
@@ -261,48 +272,7 @@ impl FrameRequirements {
                 instance_batches += 1;
             }
         };
-
-        for command in scene.render_commands() {
-            let RenderCommand::Batch(batch) = command else {
-                continue;
-            };
-            match batch {
-                PrimitiveBatch::Shadows { range, .. } => {
-                    reserve(std::mem::size_of::<Shadow>(), range.len())
-                }
-                PrimitiveBatch::Quads { range, .. } => {
-                    reserve(std::mem::size_of::<Quad>(), range.len())
-                }
-                PrimitiveBatch::Paths {
-                    rasterization_vertex_count,
-                    sprite_count,
-                    ..
-                } if *rasterization_vertex_count > 0 => {
-                    reserve(
-                        std::mem::size_of::<path_types::PathRasterizationVertex>(),
-                        *rasterization_vertex_count,
-                    );
-                    reserve(std::mem::size_of::<path_types::PathSprite>(), *sprite_count);
-                }
-                PrimitiveBatch::Underlines(range) => {
-                    reserve(std::mem::size_of::<Underline>(), range.len())
-                }
-                PrimitiveBatch::MonochromeSprites { range, .. } => {
-                    reserve(std::mem::size_of::<MonochromeSprite>(), range.len())
-                }
-                PrimitiveBatch::SubpixelSprites { range, .. } => {
-                    reserve(std::mem::size_of::<SubpixelSprite>(), range.len())
-                }
-                PrimitiveBatch::PolychromeSprites { range, .. } => {
-                    reserve(std::mem::size_of::<PolychromeSprite>(), range.len())
-                }
-                PrimitiveBatch::Paths { .. }
-                | PrimitiveBatch::Surfaces(_)
-                | PrimitiveBatch::BackdropFilters(_)
-                | PrimitiveBatch::Chunks(_)
-                | PrimitiveBatch::GroupBoundary(_) => {}
-            }
-        }
+        reserve_instances(scene, &mut reserve);
         debug_assert_eq!(instance_batches as usize, planned.instance_batch_count);
 
         Self {
@@ -316,10 +286,62 @@ impl FrameRequirements {
                     + u64::from(planned.uses_offscreen_target),
                 surface_count: planned.surface_count as u64,
                 group_count: planned.isolated_group_count as u64,
-                target_count: FRAME_TARGET_GLOBALS + planned.isolated_group_count as u64,
+                target_count: FRAME_TARGET_GLOBALS
+                    + planned.isolated_group_count as u64
+                    + CHUNK_TARGET_GLOBALS * planned.chunk_count as u64,
             },
             uses_path_target: planned.uses_path_target,
             uses_offscreen_target: planned.uses_offscreen_target,
+        }
+    }
+}
+
+/// Reserves, by `reserve(element_size, count)`, the instances each batch of `scene` writes,
+/// and those of each chunk it draws, once for each time it is drawn.
+fn reserve_instances(scene: &Scene, reserve: &mut impl FnMut(usize, usize)) {
+    for command in scene.render_commands() {
+        let RenderCommand::Batch(batch) = command else {
+            continue;
+        };
+        match batch {
+            PrimitiveBatch::Shadows { range, .. } => {
+                reserve(std::mem::size_of::<Shadow>(), range.len())
+            }
+            PrimitiveBatch::Quads { range, .. } => {
+                reserve(std::mem::size_of::<Quad>(), range.len())
+            }
+            PrimitiveBatch::Paths {
+                rasterization_vertex_count,
+                sprite_count,
+                ..
+            } if *rasterization_vertex_count > 0 => {
+                reserve(
+                    std::mem::size_of::<path_types::PathRasterizationVertex>(),
+                    *rasterization_vertex_count,
+                );
+                reserve(std::mem::size_of::<path_types::PathSprite>(), *sprite_count);
+            }
+            PrimitiveBatch::Underlines(range) => {
+                reserve(std::mem::size_of::<Underline>(), range.len())
+            }
+            PrimitiveBatch::MonochromeSprites { range, .. } => {
+                reserve(std::mem::size_of::<MonochromeSprite>(), range.len())
+            }
+            PrimitiveBatch::SubpixelSprites { range, .. } => {
+                reserve(std::mem::size_of::<SubpixelSprite>(), range.len())
+            }
+            PrimitiveBatch::PolychromeSprites { range, .. } => {
+                reserve(std::mem::size_of::<PolychromeSprite>(), range.len())
+            }
+            PrimitiveBatch::Chunks(range) => {
+                for placed in &scene.chunks[range.clone()] {
+                    reserve_instances(&placed.chunk.scene, reserve);
+                }
+            }
+            PrimitiveBatch::Paths { .. }
+            | PrimitiveBatch::Surfaces(_)
+            | PrimitiveBatch::BackdropFilters(_)
+            | PrimitiveBatch::GroupBoundary(_) => {}
         }
     }
 }
@@ -332,7 +354,8 @@ pub(super) struct FrameTarget {
     pub(super) texture: Option<wgpu::Texture>,
     /// The viewport rectangle the texture covers.
     pub(super) bounds: Bounds<DevicePixels>,
-    /// Where the globals describing this target are in the target globals.
+    /// The globals describing this target, and where they are in the target globals.
+    pub(super) globals: GlobalUniforms,
     pub(super) globals_offset: u32,
     /// A masked group's mask, once drawn: its target, the viewport rectangle that
     /// covers, and how it masks. Kept out of the pool until the group is composited.
@@ -368,6 +391,7 @@ fn group_target(
         view: pooled.view,
         texture: Some(pooled.texture),
         bounds,
+        globals,
         globals_offset: renderer.resources().target_globals.write(&globals),
         mask: None,
     })
@@ -403,6 +427,7 @@ impl<'a> FrameEncoder<'a> {
                 origin: point(DevicePixels(0), DevicePixels(0)),
                 size: renderer.target.viewport_size(),
             },
+            globals: targets.globals.window,
             globals_offset: targets.globals.window_offset,
             mask: None,
         };
@@ -467,19 +492,38 @@ impl<'a> FrameEncoder<'a> {
     }
 
     fn encode_commands(&mut self) -> DrawResult {
+        let renderer = self.renderer;
         let mut pass = begin_scene_render_pass(
-            self.renderer,
+            renderer,
             &mut self.encoder,
             "main_pass",
             self.targets.last().expect("the window's target is first"),
-            wgpu::LoadOp::Clear(self.renderer.target.clear_color()),
+            wgpu::LoadOp::Clear(renderer.target.clear_color()),
         );
 
         // How many of the groups being drawn are hidden: a mask, or a masked group, that
         // got no target is not drawn at all, nor is what it holds.
         let mut hidden = 0usize;
 
-        for command in self.scene.render_commands() {
+        // The scenes being drawn: the window's, then each chunk being drawn inside it,
+        // innermost last. Chunks hold no groups, so groups open and close only in the
+        // window's scene.
+        let mut levels: SmallVec<[SceneLevel<'a>; 4]> = smallvec::smallvec![SceneLevel {
+            scene: self.scene,
+            commands: self.scene.render_commands().iter(),
+            chunk: None,
+        }];
+        while let Some(level) = levels.last_mut() {
+            let Some(command) = level.commands.next() else {
+                levels.pop();
+                if let Some(level) = levels.last() {
+                    let target = self.targets.last().expect("a target is on the stack");
+                    bind_level(&mut pass, renderer, target, level.chunk.as_ref());
+                }
+                continue;
+            };
+            let scene = level.scene;
+            let chunk = level.chunk;
             if hidden > 0 {
                 match command {
                     RenderCommand::BeginGroup { .. } => hidden += 1,
@@ -497,67 +541,129 @@ impl<'a> FrameEncoder<'a> {
                     if *rasterization_vertex_count == 0 {
                         continue;
                     }
-                    let paths = &self.scene.paths[range.clone()];
+                    let paths = &scene.paths[range.clone()];
                     drop(pass);
-                    let rasterized = self.renderer.draw_paths_to_intermediate(
+                    let (globals, paths_offset) = match &chunk {
+                        Some(chunk) => (chunk.bind_group, chunk.paths_offset),
+                        None => (
+                            &renderer.resources().globals_bind_group,
+                            self.globals.paths_offset,
+                        ),
+                    };
+                    let rasterized = renderer.draw_paths_to_intermediate(
                         &mut self.encoder,
                         paths,
                         &mut self.instances,
-                        self.globals.paths_offset,
+                        globals,
+                        paths_offset,
                     );
+                    let target = self.targets.last().expect("a target is on the stack");
                     pass = begin_scene_render_pass(
-                        self.renderer,
+                        renderer,
                         &mut self.encoder,
                         "after_paths",
-                        self.targets.last().expect("a target is on the stack"),
+                        target,
                         wgpu::LoadOp::Load,
                     );
                     rasterized?;
-                    self.renderer.draw_paths_from_intermediate(
+                    // The intermediate holds the paths placed in the viewport: a chunk's
+                    // are copied from where they were placed, by the target's own globals,
+                    // within the chunk's clip.
+                    if let Some(chunk) = &chunk {
+                        bind_level(&mut pass, renderer, target, None);
+                        set_scissor(&mut pass, target, Some(chunk.clip));
+                    }
+                    let copied = renderer.draw_paths_from_intermediate(
                         paths,
+                        chunk.as_ref().map(|chunk| &chunk.placement),
                         &mut self.instances,
                         &mut pass,
-                    )?;
+                    );
+                    if chunk.is_some() {
+                        bind_level(&mut pass, renderer, target, chunk.as_ref());
+                    }
+                    copied?;
                 }
                 RenderCommand::Batch(PrimitiveBatch::BackdropFilters(range)) => {
                     drop(pass);
                     let target = self.targets.last().expect("a target is on the stack");
-                    for filter in &self.scene.backdrop_filters[range.clone()] {
-                        self.renderer
-                            .draw_backdrop_filter(&mut self.encoder, filter, target);
+                    for filter in &scene.backdrop_filters[range.clone()] {
+                        renderer.draw_backdrop_filter(&mut self.encoder, filter, target);
                     }
                     pass = begin_scene_render_pass(
-                        self.renderer,
+                        renderer,
                         &mut self.encoder,
                         "after_backdrop_filter",
                         self.targets.last().expect("a target is on the stack"),
                         wgpu::LoadOp::Load,
                     );
                 }
+                RenderCommand::Batch(PrimitiveBatch::Chunks(range)) => {
+                    let target = self.targets.last().expect("a target is on the stack");
+                    let parent_placement = chunk
+                        .as_ref()
+                        .map_or(TransformationMatrix::unit(), |chunk| chunk.placement);
+                    let mut entered = SmallVec::<[SceneLevel<'a>; 4]>::new();
+                    for placed in &scene.chunks[range.clone()] {
+                        let chunk_scene = &placed.chunk.scene;
+                        let Some(bind_group) = renderer.resources().chunk_bind_group(chunk_scene)
+                        else {
+                            return Err(DrawError::CapacityPlanningInvariant);
+                        };
+                        let mut clip =
+                            transformed_bounds(&parent_placement, placed.content_mask.bounds);
+                        if let Some(outer) = &chunk {
+                            clip = clip.intersect(&outer.clip);
+                        }
+                        if scissor_rect(target, Some(clip)).is_none() {
+                            // Out of the target, or clipped away: nothing of it is drawn.
+                            continue;
+                        }
+                        let placement = parent_placement.compose(placed.placement);
+                        let target_globals = &renderer.resources().target_globals;
+                        entered.push(SceneLevel {
+                            scene: chunk_scene,
+                            commands: chunk_scene.render_commands().iter(),
+                            chunk: Some(ChunkLevel {
+                                bind_group,
+                                placement,
+                                globals_offset: target_globals
+                                    .write(&target.globals.placed(&placement)),
+                                paths_offset: target_globals
+                                    .write(&self.globals.paths.placed(&placement)),
+                                clip,
+                            }),
+                        });
+                    }
+                    // The first chunk on top, to be drawn first.
+                    levels.extend(entered.into_iter().rev());
+                    if let Some(level) = levels.last()
+                        && level.chunk.is_some()
+                    {
+                        bind_level(&mut pass, renderer, target, level.chunk.as_ref());
+                    }
+                }
                 RenderCommand::Batch(PrimitiveBatch::GroupBoundary(_)) => {
                     unreachable!("group boundaries must be compiled into render commands")
                 }
-                RenderCommand::Batch(batch) => encode_inline_batch(
-                    self.renderer,
-                    self.scene,
-                    batch,
-                    &mut self.instances,
-                    &mut pass,
-                )?,
+                RenderCommand::Batch(batch) => {
+                    encode_inline_batch(renderer, scene, batch, &mut self.instances, &mut pass)?
+                }
                 RenderCommand::BeginGroup {
                     boundary_index,
                     target,
                 } => {
+                    debug_assert!(chunk.is_none(), "a scene chunk holds no groups");
                     // A group the plan isolates is drawn in place when it is out of view or
                     // the pool has no room for its target.
                     let group = match target {
                         GroupTarget::Isolated { region } => {
-                            group_target_bounds(*region, self.renderer.target.viewport_size())
+                            group_target_bounds(*region, renderer.target.viewport_size())
                         }
                         GroupTarget::Inline => None,
                     }
-                    .and_then(|bounds| group_target(self.renderer, self.globals.window, bounds));
-                    let boundary = &self.scene.group_boundaries[*boundary_index];
+                    .and_then(|bounds| group_target(renderer, self.globals.window, bounds));
+                    let boundary = &scene.group_boundaries[*boundary_index];
                     if group.is_none() && (boundary.masked || boundary.mask_mode.is_some()) {
                         hidden = 1;
                         continue;
@@ -567,7 +673,7 @@ impl<'a> FrameEncoder<'a> {
                         drop(pass);
                         self.targets.push(group);
                         pass = begin_scene_render_pass(
-                            self.renderer,
+                            renderer,
                             &mut self.encoder,
                             "group",
                             self.targets
@@ -584,7 +690,7 @@ impl<'a> FrameEncoder<'a> {
                             .targets
                             .pop()
                             .expect("an isolated group's target is on the stack");
-                        let boundary = &self.scene.group_boundaries[*boundary_index];
+                        let boundary = &scene.group_boundaries[*boundary_index];
                         if let Some(mode) = boundary.mask_mode {
                             // A mask is not composited: the group it masks samples it.
                             let parent = self
@@ -595,21 +701,16 @@ impl<'a> FrameEncoder<'a> {
                             parent.mask = Some((group.into_pooled(), bounds, mode));
                         } else if boundary.masked && group.mask.is_none() {
                             // Its mask is out of view: so is all of it.
-                            self.renderer.give_back_pooled_texture(group.into_pooled());
+                            renderer.give_back_pooled_texture(group.into_pooled());
                         } else {
                             let parent = self
                                 .targets
                                 .last()
                                 .expect("the window's target is under every group's");
-                            self.renderer.composite_group(
-                                &mut self.encoder,
-                                boundary,
-                                group,
-                                parent,
-                            );
+                            renderer.composite_group(&mut self.encoder, boundary, group, parent);
                         }
                         pass = begin_scene_render_pass(
-                            self.renderer,
+                            renderer,
                             &mut self.encoder,
                             "after_group",
                             self.targets.last().expect("a target is on the stack"),
@@ -625,6 +726,118 @@ impl<'a> FrameEncoder<'a> {
             "render plan left a group open"
         );
         Ok(())
+    }
+}
+
+/// A scene being drawn: the window's, or a chunk drawn inside it.
+struct SceneLevel<'a> {
+    scene: &'a Scene,
+    commands: std::slice::Iter<'a, RenderCommand>,
+    chunk: Option<ChunkLevel<'a>>,
+}
+
+/// How a chunk is drawn into the current target.
+#[derive(Clone, Copy)]
+struct ChunkLevel<'a> {
+    /// Group 0 with the chunk's own tables.
+    bind_group: &'a wgpu::BindGroup,
+    /// From the chunk's viewport to the window's, in device pixels.
+    placement: TransformationMatrix,
+    /// Its globals, placed, for the target, and for the path intermediate.
+    globals_offset: u32,
+    paths_offset: u32,
+    /// The window viewport rectangle it is clipped to.
+    clip: Bounds<ScaledPixels>,
+}
+
+/// Binds group 0 for drawing `chunk` into `target`, with its clip as the scissor, or,
+/// without a chunk, for drawing the window's scene, with no scissor.
+fn bind_level(
+    pass: &mut wgpu::RenderPass<'_>,
+    renderer: &WgpuRenderer,
+    target: &FrameTarget,
+    chunk: Option<&ChunkLevel<'_>>,
+) {
+    match chunk {
+        Some(chunk) => pass.set_bind_group(
+            shader_interface::GLOBAL_BIND_GROUP,
+            chunk.bind_group,
+            &[chunk.globals_offset],
+        ),
+        None => pass.set_bind_group(
+            shader_interface::GLOBAL_BIND_GROUP,
+            &renderer.resources().globals_bind_group,
+            &[target.globals_offset],
+        ),
+    }
+    set_scissor(pass, target, chunk.map(|chunk| chunk.clip));
+}
+
+/// Clips what `pass` draws into `target` to `clip`, a window viewport rectangle, or to
+/// nothing beyond the target. An empty clip is never set: such a chunk is not drawn.
+fn set_scissor(
+    pass: &mut wgpu::RenderPass<'_>,
+    target: &FrameTarget,
+    clip: Option<Bounds<ScaledPixels>>,
+) {
+    if let Some([x, y, width, height]) = scissor_rect(target, clip) {
+        pass.set_scissor_rect(x, y, width, height);
+    }
+}
+
+/// The scissor rectangle, in `target`'s pixels, that clips to `clip`, a window viewport
+/// rectangle, or covers the whole target; `None` if it would be empty.
+fn scissor_rect(target: &FrameTarget, clip: Option<Bounds<ScaledPixels>>) -> Option<[u32; 4]> {
+    let width = target.bounds.size.width.0.max(0) as u32;
+    let height = target.bounds.size.height.0.max(0) as u32;
+    let rect = match clip {
+        None => [0, 0, width, height],
+        Some(clip) => {
+            let origin = (
+                target.bounds.origin.x.0 as f32,
+                target.bounds.origin.y.0 as f32,
+            );
+            let left = (clip.origin.x.0 - origin.0).floor().clamp(0., width as f32) as u32;
+            let top = (clip.origin.y.0 - origin.1)
+                .floor()
+                .clamp(0., height as f32) as u32;
+            let right = (clip.origin.x.0 + clip.size.width.0 - origin.0)
+                .ceil()
+                .clamp(left as f32, width as f32) as u32;
+            let bottom = (clip.origin.y.0 + clip.size.height.0 - origin.1)
+                .ceil()
+                .clamp(top as f32, height as f32) as u32;
+            [left, top, right - left, bottom - top]
+        }
+    };
+    (rect[2] > 0 && rect[3] > 0).then_some(rect)
+}
+
+/// The viewport bounds that contain `bounds` moved by `transformation`.
+pub(super) fn transformed_bounds(
+    transformation: &TransformationMatrix,
+    bounds: Bounds<ScaledPixels>,
+) -> Bounds<ScaledPixels> {
+    let corners = [
+        bounds.origin,
+        point(bounds.origin.x + bounds.size.width, bounds.origin.y),
+        point(bounds.origin.x, bounds.origin.y + bounds.size.height),
+        point(
+            bounds.origin.x + bounds.size.width,
+            bounds.origin.y + bounds.size.height,
+        ),
+    ]
+    .map(|corner| transformation.apply(corner.map(|value| gpui::px(value.0))));
+    let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for corner in corners {
+        left = left.min(f32::from(corner.x));
+        top = top.min(f32::from(corner.y));
+        right = right.max(f32::from(corner.x));
+        bottom = bottom.max(f32::from(corner.y));
+    }
+    Bounds {
+        origin: point(ScaledPixels(left), ScaledPixels(top)),
+        size: size(ScaledPixels(right - left), ScaledPixels(bottom - top)),
     }
 }
 
@@ -704,10 +917,6 @@ fn encode_inline_batch(
         | PrimitiveBatch::GroupBoundary(_) => {
             unreachable!("pass-interrupting batches are handled by FrameEncoder")
         }
-        // Not made for this renderer: `supports_scene_chunks` is false.
-        PrimitiveBatch::Chunks(_) => {
-            debug_assert!(false, "a scene chunk reached the wgpu renderer");
-            Ok(())
-        }
+        PrimitiveBatch::Chunks(_) => unreachable!("chunks are drawn by FrameEncoder"),
     }
 }

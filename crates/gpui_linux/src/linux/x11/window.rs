@@ -1796,6 +1796,11 @@ impl PlatformWindow for X11Window {
         }
     }
 
+    fn supports_scene_chunks(&self) -> bool {
+        // The wgpu renderer draws chunks.
+        true
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         let inner = self.0.state.borrow();
         inner.renderer.sprite_atlas().clone()

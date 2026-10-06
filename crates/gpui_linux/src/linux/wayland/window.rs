@@ -2148,6 +2148,11 @@ impl PlatformWindow for WaylandWindow {
         self.0.schedule_frame();
     }
 
+    fn supports_scene_chunks(&self) -> bool {
+        // The wgpu renderer draws chunks.
+        true
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         let state = self.borrow();
         state.renderer.sprite_atlas().clone()

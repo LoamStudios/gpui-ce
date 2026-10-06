@@ -854,6 +854,11 @@ impl PlatformWindow for WebWindow {
         self.inner.state.borrow_mut().renderer.draw(scene);
     }
 
+    fn supports_scene_chunks(&self) -> bool {
+        // The wgpu renderer draws chunks.
+        true
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.inner.state.borrow().renderer.sprite_atlas().clone()
     }
