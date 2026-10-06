@@ -4,6 +4,7 @@
 
 use super::{
     PHOTO_LAYER_SIZE, PHOTO_TILE_GUTTER, PHOTO_TILE_SIZE, Photo, PhotoId, photo_level_size,
+    photo_tile_bounds,
 };
 use crate::{
     AnyWindowHandle, App, AppContext as _, DevicePixels, PaintExtend, PaintWord, PhotoPaint, Point,
@@ -17,6 +18,15 @@ use std::sync::Arc;
 
 /// The most texture memory a window keeps photo tiles in.
 pub const PHOTO_MEMORY_BUDGET: usize = 512 << 20;
+
+/// How many frames may be drawing on the GPU while the next is prepared: a
+/// tile's space is reused only once that many frames have not drawn from it,
+/// since tiles are copied in without waiting for the frames before.
+const FRAMES_IN_FLIGHT: u64 = 3;
+
+/// The most tile pixels, in bytes, a frame copies to the GPU: the rest wait
+/// for the frames after it, so a burst of decoded tiles doesn't hold one up.
+const MAX_UPLOAD_BYTES_PER_FRAME: usize = 4 << 20;
 
 /// The most tiles one photo paint draws from: a photo that would need more
 /// is drawn from a coarser level.
@@ -33,6 +43,8 @@ pub struct PhotoUploads {
 struct PhotoUploadState {
     layers: u32,
     tiles: Vec<PhotoTileUpload>,
+    /// Whether the renderer lost what its array held.
+    lost: bool,
 }
 
 /// A tile to copy into a layer of the photo texture array: rows of
@@ -56,6 +68,16 @@ impl PhotoUploads {
     pub fn take(&self) -> (u32, Vec<PhotoTileUpload>) {
         let mut state = self.state.lock();
         (state.layers, std::mem::take(&mut state.tiles))
+    }
+
+    /// Tells the window the renderer lost what its photo texture array held,
+    /// as when its device is lost and made again: the window places and
+    /// uploads every tile again, from a new, empty array.
+    pub fn lose(&self) {
+        let mut state = self.state.lock();
+        state.lost = true;
+        state.layers = 0;
+        state.tiles.clear();
     }
 }
 
@@ -84,11 +106,31 @@ pub(crate) struct PhotoResidency {
     layers: Vec<AtlasAllocator>,
     max_layers: u32,
     tiles: FxHashMap<TileKey, ResidentTile>,
-    pending: FxHashSet<TileKey>,
+    /// The tiles being decoded, and their pixels.
+    pending: FxHashMap<TileKey, u64>,
+    pending_pixels: u64,
     failed: FxHashSet<TileKey>,
     decoded: Arc<Mutex<Vec<DecodedTile>>>,
     uploads: Arc<PhotoUploads>,
     frame: u64,
+    stats: PhotoStats,
+}
+
+/// What a window's last frame did with its photos, for benchmarks.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PhotoStats {
+    /// How long choosing levels and tiles took.
+    pub prepare: std::time::Duration,
+    /// The tiles drawn from, and how many of them were coarser than wanted
+    /// or missing.
+    pub tiles_drawn: usize,
+    pub tiles_lacking: usize,
+    /// The tiles resident on the GPU, the layers they take, and the tiles
+    /// being decoded.
+    pub resident: usize,
+    pub layers: usize,
+    pub pending: usize,
 }
 
 impl Default for PhotoResidency {
@@ -98,11 +140,13 @@ impl Default for PhotoResidency {
             layers: Vec::new(),
             max_layers: (PHOTO_MEMORY_BUDGET / layer_bytes).max(1) as u32,
             tiles: FxHashMap::default(),
-            pending: FxHashSet::default(),
+            pending: FxHashMap::default(),
+            pending_pixels: 0,
             failed: FxHashSet::default(),
             decoded: Arc::default(),
             uploads: Arc::default(),
             frame: 0,
+            stats: PhotoStats::default(),
         }
     }
 }
@@ -126,25 +170,64 @@ impl PhotoResidency {
         window: AnyWindowHandle,
         cx: &App,
     ) {
+        let start = std::time::Instant::now();
         self.frame += 1;
-        self.place_decoded();
+        self.stats = PhotoStats::default();
+        if std::mem::take(&mut self.uploads.state.lock().lost) {
+            self.tiles.clear();
+            self.layers.clear();
+        }
+        if self.place_decoded() {
+            // Ask for another frame once this one is drawn, to place the rest.
+            cx.spawn(async move |cx| {
+                cx.update_window(window, |_, window, _| window.refresh())
+                    .ok();
+            })
+            .detach();
+        }
         scene.photo_uploads = Some(self.uploads.clone());
-        if scene.photo_paints().is_empty() {
-            return;
+        if !scene.photo_paints().is_empty() {
+            let mut requests = Vec::new();
+            for paint in scene.photo_paints().to_vec() {
+                self.resolve(scene, &paint, viewport_size, &mut requests);
+            }
+            self.request(requests, window, cx);
         }
-        let mut requests = Vec::new();
-        for paint in scene.photo_paints().to_vec() {
-            self.resolve(scene, &paint, viewport_size, &mut requests);
-        }
-        self.request(requests, window, cx);
+        self.stats.prepare = start.elapsed();
+        self.stats.resident = self.tiles.len();
+        self.stats.layers = self.layers.len();
+        self.stats.pending = self.pending.len();
     }
 
-    /// Places the tiles decoded since the last frame, to be uploaded before
-    /// the next draw.
-    fn place_decoded(&mut self) {
-        let decoded = std::mem::take(&mut *self.decoded.lock());
+    /// What the last frame did with its photos.
+    pub(crate) fn stats(&self) -> PhotoStats {
+        self.stats
+    }
+
+    /// Places tiles decoded since the last frame, to be uploaded before the
+    /// next draw, up to [`MAX_UPLOAD_BYTES_PER_FRAME`]. Returns whether any
+    /// are left for later frames.
+    fn place_decoded(&mut self) -> bool {
+        let mut decoded = std::mem::take(&mut *self.decoded.lock());
+        let mut bytes = 0;
+        let placed = decoded
+            .iter()
+            .position(|(_, result)| {
+                bytes += result.as_ref().map_or(0, |(_, pixels)| pixels.len());
+                bytes > MAX_UPLOAD_BYTES_PER_FRAME
+            })
+            .map_or(decoded.len(), |last| last + 1);
+        let later = decoded.split_off(placed);
+        let backlog = !later.is_empty();
+        if backlog {
+            let mut queue = self.decoded.lock();
+            let arrived = std::mem::replace(&mut *queue, later);
+            queue.extend(arrived);
+        }
         for (key, result) in decoded {
-            self.pending.remove(&key);
+            if let Some(pixels) = self.pending.remove(&key) {
+                self.pending_pixels -= pixels;
+            }
             let (size, pixels) = match result {
                 Ok(tile) => tile,
                 Err(error) => {
@@ -181,10 +264,11 @@ impl PhotoResidency {
                 pixels,
             });
         }
+        backlog
     }
 
     /// Space for a tile `size`: in a layer with room, a new layer within the
-    /// budget, or space let go of by tiles the last two frames didn't draw.
+    /// budget, or space let go of by tiles no frame in flight draws from.
     fn allocate(&mut self, size: Size<u32>) -> Option<(u32, etagere::Allocation)> {
         let size = etagere::size2(size.width as i32, size.height as i32);
         for (layer, allocator) in self.layers.iter_mut().enumerate() {
@@ -200,7 +284,7 @@ impl PhotoResidency {
             return Some((self.layers.len() as u32 - 1, allocation));
         }
 
-        let recent = self.frame.saturating_sub(1);
+        let recent = self.frame.saturating_sub(FRAMES_IN_FLIGHT);
         let mut idle: Vec<(u64, TileKey)> = self
             .tiles
             .iter()
@@ -333,6 +417,10 @@ impl PhotoResidency {
                 if word[0] < 0. {
                     self.want(key, &paint.photo, requests);
                 }
+                self.stats.tiles_drawn += 1;
+                if word[0] < 0. || word[3] > 0. {
+                    self.stats.tiles_lacking += 1;
+                }
                 words.push(word);
             }
         }
@@ -363,7 +451,7 @@ impl PhotoResidency {
     }
 
     fn want(&self, key: TileKey, photo: &Photo, requests: &mut Vec<Request>) {
-        if !self.pending.contains(&key) && !self.failed.contains(&key) {
+        if !self.pending.contains_key(&key) && !self.failed.contains(&key) {
             requests.push(Request {
                 key,
                 photo: photo.clone(),
@@ -374,24 +462,43 @@ impl PhotoResidency {
     /// Starts decoding the tiles asked for, coarsest first, as many at a
     /// time as there are threads to decode them.
     fn request(&mut self, mut requests: Vec<Request>, window: AnyWindowHandle, cx: &App) {
-        let max_pending = cx.background_executor().num_cpus().max(1) * 2;
+        // As many pixels at a time as two full tiles a thread: small tiles,
+        // as a page of photos zoomed out wants, go many at a time.
+        let max_pixels = (cx.background_executor().num_cpus().max(1) * 2) as u64
+            * (PHOTO_TILE_SIZE as u64).pow(2);
         requests.sort_by_key(|request| std::cmp::Reverse(request.key.level));
         for Request { key, photo } in requests {
-            if self.pending.len() >= max_pending {
+            if self.pending_pixels >= max_pixels {
                 break;
             }
-            if !self.pending.insert(key) {
+            if self.pending.contains_key(&key) {
                 continue;
             }
+            let pixels =
+                photo_tile_bounds(photo_level_size(photo.size(), key.level), key.x, key.y).size;
+            let pixels = pixels.width as u64 * pixels.height as u64;
+            self.pending.insert(key, pixels);
+            self.pending_pixels += pixels;
             let decoded = self.decoded.clone();
+            // Decoding yields to the work that draws frames.
             let decode = cx
                 .background_executor()
-                .spawn(async move { photo.decode_tile(key.level, key.x, key.y) });
+                .spawn_with_priority(crate::Priority::Low, async move {
+                    photo.decode_tile(key.level, key.x, key.y)
+                });
             cx.spawn(async move |cx| {
                 let tile = decode.await;
-                decoded.lock().push((key, tile));
-                cx.update_window(window, |_, window, _| window.refresh())
-                    .ok();
+                // The first tile to arrive since the last frame asks for
+                // another; the rest arrive in time for it.
+                let first = {
+                    let mut decoded = decoded.lock();
+                    decoded.push((key, tile));
+                    decoded.len() == 1
+                };
+                if first {
+                    cx.update_window(window, |_, window, _| window.refresh())
+                        .ok();
+                }
             })
             .detach();
         }
@@ -436,8 +543,11 @@ mod tests {
             "a layer holds 200 full tiles or more, not {placed}"
         );
 
-        // Two frames later, the tiles are idle, and make room.
-        residency.frame += 2;
+        // Until no frame in flight draws from them, the tiles stay...
+        residency.frame += FRAMES_IN_FLIGHT;
+        assert!(residency.allocate(tile).is_none());
+        // ...and then they are idle, and make room.
+        residency.frame += 1;
         assert!(residency.allocate(tile).is_some());
         assert!(residency.tiles.len() < placed as usize);
     }

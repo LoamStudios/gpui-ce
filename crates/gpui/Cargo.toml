@@ -274,6 +274,10 @@ name = "data_table"
 path = "examples/bench/data_table.rs"
 
 [[example]]
+name = "photo_scale"
+path = "examples/bench/photo_scale.rs"
+
+[[example]]
 name = "paths_bench"
 path = "examples/bench/paths_bench.rs"
 

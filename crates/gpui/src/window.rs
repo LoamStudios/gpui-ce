@@ -5636,6 +5636,12 @@ impl Window {
         }
     }
 
+    /// What the last frame did with its photos, for benchmarks.
+    #[doc(hidden)]
+    pub fn photo_stats(&self) -> crate::PhotoStats {
+        self.photos.stats()
+    }
+
     /// A background that paints `photo` with its top left at the current
     /// element's origin, a pixel of the photo to a pixel; see
     /// [`Self::transformed_photo`].

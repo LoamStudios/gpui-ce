@@ -657,7 +657,7 @@ impl MetalRenderer {
         let sampler = device.new_sampler(&sampler_descriptor);
 
         let command_queue = device.new_command_queue();
-        let photo_tiles = crate::metal_photos::PhotoTiles::new(&device);
+        let photo_tiles = crate::metal_photos::PhotoTiles::new(&device, is_unified_memory);
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
@@ -1056,7 +1056,7 @@ impl MetalRenderer {
         self.prepare_intermediate_textures(scene, viewport_size);
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
-        self.photo_tiles.upload(&self.device, scene, command_buffer);
+        self.photo_tiles.upload(&self.device, scene);
         let alpha = if self.opaque { 1. } else { 0. };
         let mut instance_offset = 0;
         let tables =

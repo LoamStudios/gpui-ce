@@ -20,7 +20,7 @@ use std::{
 mod residency;
 
 pub(crate) use residency::PhotoResidency;
-pub use residency::{PHOTO_MEMORY_BUDGET, PhotoTileUpload, PhotoUploads};
+pub use residency::{PHOTO_MEMORY_BUDGET, PhotoStats, PhotoTileUpload, PhotoUploads};
 
 /// The side of a photo tile, in pixels of its level.
 pub const PHOTO_TILE_SIZE: u32 = 256;
