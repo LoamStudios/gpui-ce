@@ -2384,6 +2384,57 @@ impl Element for Div {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Hitbox> {
+        let transform = self.transform_about_center(bounds);
+        window.with_transform(transform, |window| {
+            self.prepaint_in_place(global_id, inspector_id, bounds, request_layout, window, cx)
+        })
+    }
+
+    fn paint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        hitbox: &mut Option<Hitbox>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let transform = self.transform_about_center(bounds);
+        window.with_transform(transform, |window| {
+            self.paint_in_place(
+                global_id,
+                inspector_id,
+                bounds,
+                request_layout,
+                hitbox,
+                window,
+                cx,
+            )
+        })
+    }
+}
+
+impl Div {
+    /// The `transform` style, about the center of `bounds`.
+    fn transform_about_center(&self, bounds: Bounds<Pixels>) -> kurbo::Affine {
+        let Some(transform) = self.interactivity.base_style.transform else {
+            return kurbo::Affine::IDENTITY;
+        };
+        let center = bounds.center();
+        let center = kurbo::Vec2::new(f64::from(center.x.0), f64::from(center.y.0));
+        kurbo::Affine::translate(center) * transform * kurbo::Affine::translate(-center)
+    }
+
+    fn prepaint_in_place(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut DivFrameState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Hitbox> {
         let image_cache = self
             .image_cache
             .as_mut()
@@ -2522,12 +2573,12 @@ impl Element for Div {
     }
 
     #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
-    fn paint(
+    fn paint_in_place(
         &mut self,
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        request_layout: &mut Self::RequestLayoutState,
+        request_layout: &mut DivFrameState,
         hitbox: &mut Option<Hitbox>,
         window: &mut Window,
         cx: &mut App,

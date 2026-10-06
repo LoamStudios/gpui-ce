@@ -12,12 +12,13 @@ use crate::{
     PromptButton, PromptLevel, Quad, RasterizedGlyphFormat, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedDirection,
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels,
-    Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet,
-    Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
-    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Transition, TransitionState,
-    Underline, UnderlineStyle, UnicodeBidi, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    Scene, SceneClip, SceneTransform, Shadow, SharedString, Size, StrikethroughStyle, Style,
+    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Transition, TransitionState, Underline, UnderlineStyle, UnicodeBidi, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem,
     gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer},
     interactive::TouchEvent,
     point, px, rems, size, transparent_black,
@@ -74,6 +75,8 @@ use crate::Inspector;
 use crate::profiler;
 
 pub(crate) mod a11y;
+mod transform;
+pub(crate) use transform::{ElementSpace, HitboxClip, TransformedClip, transformed_bounds};
 mod prompts;
 
 use a11y::A11y;
@@ -785,7 +788,7 @@ impl HitTest {
                 continue;
             }
 
-            if !hitbox.contains(&position) {
+            if !hitbox.hit(&position) {
                 continue;
             }
 
@@ -946,10 +949,32 @@ pub struct Hitbox {
     pub fragments: Option<Arc<[Bounds<Pixels>]>>,
     /// Additional user-provided tags to extend behavior of the hitbox.
     pub tags: Vec<SharedString>,
+    /// From window coordinates to the coordinates `bounds` are in, for a
+    /// hitbox inserted under [`Window::with_transform`].
+    pub(crate) to_element: Option<TransformationMatrix>,
+    /// Clips set under a transform not aligned with the window, which
+    /// `content_mask` only bounds.
+    pub(crate) transformed_clips: Option<Arc<[HitboxClip]>>,
 }
 
 impl Hitbox {
-    /// Tests the actual regions, including the content mask, without occlusion checks.
+    /// Whether a point in window coordinates hits this hitbox, without
+    /// occlusion checks.
+    pub(crate) fn hit(&self, window_point: &Point<Pixels>) -> bool {
+        let point = match &self.to_element {
+            Some(to_element) => to_element.apply(*window_point),
+            None => *window_point,
+        };
+        self.contains(&point)
+            && self.transformed_clips.as_deref().is_none_or(|clips| {
+                clips
+                    .iter()
+                    .all(|(bounds, to_clip)| bounds.contains(&to_clip.apply(*window_point)))
+            })
+    }
+
+    /// Tests the actual regions, including the content mask, without occlusion checks. `point`
+    /// is in the coordinates of the element that inserted the hitbox, as its mouse events are.
     pub fn contains(&self, point: &Point<Pixels>) -> bool {
         self.content_mask.bounds.contains(point)
             && self.fragments.as_ref().map_or_else(
@@ -1297,6 +1322,10 @@ pub struct Window {
     /// recorded unclipped, and this applies only to what is drawn and hit
     /// tested in this frame. See [`Window::with_cached_view_recording`].
     recording_clip: Option<ContentMask<Pixels>>,
+    /// The transforms elements are drawn under; see [`Window::with_transform`].
+    pub(crate) element_spaces: Vec<ElementSpace>,
+    /// Clips set under a transform that is not aligned with the window.
+    pub(crate) transformed_clips: Vec<TransformedClip>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
     /// window, so that only actual changes are forwarded (reconfiguring a live
@@ -2051,6 +2080,8 @@ impl Window {
             style_transition_containing_bounds: None,
             content_mask_stack: Vec::new(),
             recording_clip: None,
+            element_spaces: Vec::new(),
+            transformed_clips: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
             last_text_input_configuration: None,
@@ -3064,8 +3095,11 @@ impl Window {
         position.map(|c| self.pixel_snap(c))
     }
 
+    /// Element bounds as paint geometry in device pixels, snapped to the
+    /// pixel grid.
     #[inline]
     fn snap_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
+        let bounds = self.element_space().paint_bounds(bounds);
         let scale_factor = self.scale_factor();
         let left = round_to_device_pixel(bounds.left().0, scale_factor);
         let top = round_to_device_pixel(bounds.top().0, scale_factor);
@@ -3080,7 +3114,7 @@ impl Window {
     /// Rounds half-to-zero but clamps any non-zero input up to 1 dp so thin strokes do not disappear.
     #[inline]
     fn snap_stroke(&self, value: Pixels) -> ScaledPixels {
-        ScaledPixels(round_stroke_to_device_pixel(value.0, self.scale_factor()))
+        ScaledPixels(round_stroke_to_device_pixel(value.0, self.paint_scale()))
     }
 
     #[inline]
@@ -3088,9 +3122,17 @@ impl Window {
         edges.map(|e| self.snap_stroke(*e))
     }
 
-    /// Floors the near edge and ceils the far edge, producing a strict superset of the raw region.
+    /// Element bounds as paint geometry in device pixels, flooring the near
+    /// edge and ceiling the far edge for a strict superset of the region.
     #[inline]
     fn cover_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
+        self.cover_window_bounds(self.element_space().paint_bounds(bounds))
+    }
+
+    /// Window bounds in device pixels, flooring the near edge and ceiling the
+    /// far edge for a strict superset of the region.
+    #[inline]
+    fn cover_window_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
         let scale_factor = self.scale_factor();
         let left = floor_to_device_pixel(bounds.left().0, scale_factor);
         let top = floor_to_device_pixel(bounds.top().0, scale_factor);
@@ -3104,9 +3146,9 @@ impl Window {
 
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
-        let mask = self.content_mask();
+        let mask = self.window_content_mask();
         ContentMask {
-            bounds: self.cover_bounds(mask.bounds),
+            bounds: self.cover_window_bounds(mask.bounds),
             fade_out: mask.fade_out.scale(self.scale_factor()),
         }
     }
@@ -3139,9 +3181,10 @@ impl Window {
             .is_action_available(action, node_id)
     }
 
-    /// The position of the mouse relative to the window.
+    /// The position of the mouse relative to the window, or, while an element
+    /// is drawn under [`Self::with_transform`], in that element's coordinates.
     pub fn mouse_position(&self) -> Point<Pixels> {
-        self.mouse_position
+        self.element_space().element_point(self.mouse_position)
     }
 
     /// Captures the pointer for the given hitbox. While captured, all mouse move and mouse up
@@ -3798,6 +3841,9 @@ impl Window {
     ) {
         let clip = self.content_mask();
         let moved_mask = |mask: ContentMask<Pixels>| mask.translate(offset).intersect(&clip);
+        // Hitboxes are in their elements' coordinates, as `offset` is; deferred
+        // draws are placed in the window's.
+        let window_offset = self.element_offset_in_window(offset);
         let recording_clip = self.recording_clip;
         let clipped_for_recording = |mask: ContentMask<Pixels>| match &recording_clip {
             Some(clip) => mask.intersect(clip),
@@ -3850,11 +3896,13 @@ impl Window {
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
-                    content_mask: deferred_draw.content_mask.map(moved_mask),
+                    content_mask: deferred_draw
+                        .content_mask
+                        .map(|mask| mask.translate(window_offset)),
                     rem_size: deferred_draw.rem_size,
                     priority: deferred_draw.priority,
                     element: None,
-                    absolute_offset: deferred_draw.absolute_offset + offset,
+                    absolute_offset: deferred_draw.absolute_offset + window_offset,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
                     reuse_offset: deferred_draw.reuse_offset + offset,
@@ -3909,10 +3957,13 @@ impl Window {
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
         let clip = self.snapped_content_mask();
+        let device_offset = self
+            .element_offset_in_window(offset)
+            .scale(self.scale_factor());
         self.next_frame.scene.replay_at(
             range.start.scene_index..range.end.scene_index,
             &self.rendered_frame.scene,
-            offset.scale(self.scale_factor()),
+            device_offset,
             &clip,
         );
     }
@@ -3979,15 +4030,46 @@ impl Window {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
-        if let Some(mask) = mask {
-            let mask = mask.intersect(&self.content_mask());
+        let Some(mask) = mask else {
+            return f(self);
+        };
+        let space = self.element_space();
+        if space.is_window() {
+            let mask = mask.intersect(&self.window_content_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
-            result
-        } else {
-            f(self)
+            return result;
         }
+
+        // The window keeps the mask in its own coordinates. A mask in a space
+        // that is not aligned with the window is kept there as the bounds
+        // that contain it, and exactly as a transformed clip.
+        let window_mask = ContentMask {
+            bounds: space.window_bounds(mask.bounds),
+            fade_out: if space.is_aligned() {
+                mask.fade_out.map(|fade| *fade * space.scale)
+            } else {
+                Edges::default()
+            },
+        }
+        .intersect(&self.window_content_mask());
+        self.content_mask_stack.push(window_mask);
+        let transformed = !space.is_aligned();
+        if transformed {
+            self.transformed_clips.push(TransformedClip {
+                bounds: mask.bounds,
+                space: self.element_spaces.len() - 1,
+                parent: self.transformed_clips.len().checked_sub(1),
+                scene_clip: None,
+            });
+        }
+        let result = f(self);
+        if transformed {
+            self.transformed_clips.pop();
+        }
+        self.content_mask_stack.pop();
+        result
     }
 
     /// Updates the global element offset relative to the current offset. This is used to implement
@@ -4168,12 +4250,13 @@ impl Window {
     /// one being recorded are recorded relative to it, as everything else in
     /// it is, so its recording keeps its own clips.
     pub(crate) fn with_cached_view_recording<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        if self.recording_clip.is_some() {
+        // Under a transform, the view is recorded as it is drawn, clipped.
+        if self.recording_clip.is_some() || !self.element_space().is_window() {
             return f(self);
         }
-        let clip = self.content_mask();
+        let clip = self.window_content_mask();
         let scene_clip = ContentMask {
-            bounds: self.cover_bounds(clip.bounds),
+            bounds: self.cover_window_bounds(clip.bounds),
             fade_out: clip.fade_out.scale(self.scale_factor()),
         };
         self.recording_clip = Some(clip);
@@ -4201,8 +4284,28 @@ impl Window {
         }
     }
 
-    /// Obtain the current content mask. This method should only be called during element drawing.
+    /// Obtain the current content mask, in the current element's coordinates.
+    /// Under a transform that is not aligned with the window, these are the
+    /// bounds that contain the mask. This method should only be called during
+    /// element drawing.
     pub fn content_mask(&self) -> ContentMask<Pixels> {
+        let mask = self.window_content_mask();
+        let space = self.element_space();
+        if space.is_window() {
+            return mask;
+        }
+        ContentMask {
+            bounds: space.element_bounds(mask.bounds),
+            fade_out: if space.is_aligned() {
+                mask.fade_out.map(|fade| *fade / space.scale)
+            } else {
+                Edges::default()
+            },
+        }
+    }
+
+    /// The current content mask in window coordinates.
+    pub(crate) fn window_content_mask(&self) -> ContentMask<Pixels> {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.content_mask_stack
             .last()
@@ -4457,6 +4560,15 @@ impl Window {
         content_mask: Option<ContentMask<Pixels>>,
     ) {
         self.invalidator.debug_assert_prepaint();
+        // A deferred draw is painted after the rest of the frame, outside any
+        // transform: it is placed and clipped where its element is in the
+        // window, unrotated and unscaled, as an overlay.
+        let space = self.element_space();
+        let absolute_offset = space.to_window.apply(absolute_offset);
+        let content_mask = content_mask.map(|mask| ContentMask {
+            bounds: space.window_bounds(mask.bounds),
+            ..mask
+        });
         let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
         self.next_frame.deferred_draws.push(DeferredDraw {
             current_view: self.current_view(),
@@ -4487,7 +4599,7 @@ impl Window {
         if !clipped_bounds.is_empty() {
             self.next_frame
                 .scene
-                .push_layer(self.cover_bounds(clipped_bounds));
+                .push_layer(self.viewport_bounds(self.cover_bounds(clipped_bounds)));
         }
 
         let result = f(self);
@@ -4524,7 +4636,9 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
+        let (transform, clip) = (self.scene_transform(), self.scene_clip());
+
+        let scale_factor = self.paint_scale();
         let content_mask = self.snapped_content_mask();
         let opacity = self.element_opacity();
         let element_bounds = self.cover_bounds(bounds);
@@ -4536,8 +4650,8 @@ impl Window {
             }
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
             self.next_frame.scene.insert_primitive(Shadow {
-                transform: 0,
-                clip: 0,
+                transform,
+                clip,
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(shadow_bounds),
@@ -4575,7 +4689,9 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
+        let (transform, clip) = (self.scene_transform(), self.scene_clip());
+
+        let scale_factor = self.paint_scale();
         let content_mask = self.snapped_content_mask();
         let opacity = self.element_opacity();
         let element_bounds = self.cover_bounds(bounds);
@@ -4596,8 +4712,8 @@ impl Window {
                 bottom_left: (corner_radii.bottom_left - shadow.spread_radius).max(zero),
             };
             self.next_frame.scene.insert_primitive(Shadow {
-                transform: 0,
-                clip: 0,
+                transform,
+                clip,
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(hole),
@@ -4640,7 +4756,7 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
+        let scale_factor = self.paint_scale();
         let filters: SmallVec<[ScaledFilter; 4]> = filters
             .iter()
             .filter(|filter| !filter.is_identity())
@@ -4652,7 +4768,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(BackdropFilter {
             order: 0,
-            bounds: self.snap_bounds(bounds),
+            bounds: self.viewport_bounds(self.snap_bounds(bounds)),
             content_mask: self.snapped_content_mask(),
             corner_radii: corner_radii.scale(scale_factor),
             corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
@@ -4691,7 +4807,7 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
+        let scale_factor = self.paint_scale();
         let filters: SmallVec<[ScaledFilter; 4]> = filters
             .iter()
             .filter(|filter| !filter.is_identity())
@@ -4710,7 +4826,7 @@ impl Window {
         // `.blur(r).opacity(0.5)` would render at 0.25 instead of 0.5).
         let boundary = FilterBoundary {
             order: 0,
-            bounds: self.snap_bounds(bounds),
+            bounds: self.viewport_bounds(self.snap_bounds(bounds)),
             content_mask: self.snapped_content_mask(),
             corner_radii: corner_radii.scale(scale_factor),
             corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
@@ -4786,18 +4902,20 @@ impl Window {
     pub fn paint_quad_with_corner_smoothing(&mut self, quad: PaintQuad, corner_smoothing: f32) {
         self.invalidator.debug_assert_paint();
 
+        let (transform, clip) = (self.scene_transform(), self.scene_clip());
+
         let opacity = self.element_opacity();
         let snapped_bounds = self.snap_bounds(quad.bounds);
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
         let quad = Quad {
-            transform: 0,
-            clip: 0,
+            transform,
+            clip,
             order: 0,
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
             background: quad.background.opacity(opacity),
             border_color: quad.border_color.opacity(opacity),
-            corner_radii: quad.corner_radii.scale(self.scale_factor()),
+            corner_radii: quad.corner_radii.scale(self.paint_scale()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
             border_dashed_length: quad.border_dashed_length,
@@ -4806,7 +4924,9 @@ impl Window {
             padding: 0,
         };
 
-        if !quad.background.is_transparent() {
+        // The split below clips each strip with a viewport-aligned mask, so it
+        // only applies where the quad is aligned with the viewport.
+        if !quad.background.is_transparent() || transform != 0 {
             self.next_frame.scene.insert_primitive(quad);
             return;
         }
@@ -4865,7 +4985,13 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
+        let space = self.element_space();
+        if !space.is_window() {
+            // Paths are tessellated already: move their vertices into the
+            // window, where the content mask is.
+            path = path.transformed(&space.to_window);
+        }
+        let content_mask = self.window_content_mask();
         let opacity = self.element_opacity();
         path.content_mask = content_mask;
         let color: Background = color.into();
@@ -4886,6 +5012,8 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
+        let (transform, clip) = (self.scene_transform(), self.scene_clip());
+
         let scale_factor = self.scale_factor();
         let thickness = self.snap_stroke(style.thickness);
         let height = if style.wavy {
@@ -4894,14 +5022,17 @@ impl Window {
             thickness
         };
         let bounds = Bounds {
-            origin: origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
+            origin: self
+                .element_space()
+                .paint_point(origin)
+                .map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
             size: size(self.snap_stroke(width), height),
         };
         let element_opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
-            transform: 0,
-            clip: 0,
+            transform,
+            clip,
             order: 0,
             padding: 0,
             bounds,
@@ -4927,17 +5058,22 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
+        let (transform, clip) = (self.scene_transform(), self.scene_clip());
+
         let scale_factor = self.scale_factor();
         let height = style.thickness;
         let bounds = Bounds {
-            origin: origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
+            origin: self
+                .element_space()
+                .paint_point(origin)
+                .map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
             size: size(self.snap_stroke(width), self.snap_stroke(height)),
         };
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
-            transform: 0,
-            clip: 0,
+            transform,
+            clip,
             order: 0,
             padding: 0,
             bounds,
@@ -4967,8 +5103,11 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
+        let scale_factor = self.paint_scale();
+        let glyph_origin = self
+            .element_space()
+            .paint_point(origin)
+            .scale(self.scale_factor());
 
         let (integer_origin, subpixel_variant) = quantize_glyph_origin(glyph_origin);
         let requested_mode = if self.should_use_subpixel_rendering(font_id, font_size) {
@@ -4998,6 +5137,7 @@ impl Window {
         mask_color: Hsla,
         opacity: f32,
     ) -> Result<()> {
+        let (transform, clip) = (self.scene_transform(), self.scene_clip());
         let text_system = self.text_system().clone();
         let entry = self
             .sprite_atlas
@@ -5016,8 +5156,8 @@ impl Window {
         match entry.format {
             RasterizedGlyphFormat::AlphaMask => {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
-                    transform: 0,
-                    clip: 0,
+                    transform,
+                    clip,
                     order: 0,
                     padding: 0,
                     bounds,
@@ -5029,8 +5169,8 @@ impl Window {
             }
             RasterizedGlyphFormat::BgraSubpixelMask => {
                 self.next_frame.scene.insert_primitive(SubpixelSprite {
-                    transform: 0,
-                    clip: 0,
+                    transform,
+                    clip,
                     order: 0,
                     padding: 0,
                     bounds,
@@ -5042,8 +5182,8 @@ impl Window {
             }
             RasterizedGlyphFormat::BgraColor => {
                 self.next_frame.scene.insert_primitive(PolychromeSprite {
-                    transform: 0,
-                    clip: 0,
+                    transform,
+                    clip,
                     order: 0,
                     grayscale: false.into(),
                     corner_smoothing: 0.0,
@@ -5110,8 +5250,11 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
+        let scale_factor = self.paint_scale();
+        let glyph_origin = self
+            .element_space()
+            .paint_point(origin)
+            .scale(self.scale_factor());
         let (integer_origin, subpixel_variant) = quantize_color_glyph_origin(glyph_origin);
         let raster_style = self.text_system().prepare_raster_style(
             font_id,
@@ -5144,6 +5287,8 @@ impl Window {
         cx: &App,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
+
+        let (transform, clip) = (self.scene_transform(), self.scene_clip());
 
         let element_opacity = self.element_opacity();
         let bounds = self.snap_bounds(bounds);
@@ -5184,8 +5329,8 @@ impl Window {
             .map_size(|size| size.ceil());
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
-            transform: 0,
-            clip: 0,
+            transform,
+            clip,
             order: 0,
             padding: 0,
             bounds: final_bounds,
@@ -5238,6 +5383,8 @@ impl Window {
         grayscale: bool,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
+
+        let (transform, clip) = (self.scene_transform(), self.scene_clip());
 
         let visible_bounds = bounds.intersect(&image_bounds);
         if visible_bounds.size.width <= Pixels::ZERO || visible_bounds.size.height <= Pixels::ZERO {
@@ -5310,12 +5457,12 @@ impl Window {
         let content_mask = self.snapped_content_mask();
         let corner_radii = corner_radii
             .clamp_radii_for_quad_size(visible_bounds.size)
-            .scale(self.scale_factor());
+            .scale(self.paint_scale());
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
-            transform: 0,
-            clip: 0,
+            transform,
+            clip,
             order: 0,
             grayscale: grayscale.into(),
             corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
@@ -5340,7 +5487,9 @@ impl Window {
 
         self.invalidator.debug_assert_paint();
 
-        let bounds = self.snap_bounds(bounds);
+        // Surfaces are not transformed on the GPU: under a transform they
+        // fill the viewport bounds that contain them.
+        let bounds = self.viewport_bounds(self.snap_bounds(bounds));
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_surface(
             PaintSurface {
@@ -5682,6 +5831,7 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
 
         let recorded_content_mask = self.content_mask();
+        let space = self.element_space();
         let hitbox_id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
         let hitbox = Hitbox {
@@ -5692,6 +5842,8 @@ impl Window {
             behavior,
             fragments: self.current_inline_fragments.clone(),
             tags: Vec::default(),
+            to_element: (!space.is_window()).then_some(space.to_element),
+            transformed_clips: self.hitbox_clips(),
         };
 
         self.next_frame.hitboxes.push_mut(hitbox)
@@ -5824,6 +5976,20 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
+        let space = self.element_space();
+        if !space.is_window() {
+            // Under a transform, the listener hears the event where its
+            // element is, in that element's coordinates.
+            let to_element = space.to_element;
+            self.next_frame.mouse_listeners.push(Some(Box::new(
+                move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+                    if let Some(event) = event.downcast_ref::<Event>() {
+                        listener(&event.to_element_space(&to_element), phase, window, cx)
+                    }
+                },
+            )));
+            return;
+        }
         self.next_frame.mouse_listeners.push(Some(Box::new(
             move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
                 if let Some(event) = event.downcast_ref() {
@@ -8214,6 +8380,8 @@ mod tests {
             behavior: HitboxBehavior::Normal,
             tags: vec!["background".into()],
             fragments: None,
+            to_element: None,
+            transformed_clips: None,
         };
         let mut inline = Hitbox {
             id: HitboxId(2),
@@ -8225,6 +8393,8 @@ mod tests {
             recorded_content_mask: ContentMask::default(),
             behavior: HitboxBehavior::Normal,
             tags: vec!["inline".into()],
+            to_element: None,
+            transformed_clips: None,
             fragments: Some(Arc::from([
                 Bounds::new(point(px(60.), px(0.)), size(px(40.), px(40.))),
                 Bounds::new(point(px(0.), px(40.)), size(px(40.), px(40.))),

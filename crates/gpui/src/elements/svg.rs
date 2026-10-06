@@ -142,7 +142,10 @@ impl Element for Svg {
                     .transformation
                     .as_ref()
                     .map(|transformation| {
-                        transformation.into_matrix(bounds.center(), window.scale_factor())
+                        transformation.into_matrix(
+                            window.element_space().paint_point(bounds.center()),
+                            window.scale_factor(),
+                        )
                     })
                     .unwrap_or_default();
 
@@ -274,6 +277,8 @@ impl Transformation {
         self
     }
 
+    /// The transformation about `center`, given as paint geometry in logical
+    /// pixels (see `Window::with_transform`), in device pixels.
     fn into_matrix(self, center: Point<Pixels>, scale_factor: f32) -> TransformationMatrix {
         //Note: if you read this as a sequence of matrix multiplications, start from the bottom
         TransformationMatrix::unit()

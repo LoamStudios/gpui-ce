@@ -395,6 +395,12 @@ pub struct Style {
     /// The opacity of this element
     pub opacity: Option<f32>,
 
+    /// A transform of this element and its children about the element's
+    /// center, in logical pixels: rotation, scale, skew or translation. It
+    /// does not affect layout; painting, hit testing and mouse events follow
+    /// it (see [`Window::with_transform`](crate::Window::with_transform)).
+    pub transform: Option<kurbo::Affine>,
+
     /// The grid columns of this element
     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
     pub grid_cols: Option<GridTemplate>,
@@ -1177,6 +1183,7 @@ impl Default for Style {
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
+            transform: None,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,

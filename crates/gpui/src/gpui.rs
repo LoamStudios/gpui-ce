@@ -115,6 +115,7 @@ pub use gpui_macros::{
     AppContext, InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement,
     Styled, VisualContext, bench, property_test, register_action, test,
 };
+pub use kurbo;
 pub use spring::*;
 
 /// Defines a Criterion benchmark group for benchmarks annotated with [`gpui::bench`].

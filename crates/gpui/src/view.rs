@@ -2,7 +2,8 @@ use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, AppContext as _, Bounds, ContentMask, Context,
     Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, IsZero,
     LayoutId, MouseMoveEvent, PaintIndex, Pixels, Point, PrepaintStateIndex, Render, RenderOnce,
-    ResolvedDirection, Style, StyleRefinement, TextStyle, UnicodeBidi, WeakEntity, px,
+    ResolvedDirection, Style, StyleRefinement, TextStyle, TransformationMatrix, UnicodeBidi,
+    WeakEntity, px,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -384,6 +385,11 @@ struct ViewElementCacheKey {
     /// so the records hold everything it painted and can be reused at
     /// another position; a clipped recording is missing what fell outside.
     unclipped: bool,
+    /// The transform from the view's coordinates to the window's when it was
+    /// recorded (`Window::with_transform`). Records are reused only under the
+    /// same transform: under another they would be placed, and text in them
+    /// rasterized, for the wrong one.
+    to_window: TransformationMatrix,
 }
 
 /// Whether `bounds` lies entirely inside `content_mask`, edges included —
@@ -416,9 +422,15 @@ impl ViewElementState {
         let offset = if key.bounds == bounds && key.content_mask == *content_mask {
             Point::default()
         } else if key.unclipped && key.bounds.size == bounds.size {
-            let scale_factor = window.scale_factor();
-            (bounds.origin - (key.bounds.origin + key.records_offset))
-                .map(|coordinate| px((coordinate.0 * scale_factor).round() / scale_factor))
+            let space = window.element_space();
+            let offset = bounds.origin - (key.bounds.origin + key.records_offset);
+            if space.is_aligned() {
+                let scale = window.paint_scale();
+                offset.map(|coordinate| px((coordinate.0 * scale).round() / scale))
+            } else {
+                // Not aligned with the pixel grid, so there is no grid to keep.
+                offset
+            }
         } else {
             return None;
         };
@@ -553,16 +565,21 @@ impl<V: View> Element for ViewElement<V> {
                             let cache_key = ViewElementCacheKey {
                                 bounds,
                                 records_offset: Point::default(),
-                                unclipped: unclipped_by(bounds, &content_mask),
+                                // A clip under a rotation only bounds the
+                                // content mask, so it can't tell what it cut.
+                                unclipped: unclipped_by(bounds, &content_mask)
+                                    && window.transformed_clips.is_empty(),
                                 content_mask,
                                 text_style: window.text_style(),
                                 direction: window.resolved_direction(),
                                 unicode_bidi: window.resolved_unicode_bidi(),
+                                to_window: window.element_space().to_window,
                             };
 
                             if request_layout.element.is_none()
                                 && let Some(mut element_state) = element_state
                                 && element_state.frame != window.next_frame.id
+                                && element_state.cache_key.to_window == cache_key.to_window
                                 && element_state.cache_key.text_style == cache_key.text_style
                                 && element_state.cache_key.direction == cache_key.direction
                                 && element_state.cache_key.unicode_bidi == cache_key.unicode_bidi

@@ -2453,6 +2453,7 @@ dependencies = [
  "image",
  "inventory",
  "itertools 0.14.0",
+ "kurbo",
  "log",
  "lyon",
  "num_cpus",
@@ -3572,6 +3573,7 @@ dependencies = [
  "arrayvec",
  "euclid",
  "polycool",
+ "serde",
  "smallvec",
 ]
 
@@ -5856,6 +5858,9 @@ name = "smallvec"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "smol"

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Pixels, Point,
-    Radians, ScaledFilter, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Radians, ScaledFilter, ScaledPixels, Size, bounds_tree::BoundsTree, point, px,
 };
 use smallvec::SmallVec;
 use std::{
@@ -112,6 +112,80 @@ impl Scene {
         self.is_finished = false;
     }
 
+    /// The viewport bounds that contain `primitive`: its bounds, moved by its
+    /// transform-table entry if it has one.
+    fn viewport_bounds(&self, primitive: &Primitive) -> Bounds<ScaledPixels> {
+        let bounds = *primitive.bounds();
+        match primitive.transform() {
+            0 => bounds,
+            transform => {
+                let transformation = self.transforms()[transform as usize].transformation;
+                crate::window::transformed_bounds(&transformation, bounds.map(|value| px(value.0)))
+                    .map(|value| ScaledPixels(value.0))
+            }
+        }
+    }
+
+    /// Rewrites `primitive`'s transform- and clip-table entries, which index
+    /// `prev_scene`'s tables, as entries of this scene's, moved by `offset`.
+    /// Each entry is copied once per replay, however many primitives use it.
+    fn adopt_table_entries(
+        &mut self,
+        primitive: &mut Primitive,
+        prev_scene: &Scene,
+        adopted: &mut AdoptedEntries,
+        offset: Point<ScaledPixels>,
+    ) {
+        let Some((transform, clip)) = primitive.table_entries() else {
+            return;
+        };
+        *transform = self.adopt_transform(*transform, prev_scene, adopted, offset);
+        *clip = self.adopt_clip(*clip, prev_scene, adopted, offset);
+    }
+
+    fn adopt_transform(
+        &mut self,
+        transform: u32,
+        prev_scene: &Scene,
+        adopted: &mut AdoptedEntries,
+        offset: Point<ScaledPixels>,
+    ) -> u32 {
+        if transform == 0 {
+            return 0;
+        }
+        if let Some(&index) = adopted.transforms.get(&transform) {
+            return index;
+        }
+        let entry = prev_scene.transforms()[transform as usize];
+        let index = self.push_transform(entry.moved_by(offset));
+        adopted.transforms.insert(transform, index);
+        index
+    }
+
+    fn adopt_clip(
+        &mut self,
+        clip: u32,
+        prev_scene: &Scene,
+        adopted: &mut AdoptedEntries,
+        offset: Point<ScaledPixels>,
+    ) -> u32 {
+        if clip == 0 {
+            return 0;
+        }
+        if let Some(&index) = adopted.clips.get(&clip) {
+            return index;
+        }
+        let entry = prev_scene.clips()[clip as usize];
+        let entry = SceneClip {
+            transform: self.adopt_transform(entry.transform, prev_scene, adopted, offset),
+            parent: self.adopt_clip(entry.parent, prev_scene, adopted, offset),
+            ..entry
+        };
+        let index = self.push_clip(entry);
+        adopted.clips.insert(clip, index);
+        index
+    }
+
     /// Adds `transform` to the transform table and returns its index.
     pub fn push_transform(&mut self, transform: SceneTransform) -> u32 {
         if self.transforms.is_empty() {
@@ -212,8 +286,8 @@ impl Scene {
         surface_opacity: Option<f32>,
     ) {
         self.is_finished = false;
-        let clipped_bounds = primitive
-            .bounds()
+        let clipped_bounds = self
+            .viewport_bounds(&primitive)
             .intersect(&primitive.content_mask().bounds);
 
         // Content-filter boundaries must always be inserted as matched pairs — dropping one
@@ -357,7 +431,8 @@ impl Scene {
         content_mask: &ContentMask<ScaledPixels>,
     ) {
         let operations = &prev_scene.paint_operations[range];
-        if self.replay_run_at(operations, offset, content_mask) {
+        let mut adopted = AdoptedEntries::default();
+        if self.replay_run_at(operations, prev_scene, &mut adopted, offset, content_mask) {
             return;
         }
         for operation in operations {
@@ -365,6 +440,7 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => {
                     let mut primitive = primitive.clone();
                     primitive.translate(offset, content_mask);
+                    self.adopt_table_entries(&mut primitive, prev_scene, &mut adopted, offset);
                     self.insert_primitive(primitive);
                 }
                 PaintOperation::Surface { surface, opacity } => {
@@ -392,6 +468,8 @@ impl Scene {
     fn replay_run_at(
         &mut self,
         operations: &[PaintOperation],
+        prev_scene: &Scene,
+        adopted: &mut AdoptedEntries,
         offset: Point<ScaledPixels>,
         content_mask: &ContentMask<ScaledPixels>,
     ) -> bool {
@@ -431,8 +509,9 @@ impl Scene {
                 }
             };
             primitive.translate(offset, content_mask);
-            let clipped = primitive
-                .bounds()
+            self.adopt_table_entries(&mut primitive, prev_scene, adopted, offset);
+            let clipped = self
+                .viewport_bounds(&primitive)
                 .intersect(&primitive.content_mask().bounds);
             if clipped.is_empty() {
                 continue;
@@ -611,6 +690,13 @@ pub(crate) enum PrimitiveKind {
     FilterBoundaryEnd,
 }
 
+/// Table entries copied from the scene being replayed, by their index there.
+#[derive(Default)]
+struct AdoptedEntries {
+    transforms: collections::FxHashMap<u32, u32>,
+    clips: collections::FxHashMap<u32, u32>,
+}
+
 /// A paint operation being replayed as part of a run, moved and clipped.
 enum ReplayOperation {
     Primitive(Primitive, Option<f32>),
@@ -687,6 +773,42 @@ impl Primitive {
         }
     }
 
+    /// The primitive's entry in the scene's transform table: 0 for the
+    /// identity, and for kinds that are not transformed.
+    pub(crate) fn transform(&self) -> u32 {
+        match self {
+            Primitive::Shadow(shadow) => shadow.transform,
+            Primitive::Quad(quad) => quad.transform,
+            Primitive::Underline(underline) => underline.transform,
+            Primitive::MonochromeSprite(sprite) => sprite.transform,
+            Primitive::SubpixelSprite(sprite) => sprite.transform,
+            Primitive::PolychromeSprite(sprite) => sprite.transform,
+            Primitive::Path(_)
+            | Primitive::Surface(_)
+            | Primitive::BackdropFilter(_)
+            | Primitive::FilterBoundary(_) => 0,
+        }
+    }
+
+    /// The primitive's transform- and clip-table entries, to rewrite when it
+    /// is replayed into another scene.
+    fn table_entries(&mut self) -> Option<(&mut u32, &mut u32)> {
+        match self {
+            Primitive::Shadow(shadow) => Some((&mut shadow.transform, &mut shadow.clip)),
+            Primitive::Quad(quad) => Some((&mut quad.transform, &mut quad.clip)),
+            Primitive::Underline(underline) => {
+                Some((&mut underline.transform, &mut underline.clip))
+            }
+            Primitive::MonochromeSprite(sprite) => Some((&mut sprite.transform, &mut sprite.clip)),
+            Primitive::SubpixelSprite(sprite) => Some((&mut sprite.transform, &mut sprite.clip)),
+            Primitive::PolychromeSprite(sprite) => Some((&mut sprite.transform, &mut sprite.clip)),
+            Primitive::Path(_)
+            | Primitive::Surface(_)
+            | Primitive::BackdropFilter(_)
+            | Primitive::FilterBoundary(_) => None,
+        }
+    }
+
     /// The draw order the primitive was given when it was inserted.
     pub(crate) fn order(&self) -> DrawOrder {
         match self {
@@ -710,55 +832,63 @@ impl Primitive {
         offset: Point<ScaledPixels>,
         content_mask: &ContentMask<ScaledPixels>,
     ) {
+        // A primitive placed by a transform-table entry is moved by moving
+        // that entry (`Scene::adopt_table_entries`); its geometry stays in
+        // its own space. Masks are in the viewport either way.
+        let geometry_offset = if self.transform() == 0 {
+            offset
+        } else {
+            Point::default()
+        };
         let moved = |mask: &mut ContentMask<ScaledPixels>| {
             *mask = mask.translate(offset).intersect(content_mask);
         };
         match self {
             Primitive::Shadow(shadow) => {
-                shadow.bounds = shadow.bounds + offset;
-                shadow.element_bounds = shadow.element_bounds + offset;
+                shadow.bounds = shadow.bounds + geometry_offset;
+                shadow.element_bounds = shadow.element_bounds + geometry_offset;
                 moved(&mut shadow.content_mask);
             }
             Primitive::Quad(quad) => {
-                quad.bounds = quad.bounds + offset;
+                quad.bounds = quad.bounds + geometry_offset;
                 moved(&mut quad.content_mask);
             }
             Primitive::Path(path) => {
-                path.bounds = path.bounds + offset;
+                path.bounds = path.bounds + geometry_offset;
                 moved(&mut path.content_mask);
                 for vertex in &mut path.vertices {
-                    vertex.xy_position = vertex.xy_position + offset;
+                    vertex.xy_position = vertex.xy_position + geometry_offset;
                     moved(&mut vertex.content_mask);
                 }
             }
             Primitive::Underline(underline) => {
-                underline.bounds = underline.bounds + offset;
+                underline.bounds = underline.bounds + geometry_offset;
                 moved(&mut underline.content_mask);
             }
             Primitive::MonochromeSprite(sprite) => {
-                sprite.bounds = sprite.bounds + offset;
-                sprite.transformation = sprite.transformation.moved_by(offset);
+                sprite.bounds = sprite.bounds + geometry_offset;
+                sprite.transformation = sprite.transformation.moved_by(geometry_offset);
                 moved(&mut sprite.content_mask);
             }
             Primitive::SubpixelSprite(sprite) => {
-                sprite.bounds = sprite.bounds + offset;
-                sprite.transformation = sprite.transformation.moved_by(offset);
+                sprite.bounds = sprite.bounds + geometry_offset;
+                sprite.transformation = sprite.transformation.moved_by(geometry_offset);
                 moved(&mut sprite.content_mask);
             }
             Primitive::PolychromeSprite(sprite) => {
-                sprite.bounds = sprite.bounds + offset;
+                sprite.bounds = sprite.bounds + geometry_offset;
                 moved(&mut sprite.content_mask);
             }
             Primitive::Surface(surface) => {
-                surface.bounds = surface.bounds + offset;
+                surface.bounds = surface.bounds + geometry_offset;
                 moved(&mut surface.content_mask);
             }
             Primitive::BackdropFilter(filter) => {
-                filter.bounds = filter.bounds + offset;
+                filter.bounds = filter.bounds + geometry_offset;
                 moved(&mut filter.content_mask);
             }
             Primitive::FilterBoundary(boundary) => {
-                boundary.bounds = boundary.bounds + offset;
+                boundary.bounds = boundary.bounds + geometry_offset;
                 moved(&mut boundary.content_mask);
             }
         }
@@ -1308,6 +1438,26 @@ pub struct SceneTransform {
 }
 
 impl SceneTransform {
+    /// The same placement, moved by `offset` in the viewport.
+    pub fn moved_by(self, offset: Point<ScaledPixels>) -> Self {
+        let [x, y] = self.transformation.translation;
+        let [[a, b], [c, d]] = self.inverse.rotation_scale;
+        let [inverse_x, inverse_y] = self.inverse.translation;
+        Self {
+            transformation: TransformationMatrix {
+                translation: [x + offset.x.0, y + offset.y.0],
+                ..self.transformation
+            },
+            inverse: TransformationMatrix {
+                translation: [
+                    inverse_x - (a * offset.x.0 + b * offset.y.0),
+                    inverse_y - (c * offset.x.0 + d * offset.y.0),
+                ],
+                ..self.inverse
+            },
+        }
+    }
+
     /// The identity, entry 0 of every transform table.
     pub const IDENTITY: Self = Self {
         transformation: TransformationMatrix::UNIT,
@@ -1603,6 +1753,17 @@ impl Path<Pixels> {
             color: Default::default(),
             contour_count: 0,
         }
+    }
+
+    /// The path under `transformation`, which maps its points.
+    pub(crate) fn transformed(mut self, transformation: &TransformationMatrix) -> Self {
+        for vertex in &mut self.vertices {
+            vertex.xy_position = transformation.apply(vertex.xy_position);
+        }
+        self.bounds = crate::window::transformed_bounds(transformation, self.bounds);
+        self.start = transformation.apply(self.start);
+        self.current = transformation.apply(self.current);
+        self
     }
 
     /// Scale this path by the given factor.

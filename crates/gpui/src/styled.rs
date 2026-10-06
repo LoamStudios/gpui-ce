@@ -972,6 +972,26 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Transforms this element and its children about the element's center,
+    /// after any transform already set, without affecting layout.
+    fn transform(mut self, transform: impl Into<kurbo::Affine>) -> Self {
+        let style = self.style();
+        style.transform = Some(style.transform.unwrap_or_default() * transform.into());
+        self
+    }
+
+    /// Rotates this element and its children clockwise about the element's
+    /// center, without affecting layout.
+    fn rotate(self, angle: impl Into<crate::Radians>) -> Self {
+        self.transform(kurbo::Affine::rotate(f64::from(angle.into().0)))
+    }
+
+    /// Scales this element and its children about the element's center,
+    /// without affecting layout.
+    fn scale(self, factor: f32) -> Self {
+        self.transform(kurbo::Affine::scale(f64::from(factor)))
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {
