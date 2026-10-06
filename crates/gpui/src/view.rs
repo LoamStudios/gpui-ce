@@ -761,21 +761,24 @@ impl<V: View> Element for ViewElement<V> {
                         |element_state, window| {
                             let mut element_state = element_state.unwrap();
 
+                            let subframe = element_state.subframe;
                             window.with_cached_view_recording(|window| {
-                                let paint_start = window.paint_index();
-                                if let Some(element) = element {
-                                    let refreshing = mem::replace(&mut window.refreshing, true);
-                                    element.paint(window, cx);
-                                    window.refreshing = refreshing;
-                                } else {
-                                    window.reuse_paint_at(
-                                        element_state.paint_range.clone(),
-                                        element_state.reuse_placement,
-                                        cx,
-                                    );
-                                }
-                                let paint_end = window.paint_index();
-                                element_state.paint_range = paint_start..paint_end;
+                                window.with_subframe(subframe, |window| {
+                                    let paint_start = window.paint_index();
+                                    if let Some(element) = element {
+                                        let refreshing = mem::replace(&mut window.refreshing, true);
+                                        element.paint(window, cx);
+                                        window.refreshing = refreshing;
+                                    } else {
+                                        window.reuse_paint_at(
+                                            element_state.paint_range.clone(),
+                                            element_state.reuse_placement,
+                                            cx,
+                                        );
+                                    }
+                                    let paint_end = window.paint_index();
+                                    element_state.paint_range = paint_start..paint_end;
+                                });
                             });
 
                             if element_state.moved_since_render {
