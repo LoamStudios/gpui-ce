@@ -3015,6 +3015,8 @@ mod tests {
             ..Default::default()
         });
         scene.insert_primitive(MonochromeSprite {
+            transform: 0,
+            clip: 0,
             order: 0,
             padding: 0,
             bounds: scaled(10.0, 60.0, 30.0, 30.0),
@@ -3024,6 +3026,8 @@ mod tests {
             transformation: Default::default(),
         });
         scene.insert_primitive(PolychromeSprite {
+            transform: 0,
+            clip: 0,
             order: 0,
             grayscale: ShaderBool::Disabled,
             opacity: 1.0,

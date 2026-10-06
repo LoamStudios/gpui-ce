@@ -143,6 +143,8 @@ fn every_primitive_kind_renders() {
     // 3. Shadow (blue, no blur so it is a solid block).
     let shadow_bounds = bounds(90.0, 10.0, 30.0, 30.0);
     scene.insert_primitive(Shadow {
+        transform: 0,
+        clip: 0,
         order: 0,
         blur_radius: ScaledPixels(0.0),
         bounds: shadow_bounds,
@@ -157,6 +159,8 @@ fn every_primitive_kind_renders() {
     // 4. Underline (white, solid).
     let underline_bounds = bounds(130.0, 20.0, 30.0, 4.0);
     scene.insert_primitive(Underline {
+        transform: 0,
+        clip: 0,
         order: 0,
         padding: 0,
         bounds: underline_bounds,
@@ -168,6 +172,8 @@ fn every_primitive_kind_renders() {
     // 5. Monochrome sprite (white coverage tile tinted green).
     let mono_bounds = bounds(10.0, 60.0, 30.0, 30.0);
     scene.insert_primitive(MonochromeSprite {
+        transform: 0,
+        clip: 0,
         order: 0,
         padding: 0,
         bounds: mono_bounds,
@@ -179,6 +185,8 @@ fn every_primitive_kind_renders() {
     // 6. Polychrome sprite (red image).
     let poly_bounds = bounds(50.0, 60.0, 30.0, 30.0);
     scene.insert_primitive(PolychromeSprite {
+        transform: 0,
+        clip: 0,
         order: 0,
         grayscale: ShaderBool::Disabled,
         opacity: 1.0,
@@ -209,6 +217,8 @@ fn every_primitive_kind_renders() {
     .color_space(ColorSpace::Srgb);
     let gradient_drop_bounds = bounds(210.0, 10.0, 40.0, 40.0);
     scene.insert_primitive(Shadow {
+        transform: 0,
+        clip: 0,
         order: 0,
         blur_radius: ScaledPixels(0.0),
         bounds: gradient_drop_bounds,
@@ -221,6 +231,8 @@ fn every_primitive_kind_renders() {
         corner_smoothing: 0.0,
     });
     scene.insert_primitive(Shadow {
+        transform: 0,
+        clip: 0,
         order: 0,
         blur_radius: ScaledPixels(0.0),
         bounds: bounds(266.0, 16.0, 28.0, 28.0),
@@ -374,6 +386,8 @@ fn smoothed_primitives_share_one_contour() {
 
     let image_bounds = bounds(204.0, 10.0, 50.0, 50.0);
     scene.insert_primitive(PolychromeSprite {
+        transform: 0,
+        clip: 0,
         order: 0,
         grayscale: ShaderBool::Disabled,
         opacity: 1.0,
@@ -386,6 +400,8 @@ fn smoothed_primitives_share_one_contour() {
 
     let drop_element = bounds(20.0, 96.0, 50.0, 44.0);
     scene.insert_primitive(Shadow {
+        transform: 0,
+        clip: 0,
         order: 0,
         blur_radius: ScaledPixels(5.0),
         bounds: bounds(25.0, 101.0, 50.0, 44.0),
@@ -416,6 +432,8 @@ fn smoothed_primitives_share_one_contour() {
         ..Default::default()
     });
     scene.insert_primitive(Shadow {
+        transform: 0,
+        clip: 0,
         order: 0,
         blur_radius: ScaledPixels(4.0),
         bounds: bounds(104.0, 98.0, 42.0, 40.0),
