@@ -68,6 +68,17 @@ const _: () = assert!(
     "the scene tables must not reach group 1's registers"
 );
 const DATA_REGISTER: u32 = data_register(shader_interface::DATA_BUFFER_BINDING);
+/// The window's photo tile array, a texture beside the scene tables, and the sampler that
+/// filters it, which group 1's samplers follow.
+const PHOTO_TILES_REGISTER: u32 = global_register(shader_interface::PHOTO_TILES_BINDING);
+const PHOTO_SAMPLER_REGISTER: u32 = global_register(shader_interface::PHOTO_SAMPLER_BINDING);
+const _: () = assert!(
+    (PHOTO_TILES_REGISTER < SCENE_TABLES_REGISTER
+        || PHOTO_TILES_REGISTER >= SCENE_TABLES_REGISTER + 3)
+        && PHOTO_TILES_REGISTER < DATA_REGISTER
+        && PHOTO_SAMPLER_REGISTER < data_register(0),
+    "the photo tiles and their sampler must sit apart from the scene tables, below group 1"
+);
 const PRIMARY_TEXTURE_REGISTER: u32 = data_register(shader_interface::PRIMARY_TEXTURE_BINDING);
 const PRIMARY_SAMPLER_REGISTER: u32 = data_register(shader_interface::PRIMARY_SAMPLER_BINDING);
 const SURFACE_SAMPLER_REGISTER: u32 = data_register(shader_interface::SURFACE_SAMPLER_BINDING);
@@ -265,6 +276,8 @@ struct DirectXGlobalElements {
     transforms: SceneTableBuffer<SceneTransform>,
     clips: SceneTableBuffer<SceneClip>,
     paints: SceneTableBuffer<PaintWord>,
+    /// The window's resident photo tiles, which every batch pipeline's paints may sample.
+    photo_tiles: PhotoTiles,
 }
 
 impl DirectXGlobalElements {
@@ -281,6 +294,25 @@ impl DirectXGlobalElements {
             self.clips.view.clone(),
             self.paints.view.clone(),
         ]
+    }
+
+    /// Binds the photo tile array and its sampler for the pixel stage, where paints are
+    /// evaluated.
+    ///
+    /// # Safety
+    ///
+    /// `device_context` must belong to the device the tiles were created on.
+    unsafe fn bind_photo_tiles(&self, device_context: &ID3D11DeviceContext) {
+        unsafe {
+            device_context.PSSetShaderResources(
+                PHOTO_TILES_REGISTER,
+                Some(slice::from_ref(self.photo_tiles.view())),
+            );
+            device_context.PSSetSamplers(
+                PHOTO_SAMPLER_REGISTER,
+                Some(slice::from_ref(self.photo_tiles.sampler())),
+            );
+        }
     }
 }
 
@@ -1058,6 +1090,9 @@ impl DirectXRenderer {
             &devices.device_context,
             scene.paint_table(),
         )?;
+        self.globals
+            .photo_tiles
+            .upload(&devices.device, &devices.device_context, scene)?;
 
         if !scene.shadows.is_empty() {
             self.pipelines.shadow_pipeline.update_buffer(
@@ -1731,6 +1766,7 @@ impl DirectXRenderer {
             // A composite clipped to a rounded rectangle finds it through the transform table.
             ctx.VSSetShaderResources(SCENE_TABLES_REGISTER, Some(&scene_tables));
             ctx.PSSetShaderResources(SCENE_TABLES_REGISTER, Some(&scene_tables));
+            self.globals.bind_photo_tiles(ctx);
             ctx.PSSetShaderResources(GROUP_TEXTURE_REGISTER, Some(&textures));
             ctx.PSSetShaderResources(MASK_TEXTURE_REGISTER, Some(slice::from_ref(mask)));
             ctx.PSSetSamplers(
@@ -2113,6 +2149,7 @@ impl DirectXGlobalElements {
             transforms: SceneTableBuffer::new(device, "scene_transforms")?,
             clips: SceneTableBuffer::new(device, "scene_clips")?,
             paints: SceneTableBuffer::new(device, "scene_paints")?,
+            photo_tiles: PhotoTiles::new(device)?,
         })
     }
 }
@@ -2351,6 +2388,7 @@ impl<T> PipelineState<T> {
         unsafe {
             ctx.VSSetShaderResources(SCENE_TABLES_REGISTER, Some(&scene_tables));
             ctx.PSSetShaderResources(SCENE_TABLES_REGISTER, Some(&scene_tables));
+            frame.globals.bind_photo_tiles(ctx);
             ctx.VSSetShaderResources(DATA_REGISTER, Some(slice::from_ref(&self.view)));
             ctx.PSSetShaderResources(DATA_REGISTER, Some(slice::from_ref(&self.view)));
             ctx.IASetPrimitiveTopology(topology);

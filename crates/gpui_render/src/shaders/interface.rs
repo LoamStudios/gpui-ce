@@ -151,7 +151,7 @@ pub const GLOBAL_BINDING_COUNT: u32 = 7;
 pub const RECTANGLE_VERTEX_COUNT: u32 = 4;
 pub const FULLSCREEN_TRIANGLE_VERTEX_COUNT: u32 = 3;
 /// D3D11 constant-buffer register of the per-draw instance base for instanced pipelines.
-/// Group-0 cbuffers occupy b0 and b1, and the group-1 uniform lands on b5.
+/// Group-0 cbuffers occupy b0 and b1, and the group-1 uniform lands on b7, after group 0.
 pub const DX11_DRAW_CONSTANTS_REGISTER: u32 = 3;
 /// Metal buffer index of the runtime-array sizes Naga's MSL declares, after every buffer slot.
 pub const MSL_BUFFER_SIZES_SLOT: u32 = native_slot(DATA_BIND_GROUP, DATA_BUFFER_BINDING) + 1;
