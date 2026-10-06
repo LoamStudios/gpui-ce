@@ -273,6 +273,10 @@ name = "data_table"
 path = "examples/bench/data_table.rs"
 
 [[example]]
+name = "canvas_scale"
+path = "examples/bench/canvas_scale.rs"
+
+[[example]]
 name = "paths_bench"
 path = "examples/bench/paths_bench.rs"
 
