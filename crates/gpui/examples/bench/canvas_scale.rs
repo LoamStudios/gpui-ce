@@ -33,6 +33,13 @@
 //! cargo run -p gpui-ce --release --example canvas_scale -- --transform    # a camera transform
 //! ```
 //!
+//! The window is off the screen, where it never shows, and the run draws
+//! and presents each frame itself, as fast as frames finish; it reports how
+//! long each frame's draw and present took as well. A present includes
+//! waiting for a drawable, which Metal hands out at the display's rate even
+//! off the screen, so most of it is that wait. With `--onscreen`, the
+//! window is on the screen and frames come at the display's rate.
+//!
 //! The run lasts one zoom out and back (or one pan), then prints frame times
 //! grouped by how many items were visible, and quits.
 
@@ -190,6 +197,9 @@ struct Stage {
     started: Instant,
     last_frame: Option<Instant>,
     samples: Rc<RefCell<Vec<Sample>>>,
+    /// How long each frame's draw and present took, when the run draws its
+    /// own frames.
+    draws: Rc<RefCell<Vec<(Duration, Duration)>>>,
     finished: bool,
 }
 
@@ -206,6 +216,7 @@ impl Stage {
             started: Instant::now(),
             last_frame: None,
             samples: Rc::new(RefCell::new(Vec::new())),
+            draws: Rc::default(),
             finished: false,
         }
     }
@@ -255,6 +266,18 @@ impl Stage {
             println!(
                 "canvas_scale: cached items rendered {:.1} times per frame",
                 ITEM_RENDERS.load(Ordering::Relaxed) as f64 / samples.len().max(1) as f64
+            );
+        }
+        let draws = self.draws.borrow();
+        if !draws.is_empty() {
+            let mut draw: Vec<f64> = draws.iter().map(|(draw, _)| millis(*draw)).collect();
+            let mut present: Vec<f64> = draws.iter().map(|(_, present)| millis(*present)).collect();
+            println!(
+                "canvas_scale: whole frames: draw median {:.2} ms, p95 {:.2} ms; present median {:.2} ms, p95 {:.2} ms",
+                quantile(&mut draw, 0.5),
+                quantile(&mut draw, 0.95),
+                quantile(&mut present, 0.5),
+                quantile(&mut present, 0.95),
             );
         }
         println!("canvas_scale: visible items  frames   CPU median   CPU p95   interval median");
@@ -677,27 +700,63 @@ fn run_example() {
         .map_or(Motion::Zoom, |zoom| {
             Motion::Pan(zoom.parse().expect("--pan=<zoom>, e.g. --pan=0.4"))
         });
+    let onscreen = args.iter().any(|arg| arg == "--onscreen");
+    let draws: Rc<RefCell<Vec<(Duration, Duration)>>> = Rc::default();
     // A benchmark run never takes the keyboard: the process cannot be
-    // activated, and the window floats above others without focus, so it
-    // keeps drawing without being brought forward.
+    // activated, and the window has no focus.
     application()
         .with_activation_policy(MacActivationPolicy::Prohibited)
         .run(move |cx: &mut App| {
             example_support::load_fonts(cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                        None,
-                        size(px(1600.0), px(1000.0)),
-                        cx,
-                    ))),
-                    kind: WindowKind::PopUp,
-                    focus: false,
-                    ..Default::default()
-                },
-                |_, cx| cx.new(|_| Stage::new(items, draw, motion)),
-            )
-            .unwrap();
+            let window_size = size(px(1600.0), px(1000.0));
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(if onscreen {
+                            Bounds::centered(None, window_size, cx)
+                        } else {
+                            // Off the screen, where it never shows.
+                            Bounds::new(point(px(-10_000.), px(-10_000.)), window_size)
+                        })),
+                        // On the screen, it floats above others, so it keeps
+                        // drawing without being brought forward.
+                        kind: if onscreen {
+                            WindowKind::PopUp
+                        } else {
+                            WindowKind::Normal
+                        },
+                        focus: false,
+                        ..Default::default()
+                    },
+                    |_, cx| {
+                        cx.new(|_| Stage {
+                            draws: draws.clone(),
+                            ..Stage::new(items, draw, motion)
+                        })
+                    },
+                )
+                .unwrap();
+            let window: gpui::AnyWindowHandle = window.into();
+            if !onscreen {
+                // The platform doesn't ask a window off the screen to draw:
+                // draw each frame here, and the next as soon as it's done.
+                cx.spawn(async move |cx| {
+                    loop {
+                        let drawn = cx.update_window(window, |root, window, cx| {
+                            cx.notify(root.entity_id());
+                            let times = window.draw_and_present(cx);
+                            draws.borrow_mut().push(times);
+                        });
+                        if drawn.is_err() {
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(1))
+                            .await;
+                    }
+                })
+                .detach();
+            }
         });
 }
 

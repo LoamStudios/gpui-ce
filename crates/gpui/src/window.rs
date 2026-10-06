@@ -3871,6 +3871,21 @@ impl Window {
         self.invalidator.replace_views(views);
     }
 
+    /// Draws a frame now and presents it, rather than when the platform next
+    /// asks: for a benchmark that paces its own frames in a window off the
+    /// screen, which the platform doesn't ask to draw. Returns how long the
+    /// draw and the present took.
+    #[doc(hidden)]
+    pub fn draw_and_present(&mut self, cx: &mut App) -> (Duration, Duration) {
+        let start = Instant::now();
+        let arena_clear_needed = self.draw(cx);
+        let drawn = start.elapsed();
+        self.present();
+        let presented = start.elapsed() - drawn;
+        arena_clear_needed.clear(cx);
+        (drawn, presented)
+    }
+
     #[profiling::function]
     fn present(&mut self) {
         #[cfg(feature = "profiler")]
