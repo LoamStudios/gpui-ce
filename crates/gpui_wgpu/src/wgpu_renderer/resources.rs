@@ -5,6 +5,7 @@ use std::{
 };
 
 use collections::FxHashMap;
+use smallvec::SmallVec;
 
 use crate::WgpuContext;
 use gpui_render::shaders::{
@@ -62,6 +63,8 @@ pub(super) struct WgpuResources {
     pub(super) target_globals: DynamicUniformBuffer<GlobalUniforms>,
     pub(super) font_rasterization_buffer: wgpu::Buffer,
     scene_tables: SceneTables,
+    /// Tables of the scene chunks drawn this frame, one slot for each distinct chunk.
+    chunk_tables: ChunkTables,
     /// The window's resident photo tiles, bound in group 0.
     photo_tiles: PhotoTiles,
     /// Group 0, whose global uniforms are chosen per target by dynamic offset.
@@ -104,6 +107,27 @@ impl SceneTables {
             paints: self.paints.binding(),
         }
     }
+}
+
+/// The tables of the scene chunks a frame draws, each with a group-0 bind group of its
+/// own that binds them in place of the scene's. Slots are reused from frame to frame.
+#[derive(Default)]
+struct ChunkTables {
+    slots: Vec<ChunkTableSlot>,
+    /// This frame's slot for each chunk scene, by its address: the chunks are held by the
+    /// scene being drawn, so the addresses are stable and distinct for the frame.
+    by_scene: FxHashMap<usize, usize>,
+}
+
+struct ChunkTableSlot {
+    tables: SceneTables,
+    /// Made once the slot's tables and the group-0 resources it shares are in place;
+    /// dropped when either is replaced.
+    bind_group: Option<wgpu::BindGroup>,
+}
+
+fn chunk_key(scene: &gpui::Scene) -> usize {
+    std::ptr::from_ref(scene) as usize
 }
 
 #[derive(Default)]
@@ -230,6 +254,7 @@ impl WgpuResources {
             target_globals,
             font_rasterization_buffer,
             scene_tables,
+            chunk_tables: ChunkTables::default(),
             photo_tiles,
             globals_bind_group,
             globals_bind_group_generation,
@@ -286,6 +311,77 @@ impl WgpuResources {
         true
     }
 
+    /// Uploads the tables of every chunk `scene` draws, at any depth, each into a slot of
+    /// its own with a group-0 bind group for it. Called once the frame's target globals
+    /// are in place, as the bind groups reference them. Returns false when the device
+    /// cannot hold a chunk's tables.
+    pub(super) fn upload_chunk_tables(&mut self, scene: &gpui::Scene) -> bool {
+        self.chunk_tables.by_scene.clear();
+        if scene.chunks.is_empty() {
+            return true;
+        }
+        let transport = self.instances.transport();
+        let mut pending: SmallVec<[&gpui::Scene; 8]> = scene
+            .chunks
+            .iter()
+            .map(|placed| &placed.chunk.scene)
+            .collect();
+        while let Some(chunk) = pending.pop() {
+            let key = chunk_key(chunk);
+            if self.chunk_tables.by_scene.contains_key(&key) {
+                continue;
+            }
+            let index = self.chunk_tables.by_scene.len();
+            self.chunk_tables.by_scene.insert(key, index);
+            if index == self.chunk_tables.slots.len() {
+                self.chunk_tables.slots.push(ChunkTableSlot {
+                    tables: SceneTables::new(&self.device, transport),
+                    bind_group: None,
+                });
+            }
+            let slot = &mut self.chunk_tables.slots[index];
+            let tables = &mut slot.tables;
+            let (Some(transforms_grew), Some(clips_grew), Some(paints_grew)) = (
+                tables
+                    .transforms
+                    .ensure_capacity(&self.device, chunk.transforms().len() as u64),
+                tables
+                    .clips
+                    .ensure_capacity(&self.device, chunk.clips().len() as u64),
+                tables
+                    .paints
+                    .ensure_capacity(&self.device, chunk.paint_table().len() as u64),
+            ) else {
+                return false;
+            };
+            if transforms_grew || clips_grew || paints_grew {
+                slot.bind_group = None;
+            }
+            tables.transforms.write(&self.queue, chunk.transforms());
+            tables.clips.write(&self.queue, chunk.clips());
+            tables.paints.write(&self.queue, chunk.paint_table());
+            if slot.bind_group.is_none() {
+                slot.bind_group = Some(create_globals_bind_group(
+                    &self.device,
+                    &self.bind_group_layouts,
+                    &self.target_globals,
+                    &self.font_rasterization_buffer,
+                    &slot.tables,
+                    &self.photo_tiles,
+                ));
+            }
+            pending.extend(chunk.chunks.iter().map(|placed| &placed.chunk.scene));
+        }
+        true
+    }
+
+    /// The group-0 bind group that binds `chunk`'s tables, uploaded this frame by
+    /// [`Self::upload_chunk_tables`].
+    pub(super) fn chunk_bind_group(&self, chunk: &gpui::Scene) -> Option<&wgpu::BindGroup> {
+        let index = *self.chunk_tables.by_scene.get(&chunk_key(chunk))?;
+        self.chunk_tables.slots[index].bind_group.as_ref()
+    }
+
     /// Copies the tiles the scene's photos placed since the last frame into the photo
     /// tile array, growing it, and rebuilding the group-0 bind group that holds it, as
     /// needed. Called before anything else of the frame is uploaded, as growing the array
@@ -306,6 +402,10 @@ impl WgpuResources {
             &self.photo_tiles,
         );
         self.globals_bind_group_generation = self.target_globals.generation();
+        // The chunks' bind groups share what was just replaced.
+        for slot in &mut self.chunk_tables.slots {
+            slot.bind_group = None;
+        }
     }
 
     pub(super) fn finish_frame_uploads(&self) {
