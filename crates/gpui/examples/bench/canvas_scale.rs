@@ -37,6 +37,7 @@ mod example_support;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -83,6 +84,9 @@ enum Motion {
     Pan(f32),
 }
 
+/// How many times a cached item has been rendered, to tell reuse from misses.
+static ITEM_RENDERS: AtomicUsize = AtomicUsize::new(0);
+
 /// One grid item as an entity of its own, for `Draw::Cached`. It reads the
 /// zoom when it renders, which it does again whenever its size changes.
 struct Item {
@@ -92,6 +96,7 @@ struct Item {
 
 impl Render for Item {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        ITEM_RENDERS.fetch_add(1, Ordering::Relaxed);
         let zoom = self.zoom.get();
         item(div(), self.index, zoom).size_full()
     }
@@ -192,6 +197,12 @@ impl Stage {
             samples.len(),
             self.started.elapsed().as_secs_f32()
         );
+        if self.draw == Draw::Cached {
+            println!(
+                "canvas_scale: cached items rendered {:.1} times per frame",
+                ITEM_RENDERS.load(Ordering::Relaxed) as f64 / samples.len().max(1) as f64
+            );
+        }
         println!("canvas_scale: visible items  frames   CPU median   CPU p95   interval median");
         for (low, high) in buckets {
             let in_bucket: Vec<&Sample> = samples
