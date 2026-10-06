@@ -56,6 +56,11 @@ impl Display for EntityId {
 pub(crate) struct EntityMap {
     entities: SecondaryMap<EntityId, Box<dyn Any>>,
     pub accessed_entities: RefCell<FxHashSet<EntityId>>,
+    /// Every access while [`Self::record_accesses`] is recording, in order,
+    /// so a recording reads only its own.
+    access_log: RefCell<Vec<EntityId>>,
+    /// How many recordings are under way.
+    recordings: std::cell::Cell<usize>,
     ref_counts: Arc<RwLock<EntityRefCounts>>,
 }
 
@@ -72,6 +77,8 @@ impl EntityMap {
         Self {
             entities: SecondaryMap::new(),
             accessed_entities: RefCell::new(FxHashSet::default()),
+            access_log: RefCell::new(Vec::new()),
+            recordings: std::cell::Cell::new(0),
             ref_counts: Arc::new(RwLock::new(EntityRefCounts {
                 counts: SlotMap::with_key(),
                 dropped_entity_ids: Vec::new(),
@@ -121,8 +128,7 @@ impl EntityMap {
     where
         T: 'static,
     {
-        let mut accessed_entities = self.accessed_entities.get_mut();
-        accessed_entities.insert(slot.entity_id);
+        self.note_access(slot.entity_id);
 
         let handle = slot.0;
         self.entities.insert(handle.entity_id, Box::new(entity));
@@ -133,8 +139,7 @@ impl EntityMap {
     #[track_caller]
     pub fn lease<T>(&mut self, pointer: &Entity<T>) -> Lease<T> {
         self.assert_valid_context(pointer);
-        let mut accessed_entities = self.accessed_entities.get_mut();
-        accessed_entities.insert(pointer.entity_id);
+        self.note_access(pointer.entity_id);
 
         let entity = Some(
             self.entities
@@ -155,8 +160,7 @@ impl EntityMap {
 
     pub fn read<T: 'static>(&self, entity: &Entity<T>) -> &T {
         self.assert_valid_context(entity);
-        let mut accessed_entities = self.accessed_entities.borrow_mut();
-        accessed_entities.insert(entity.entity_id);
+        self.note_access(entity.entity_id);
 
         self.entities
             .get(entity.entity_id)
@@ -172,9 +176,37 @@ impl EntityMap {
     }
 
     pub fn extend_accessed(&mut self, entities: &FxHashSet<EntityId>) {
-        self.accessed_entities
-            .get_mut()
-            .extend(entities.iter().copied());
+        for &entity_id in entities {
+            self.note_access(entity_id);
+        }
+    }
+
+    /// Notes that `entity_id` was accessed this frame, and by any recording
+    /// under way.
+    fn note_access(&self, entity_id: EntityId) {
+        self.accessed_entities.borrow_mut().insert(entity_id);
+        if self.recordings.get() > 0 {
+            self.access_log.borrow_mut().push(entity_id);
+        }
+    }
+
+    /// Starts recording the entities accessed, and returns where the
+    /// recording starts, for [`Self::finish_recording`].
+    pub fn start_recording(&self) -> usize {
+        self.recordings.set(self.recordings.get() + 1);
+        self.access_log.borrow().len()
+    }
+
+    /// The entities accessed since the recording that started at `start`.
+    pub fn finish_recording(&self, start: usize) -> FxHashSet<EntityId> {
+        let mut log = self.access_log.borrow_mut();
+        let accessed = log[start..].iter().copied().collect();
+        let recordings = self.recordings.get() - 1;
+        self.recordings.set(recordings);
+        if recordings == 0 {
+            log.clear();
+        }
+        accessed
     }
 
     pub fn clear_accessed(&mut self) {
