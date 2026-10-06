@@ -378,3 +378,87 @@ fn a_cached_view_is_placed_under_a_new_rotation_by_the_gpu(cx: &mut TestAppConte
     card_quad(cx, window, false);
     assert_eq!(renders.get(), 3, "rendered again under a scaling change");
 }
+
+struct Icon;
+
+impl Render for Icon {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        crate::svg()
+            .size(px(20.))
+            .text_color(red())
+            .data(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10"/></svg>"#)
+    }
+}
+
+struct ZoomedIcon {
+    icon: Entity<Icon>,
+    transform: Rc<Cell<kurbo::Affine>>,
+}
+
+impl Render for ZoomedIcon {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let mut style = crate::StyleRefinement::default();
+        style.size.width = Some(px(20.).into());
+        style.size.height = Some(px(20.).into());
+        div().size(px(400.)).relative().child(
+            div()
+                .absolute()
+                .left(px(100.))
+                .top(px(100.))
+                .size(px(20.))
+                .transform(self.transform.get())
+                .child(self.icon.clone().cached(style)),
+        )
+    }
+}
+
+#[crate::test]
+fn a_cached_svg_is_rasterized_again_under_a_new_zoom(cx: &mut TestAppContext) {
+    let transform = Rc::new(Cell::new(kurbo::Affine::scale(1.)));
+    let window: AnyWindowHandle = cx
+        .add_window({
+            let transform = transform.clone();
+            move |_, cx| ZoomedIcon {
+                icon: cx.new(|_| Icon),
+                transform,
+            }
+        })
+        .into();
+    let sprite = |cx: &mut TestAppContext, fresh: bool| {
+        cx.update_window(window, |root, window, cx| {
+            let root = root.downcast::<ZoomedIcon>().unwrap();
+            if fresh {
+                let icon = root.read(cx).icon.clone();
+                icon.update(cx, |_, cx| cx.notify());
+            }
+            root.update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear(cx);
+            window.rendered_frame.scene.monochrome_sprites[0]
+        })
+        .unwrap()
+    };
+    let painted = sprite(cx, false);
+
+    transform.set(kurbo::Affine::scale(2.));
+    let reused = sprite(cx, false);
+    assert_eq!(reused.transform, 0, "a zoom keeps the icon aligned");
+    assert_ne!(
+        reused.tile.tile_id, painted.tile.tile_id,
+        "from a new raster"
+    );
+    assert_eq!(
+        reused.tile.bounds.size.width.0,
+        painted.tile.bounds.size.width.0 * 2,
+        "at the size it now appears"
+    );
+
+    let fresh = sprite(cx, true);
+    assert_eq!(
+        reused.tile.tile_id, fresh.tile.tile_id,
+        "the raster painting it there uses"
+    );
+    assert_eq!(
+        reused.bounds, fresh.bounds,
+        "where painting it there puts it"
+    );
+}

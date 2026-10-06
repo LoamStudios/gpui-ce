@@ -165,16 +165,17 @@ impl Scene {
     ///
     /// A placement that keeps the recording aligned with the viewport, as a
     /// zoom does, maps its geometry exactly, and `rasterize` rasterizes its
-    /// glyphs again at the size they now appear, so the replay is as sharp as
-    /// painting it again. Any other placement is applied on the GPU through
-    /// the transform table, with glyphs as they were rasterized.
+    /// glyphs and SVGs again, from their sources placed where they now are, so
+    /// the replay is as sharp as painting it again. Any other placement is
+    /// applied on the GPU through the transform table, with sprites as they
+    /// were rasterized.
     pub(crate) fn replay_placed(
         &mut self,
         range: Range<usize>,
         prev_scene: &Scene,
         placement: &TransformationMatrix,
         content_mask: &ContentMask<ScaledPixels>,
-        rasterize: &mut dyn FnMut(&GlyphSource, &UniformPlacement) -> Option<PlacedGlyph>,
+        rasterize: &mut dyn FnMut(RasterSource) -> Option<PlacedRaster>,
     ) {
         let uniform = UniformPlacement::of(placement);
         let mut adopted = AdoptedEntries::default();
@@ -194,26 +195,26 @@ impl Scene {
                     );
                     self.insert_primitive(primitive);
                 }
-                PaintOperation::Glyph(sprite, source) => {
+                PaintOperation::Raster(sprite, source) => {
                     let mut sprite = sprite.clone();
                     if let Some(uniform) = uniform.as_ref().filter(|_| sprite.transform() == 0) {
-                        let Some(glyph) = rasterize(source, uniform) else {
+                        let Some(raster) = rasterize(source.placed(uniform)) else {
                             continue;
                         };
                         sprite.place_uniformly(uniform, content_mask);
                         match &mut sprite {
                             Primitive::MonochromeSprite(sprite) => {
-                                (sprite.bounds, sprite.tile) = (glyph.bounds, glyph.tile);
+                                (sprite.bounds, sprite.tile) = (raster.bounds, raster.tile);
                             }
                             Primitive::SubpixelSprite(sprite) => {
-                                (sprite.bounds, sprite.tile) = (glyph.bounds, glyph.tile);
+                                (sprite.bounds, sprite.tile) = (raster.bounds, raster.tile);
                             }
                             Primitive::PolychromeSprite(sprite) => {
-                                (sprite.bounds, sprite.tile) = (glyph.bounds, glyph.tile);
+                                (sprite.bounds, sprite.tile) = (raster.bounds, raster.tile);
                             }
                             _ => {}
                         }
-                        self.insert_glyph(sprite, glyph.source);
+                        self.insert_raster(sprite, raster.source);
                     } else {
                         self.place(
                             &mut sprite,
@@ -224,7 +225,7 @@ impl Scene {
                             uniform.as_ref(),
                             content_mask,
                         );
-                        self.insert_glyph(sprite, (**source).clone());
+                        self.insert_raster(sprite, (**source).clone());
                     }
                 }
                 PaintOperation::Surface { surface, opacity } => {
@@ -482,7 +483,7 @@ impl Scene {
 
     /// Inserts a glyph's sprite, recording where it came from so that a
     /// replay at another scale can rasterize it again.
-    pub(crate) fn insert_glyph(&mut self, sprite: Primitive, source: GlyphSource) {
+    pub(crate) fn insert_raster(&mut self, sprite: Primitive, source: RasterSource) {
         self.insert_primitive_with_surface_opacity(sprite, None, Some(Box::new(source)));
     }
 
@@ -490,7 +491,7 @@ impl Scene {
         &mut self,
         mut primitive: Primitive,
         surface_opacity: Option<f32>,
-        glyph_source: Option<Box<GlyphSource>>,
+        raster_source: Option<Box<RasterSource>>,
     ) {
         self.is_finished = false;
         let clipped_bounds = self
@@ -526,7 +527,7 @@ impl Scene {
                 .copied()
                 .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds))
         };
-        self.push_primitive(primitive, order, surface_opacity, glyph_source);
+        self.push_primitive(primitive, order, surface_opacity, raster_source);
     }
 
     /// Stores `primitive` at `order`, which has been assigned already: as
@@ -537,7 +538,7 @@ impl Scene {
         mut primitive: Primitive,
         order: DrawOrder,
         surface_opacity: Option<f32>,
-        glyph_source: Option<Box<GlyphSource>>,
+        raster_source: Option<Box<RasterSource>>,
     ) {
         primitive.set_order(order);
         if let Primitive::FilterBoundary(boundary) = &primitive
@@ -571,9 +572,9 @@ impl Scene {
                 surface: surface.clone(),
                 opacity,
             });
-        } else if let Some(source) = glyph_source {
+        } else if let Some(source) = raster_source {
             self.paint_operations
-                .push(PaintOperation::Glyph(primitive, source));
+                .push(PaintOperation::Raster(primitive, source));
         } else {
             self.paint_operations
                 .push(PaintOperation::Primitive(primitive));
@@ -618,8 +619,8 @@ impl Scene {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
-                PaintOperation::Glyph(primitive, source) => {
-                    self.insert_glyph(primitive.clone(), (**source).clone())
+                PaintOperation::Raster(primitive, source) => {
+                    self.insert_raster(primitive.clone(), (**source).clone())
                 }
                 PaintOperation::Surface { surface, opacity } => {
                     self.insert_surface(surface.clone(), *opacity)
@@ -657,12 +658,12 @@ impl Scene {
                     self.adopt_table_entries(&mut primitive, prev_scene, &mut adopted, offset);
                     self.insert_primitive(primitive);
                 }
-                PaintOperation::Glyph(primitive, source) => {
+                PaintOperation::Raster(primitive, source) => {
                     let mut primitive = primitive.clone();
                     primitive.translate(offset, content_mask);
                     self.adopt_table_entries(&mut primitive, prev_scene, &mut adopted, offset);
                     let source = source.moved_by(offset, &primitive);
-                    self.insert_glyph(primitive, source);
+                    self.insert_raster(primitive, source);
                 }
                 PaintOperation::Surface { surface, opacity } => {
                     let mut primitive = Primitive::Surface(surface.clone());
@@ -713,9 +714,11 @@ impl Scene {
         };
         let (mut first, mut last) = (DrawOrder::MAX, DrawOrder::MIN);
         for operation in operations {
-            let (mut primitive, surface_opacity, glyph_source) = match operation {
+            let (mut primitive, surface_opacity, raster_source) = match operation {
                 PaintOperation::Primitive(primitive) => (primitive.clone(), None, None),
-                PaintOperation::Glyph(primitive, source) => (primitive.clone(), None, Some(source)),
+                PaintOperation::Raster(primitive, source) => {
+                    (primitive.clone(), None, Some(source))
+                }
                 PaintOperation::Surface { surface, opacity } => {
                     (Primitive::Surface(surface.clone()), Some(*opacity), None)
                 }
@@ -742,12 +745,12 @@ impl Scene {
             first = first.min(order);
             last = last.max(order);
             cover(clipped);
-            let glyph_source =
-                glyph_source.map(|source| Box::new(source.moved_by(offset, &primitive)));
+            let raster_source =
+                raster_source.map(|source| Box::new(source.moved_by(offset, &primitive)));
             run.push(ReplayOperation::Primitive(
                 primitive,
                 surface_opacity,
-                glyph_source,
+                raster_source,
             ));
         }
 
@@ -758,9 +761,9 @@ impl Scene {
         };
         for operation in run.drain(..) {
             match operation {
-                ReplayOperation::Primitive(primitive, surface_opacity, glyph_source) => {
+                ReplayOperation::Primitive(primitive, surface_opacity, raster_source) => {
                     let order = base + (primitive.order() - first);
-                    self.push_primitive(primitive, order, surface_opacity, glyph_source);
+                    self.push_primitive(primitive, order, surface_opacity, raster_source);
                 }
                 // Recorded so that this frame can be replayed in turn; the
                 // orders inside were assigned above.
@@ -918,8 +921,47 @@ pub(crate) enum PrimitiveKind {
     FilterBoundaryEnd,
 }
 
-/// Where a glyph's sprite came from: what a replay at another scale needs to
-/// rasterize the glyph again, at the size it then appears.
+/// Where a rasterized sprite came from: what a replay at another scale needs
+/// to rasterize it again, at the size it then appears.
+#[derive(Clone, Debug)]
+pub(crate) enum RasterSource {
+    Glyph(GlyphSource),
+    Svg(SvgSource),
+}
+
+impl RasterSource {
+    /// The source of `sprite` once moved by `offset`: a sprite placed by a
+    /// transform-table entry moves with the entry, not its position.
+    fn moved_by(&self, offset: Point<ScaledPixels>, sprite: &Primitive) -> Self {
+        let mut source = self.clone();
+        if sprite.transform() == 0 {
+            match &mut source {
+                RasterSource::Glyph(glyph) => glyph.origin = glyph.origin + offset,
+                RasterSource::Svg(svg) => svg.bounds.origin = svg.bounds.origin + offset,
+            }
+        }
+        source
+    }
+
+    /// The source of a sprite placed by `placement`: where it now is, at the
+    /// size it now appears.
+    pub(crate) fn placed(&self, placement: &UniformPlacement) -> Self {
+        match self {
+            RasterSource::Glyph(glyph) => {
+                let mut glyph = glyph.clone();
+                glyph.params.scale_factor *= placement.scale;
+                glyph.origin = placement.point(glyph.origin);
+                RasterSource::Glyph(glyph)
+            }
+            RasterSource::Svg(svg) => RasterSource::Svg(SvgSource {
+                bounds: placement.bounds(svg.bounds),
+                ..svg.clone()
+            }),
+        }
+    }
+}
+
+/// Where a glyph's sprite came from.
 #[derive(Clone, Debug)]
 pub(crate) struct GlyphSource {
     /// The parameters it was rasterized with.
@@ -931,16 +973,16 @@ pub(crate) struct GlyphSource {
     pub(crate) color: bool,
 }
 
-impl GlyphSource {
-    /// The source of `sprite` once moved by `offset`: a sprite placed by a
-    /// transform-table entry moves with the entry, not its origin.
-    fn moved_by(&self, offset: Point<ScaledPixels>, sprite: &Primitive) -> Self {
-        let mut source = self.clone();
-        if sprite.transform() == 0 {
-            source.origin = source.origin + offset;
-        }
-        source
-    }
+/// Where an SVG's sprite came from.
+#[derive(Clone, Debug)]
+pub(crate) struct SvgSource {
+    /// The SVG's asset path, which also keys its rasters in the atlas.
+    pub(crate) path: crate::SharedString,
+    /// Its bytes, when they were given rather than loaded from `path`.
+    pub(crate) data: Option<std::sync::Arc<[u8]>>,
+    /// The bounds it was fitted into, in device pixels, in the space of its
+    /// sprite's transform-table entry.
+    pub(crate) bounds: Bounds<ScaledPixels>,
 }
 
 /// A placement that scales uniformly by a positive factor, then translates:
@@ -1000,11 +1042,11 @@ impl UniformPlacement {
     }
 }
 
-/// A glyph rasterized again for a replay; see [`Scene::replay_placed`].
-pub(crate) struct PlacedGlyph {
+/// A sprite rasterized again for a replay; see [`Scene::replay_placed`].
+pub(crate) struct PlacedRaster {
     pub(crate) bounds: Bounds<ScaledPixels>,
     pub(crate) tile: AtlasTile,
-    pub(crate) source: GlyphSource,
+    pub(crate) source: RasterSource,
 }
 
 /// The transform-table entry for a replay's placement itself, made the first
@@ -1023,7 +1065,7 @@ struct AdoptedEntries {
 
 /// A paint operation being replayed as part of a run, moved and clipped.
 enum ReplayOperation {
-    Primitive(Primitive, Option<f32>, Option<Box<GlyphSource>>),
+    Primitive(Primitive, Option<f32>, Option<Box<RasterSource>>),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
 }
@@ -1031,7 +1073,7 @@ enum ReplayOperation {
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     /// A glyph's sprite, with where it came from.
-    Glyph(Primitive, Box<GlyphSource>),
+    Raster(Primitive, Box<RasterSource>),
     Surface {
         surface: PaintSurface,
         opacity: f32,
@@ -2461,7 +2503,7 @@ mod tests {
                                 scene.push_layer((*bounds + offset).intersect(&clip.bounds))
                             }
                             PaintOperation::EndLayer => scene.pop_layer(),
-                            PaintOperation::Surface { .. } | PaintOperation::Glyph(..) => {
+                            PaintOperation::Surface { .. } | PaintOperation::Raster(..) => {
                                 unreachable!()
                             }
                         }
@@ -2519,7 +2561,7 @@ mod tests {
             bounds: Bounds::<DevicePixels>::default(),
         };
         let mut rendered = Scene::default();
-        rendered.insert_glyph(
+        rendered.insert_raster(
             Primitive::MonochromeSprite(MonochromeSprite {
                 order: 0,
                 padding: 0,
@@ -2531,11 +2573,11 @@ mod tests {
                 transform: 0,
                 clip: 0,
             }),
-            GlyphSource {
+            RasterSource::Glyph(GlyphSource {
                 params,
                 origin: point(sp(10.25), sp(20.)),
                 color: false,
-            },
+            }),
         );
 
         let mut replayed = Scene::default();
@@ -2552,12 +2594,12 @@ mod tests {
                 bounds: Bounds::new(point(sp(0.), sp(0.)), Size::new(sp(200.), sp(200.))),
                 ..Default::default()
             },
-            &mut |source, placement| {
-                let mut source = source.clone();
-                source.params.scale_factor *= placement.scale;
-                source.origin = placement.point(source.origin);
-                asked = Some(source.clone());
-                Some(PlacedGlyph {
+            &mut |source| {
+                let RasterSource::Glyph(glyph) = &source else {
+                    panic!("a glyph's source")
+                };
+                asked = Some(glyph.clone());
+                Some(PlacedRaster {
                     bounds: Bounds::new(point(sp(25.), sp(35.)), Size::new(sp(16.), sp(24.))),
                     tile: tile(2),
                     source,
@@ -2575,7 +2617,7 @@ mod tests {
             Bounds::new(point(sp(25.), sp(35.)), Size::new(sp(16.), sp(24.)))
         );
         assert!(
-            matches!(&replayed.paint_operations[0], PaintOperation::Glyph(_, source) if source.params.scale_factor == 4.),
+            matches!(&replayed.paint_operations[0], PaintOperation::Raster(_, source) if matches!(&**source, RasterSource::Glyph(glyph) if glyph.params.scale_factor == 4.)),
             "and recorded with its new source, for the next replay"
         );
     }

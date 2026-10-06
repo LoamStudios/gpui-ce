@@ -76,7 +76,7 @@ use crate::profiler;
 
 pub(crate) mod a11y;
 mod transform;
-use crate::scene::{GlyphSource, PlacedGlyph, UniformPlacement};
+use crate::scene::{GlyphSource, PlacedRaster, RasterSource, SvgSource};
 pub(crate) use transform::{
     ElementSpace, HitboxClip, Placement, TransformedClip, transformed_bounds,
 };
@@ -124,6 +124,43 @@ fn rasterize_glyph(
         format: entry.format,
         source,
     }))
+}
+
+/// Rasterizes the SVG `source` describes, through the atlas, fitted and
+/// centered in its bounds: its sprite's bounds and tile, or `None` for an SVG
+/// that could not be loaded.
+fn rasterize_svg(
+    atlas: &Arc<dyn PlatformAtlas>,
+    svg_renderer: &crate::SvgRenderer,
+    source: &SvgSource,
+) -> Result<Option<(Bounds<ScaledPixels>, AtlasTile)>> {
+    let params = RenderSvgParams {
+        path: source.path.clone(),
+        size: source
+            .bounds
+            .size
+            .map(|pixels| DevicePixels::from((pixels.0 * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32)),
+    };
+    let Some(tile) = atlas.get_or_insert_with(&params.clone().into(), &mut || {
+        let Some((size, bytes)) =
+            svg_renderer.render_alpha_mask(&params, source.data.as_deref())?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((size, Cow::Owned(bytes))))
+    })?
+    else {
+        return Ok(None);
+    };
+    let size = tile
+        .bounds
+        .size
+        .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR));
+    let origin = source.bounds.center() - point(size.width / 2., size.height / 2.);
+    let bounds = Bounds { origin, size }
+        .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
+        .map_size(|size| size.ceil());
+    Ok(Some((bounds, tile)))
 }
 
 fn quantize_glyph_origin(origin: Point<ScaledPixels>) -> (Point<ScaledPixels>, Point<u8>) {
@@ -3841,6 +3878,7 @@ impl Window {
                     window.reuse_paint_at(
                         deferred_draw.paint_range.clone(),
                         deferred_draw.reuse_placement,
+                        cx,
                     );
                 });
             }
@@ -4034,7 +4072,12 @@ impl Window {
 
     /// Reuses the paint records in `range` of the rendered frame, with the
     /// scene primitives moved by `offset`; see [`Self::reuse_prepaint_at`].
-    pub(crate) fn reuse_paint_at(&mut self, range: Range<PaintIndex>, placement: Placement) {
+    pub(crate) fn reuse_paint_at(
+        &mut self,
+        range: Range<PaintIndex>,
+        placement: Placement,
+        cx: &App,
+    ) {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -4089,16 +4132,24 @@ impl Window {
                     &self.rendered_frame.scene,
                     &device_placement,
                     &clip,
-                    &mut |source: &GlyphSource, placement: &UniformPlacement| {
-                        let mut source = source.clone();
-                        source.params.scale_factor *= placement.scale;
-                        source.origin = placement.point(source.origin);
-                        let glyph = rasterize_glyph(atlas, text_system, source).ok()??;
-                        Some(PlacedGlyph {
-                            bounds: glyph.bounds,
-                            tile: glyph.tile,
-                            source: glyph.source,
-                        })
+                    &mut |source| match source {
+                        RasterSource::Glyph(source) => {
+                            let glyph = rasterize_glyph(atlas, text_system, source).ok()??;
+                            Some(PlacedRaster {
+                                bounds: glyph.bounds,
+                                tile: glyph.tile,
+                                source: RasterSource::Glyph(glyph.source),
+                            })
+                        }
+                        RasterSource::Svg(source) => {
+                            let (bounds, tile) =
+                                rasterize_svg(atlas, &cx.svg_renderer, &source).ok()??;
+                            Some(PlacedRaster {
+                                bounds,
+                                tile,
+                                source: RasterSource::Svg(source),
+                            })
+                        }
                     },
                 );
             }
@@ -5310,7 +5361,7 @@ impl Window {
         let source = glyph.source;
         match format {
             RasterizedGlyphFormat::AlphaMask => {
-                self.next_frame.scene.insert_glyph(
+                self.next_frame.scene.insert_raster(
                     MonochromeSprite {
                         transform,
                         clip,
@@ -5323,11 +5374,11 @@ impl Window {
                         transformation: TransformationMatrix::unit(),
                     }
                     .into(),
-                    source,
+                    RasterSource::Glyph(source),
                 );
             }
             RasterizedGlyphFormat::BgraSubpixelMask => {
-                self.next_frame.scene.insert_glyph(
+                self.next_frame.scene.insert_raster(
                     SubpixelSprite {
                         transform,
                         clip,
@@ -5340,11 +5391,11 @@ impl Window {
                         transformation: TransformationMatrix::unit(),
                     }
                     .into(),
-                    source,
+                    RasterSource::Glyph(source),
                 );
             }
             RasterizedGlyphFormat::BgraColor => {
-                self.next_frame.scene.insert_glyph(
+                self.next_frame.scene.insert_raster(
                     PolychromeSprite {
                         transform,
                         clip,
@@ -5358,7 +5409,7 @@ impl Window {
                         opacity,
                     }
                     .into(),
-                    source,
+                    RasterSource::Glyph(source),
                 );
             }
         }
@@ -5447,7 +5498,21 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         path: SharedString,
-        mut data: Option<&[u8]>,
+        data: Option<&[u8]>,
+        transformation: TransformationMatrix,
+        color: Hsla,
+        cx: &App,
+    ) -> Result<()> {
+        self.paint_svg_shared(bounds, path, data.map(Arc::from), transformation, color, cx)
+    }
+
+    /// [`Self::paint_svg`] with bytes that are already shared, which its
+    /// sprite keeps to rasterize them again when replayed at another scale.
+    pub(crate) fn paint_svg_shared(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        path: SharedString,
+        data: Option<Arc<[u8]>>,
         transformation: TransformationMatrix,
         color: Hsla,
         cx: &App,
@@ -5455,56 +5520,32 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let (transform, clip) = (self.scene_transform(), self.scene_clip());
-
         let element_opacity = self.element_opacity();
-        let bounds = self.snap_bounds(bounds);
-
-        let params = RenderSvgParams {
+        let source = SvgSource {
             path,
-            size: bounds.size.map(|pixels| {
-                DevicePixels::from((pixels.0 * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32)
-            }),
+            data,
+            bounds: self.snap_bounds(bounds),
         };
-
-        let Some(tile) =
-            self.sprite_atlas
-                .get_or_insert_with(&params.clone().into(), &mut || {
-                    let Some((size, bytes)) = cx.svg_renderer.render_alpha_mask(&params, data)?
-                    else {
-                        return Ok(None);
-                    };
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
+        let Some((bounds, tile)) = rasterize_svg(&self.sprite_atlas, &cx.svg_renderer, &source)?
         else {
             return Ok(());
         };
         let content_mask = self.snapped_content_mask();
-        let svg_bounds = Bounds {
-            origin: bounds.center()
-                - Point::new(
-                    ScaledPixels(tile.bounds.size.width.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
-                    ScaledPixels(tile.bounds.size.height.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
-                ),
-            size: tile
-                .bounds
-                .size
-                .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR)),
-        };
-        let final_bounds = svg_bounds
-            .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
-            .map_size(|size| size.ceil());
-
-        self.next_frame.scene.insert_primitive(MonochromeSprite {
-            transform,
-            clip,
-            order: 0,
-            padding: 0,
-            bounds: final_bounds,
-            content_mask,
-            color: color.opacity(element_opacity).into(),
-            tile,
-            transformation,
-        });
+        self.next_frame.scene.insert_raster(
+            MonochromeSprite {
+                transform,
+                clip,
+                order: 0,
+                padding: 0,
+                bounds,
+                content_mask,
+                color: color.opacity(element_opacity).into(),
+                tile,
+                transformation,
+            }
+            .into(),
+            RasterSource::Svg(source),
+        );
 
         Ok(())
     }

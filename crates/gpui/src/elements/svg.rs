@@ -152,10 +152,10 @@ impl Element for Svg {
                 if let Some((data, path)) = self.data.as_ref().zip(self.data_path.as_ref()) {
                     if let Some(color) = style.text.color {
                         window
-                            .paint_svg(
+                            .paint_svg_shared(
                                 bounds,
                                 path.clone(),
-                                Some(&**data),
+                                Some(data.clone()),
                                 transformation,
                                 color,
                                 cx,
@@ -173,10 +173,10 @@ impl Element for Svg {
                     };
 
                     window
-                        .paint_svg(
+                        .paint_svg_shared(
                             bounds,
                             path.clone(),
-                            Some(&bytes),
+                            Some(bytes),
                             transformation,
                             color,
                             cx,

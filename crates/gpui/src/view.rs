@@ -760,6 +760,7 @@ impl<V: View> Element for ViewElement<V> {
                                     window.reuse_paint_at(
                                         element_state.paint_range.clone(),
                                         element_state.reuse_placement,
+                                        cx,
                                     );
                                 }
                                 let paint_end = window.paint_index();
