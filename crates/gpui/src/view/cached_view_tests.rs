@@ -801,3 +801,66 @@ fn cached_view_keeps_the_clips_inside_it_when_moved(cx: &mut TestAppContext) {
         "the well still cuts the card, where the panel now is"
     );
 }
+
+/// A cached view inside one that was reused for a frame, then rendered
+/// again, is drawn where it should be. It is rendered again too: a view that
+/// renders renders the cached views inside it (`Window::refreshing`), since
+/// their records index the frame they were made in, which may be older than
+/// the one before. Reusing them needs every frame list kept in subframes
+/// (decision 006 of workroom-canvas-gpui); then this counts one render.
+#[crate::test]
+fn cached_view_inside_a_reused_one_is_drawn_right_after_it_renders_again(cx: &mut TestAppContext) {
+    let renders = Rc::new(Cell::new(0));
+    let scroll = Rc::new(Cell::new(30.));
+    let panel = Rc::new(std::cell::RefCell::new(None));
+    let window = cx.add_window({
+        let (renders, scroll, panel) = (renders.clone(), scroll.clone(), panel.clone());
+        move |_, cx| {
+            let entity = cx.new(|cx| Panel {
+                card: cx.new(|_| Card { renders }),
+            });
+            *panel.borrow_mut() = Some(entity.clone());
+            PanelViewport {
+                panel: entity,
+                scroll,
+            }
+        }
+    });
+    let window = AnyWindowHandle::from(window);
+    let panel = panel.borrow().clone().unwrap();
+    let draw = |cx: &mut TestAppContext, notify_panel: bool| {
+        cx.update_window(window, |root, window, cx| {
+            root.downcast::<PanelViewport>()
+                .unwrap()
+                .update(cx, |_, cx| cx.notify());
+            if notify_panel {
+                panel.update(cx, |_, cx| cx.notify());
+            }
+            window.draw(cx).clear(cx)
+        })
+        .unwrap();
+    };
+
+    // The panel moves: it is reused, with the card inside it untouched.
+    scroll.set(40.);
+    draw(cx, false);
+    // The panel renders again back where the card was recorded, which the
+    // panel's well clips, so the card is reused only where it was: from
+    // records made two frames ago.
+    scroll.set(30.);
+    draw(cx, true);
+    // And once more, with both reused.
+    draw(cx, false);
+
+    assert_eq!(renders.get(), 2, "the card renders again with the panel");
+    assert_eq!(
+        quads(cx, window),
+        vec![(50., 50., 20., 20.), (50., 50., 100., 60.)],
+        "the card is drawn where the panel is"
+    );
+    assert_eq!(
+        hitboxes(cx, window).len(),
+        1,
+        "the card's hitbox is kept once"
+    );
+}
