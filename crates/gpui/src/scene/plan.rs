@@ -76,6 +76,9 @@ impl ScenePlan {
             region: Option<Bounds<ScaledPixels>>,
             /// The region of its mask group, once drawn, for a masked group.
             mask_region: Option<Bounds<ScaledPixels>>,
+            /// The requirements before it began: what they return to if the
+            /// group is dropped, with all it holds.
+            requirements: ScenePlanRequirements,
         }
         let union = |region: &mut Option<Bounds<ScaledPixels>>, bounds: Bounds<ScaledPixels>| {
             *region = Some(region.map_or(bounds, |region| region.union(&bounds)));
@@ -93,6 +96,7 @@ impl ScenePlan {
                             boundary_index,
                             region: None,
                             mask_region: None,
+                            requirements,
                         });
                         commands.push(RenderCommand::BeginGroup {
                             boundary_index,
@@ -116,6 +120,7 @@ impl ScenePlan {
                                     .filter(|region| !region.is_empty());
                                 let Some(region) = region else {
                                     commands.truncate(group.command);
+                                    requirements = group.requirements;
                                     continue;
                                 };
                                 GroupTarget::Isolated { region }
@@ -125,6 +130,7 @@ impl ScenePlan {
                             }
                             None if matched && start.masked => {
                                 commands.truncate(group.command);
+                                requirements = group.requirements;
                                 continue;
                             }
                             _ => GroupTarget::Inline,

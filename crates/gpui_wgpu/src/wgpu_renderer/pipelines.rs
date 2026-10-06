@@ -12,6 +12,9 @@ use gpui_render::{
 };
 use std::num::NonZeroU64;
 
+/// The group composite's mask texture, `MASK_TEXTURE` in the group shader.
+const GROUP_MASK_TEXTURE_BINDING: u32 = 4;
+
 /// Group-1 payload: a storage buffer on modern tiers, a data texture plus per-batch
 /// range uniform on downlevel.
 pub(super) enum InstanceBindingSource<'a> {
@@ -368,6 +371,7 @@ impl WgpuBindGroupLayouts {
         source: &wgpu::TextureView,
         backdrop: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
+        mask: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("group"),
@@ -388,6 +392,10 @@ impl WgpuBindGroupLayouts {
                 wgpu::BindGroupEntry {
                     binding: shader::SURFACE_SAMPLER_BINDING,
                     resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: GROUP_MASK_TEXTURE_BINDING,
+                    resource: wgpu::BindingResource::TextureView(mask),
                 },
             ],
         })
@@ -831,7 +839,7 @@ mod tests {
         ))]
         let _surface = layouts.create_surface(device, binding(), &view, &view, &sampler);
         let _blur = layouts.create_blur(device, binding(), &view, &sampler);
-        let _group = layouts.create_group(device, binding(), &view, &view, &sampler);
+        let _group = layouts.create_group(device, binding(), &view, &view, &sampler, &view);
         Ok(())
     }
 
