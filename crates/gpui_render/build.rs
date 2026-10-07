@@ -5,6 +5,8 @@
 //! against the Naga versions its consumers require. Dialect gaps close via mechanical
 //! transforms here, never per-backend hand edits.
 
+#[path = "src/msl.rs"]
+mod msl;
 #[path = "src/path_types.rs"]
 #[allow(dead_code)]
 mod path_types;
@@ -79,6 +81,10 @@ struct NativeShaderModule {
     pipeline_path: &'static str,
     source: &'static wgsl_rs::Source,
     requires_dual_source_lowering: bool,
+    /// Whether its fragment stage reads the paint table, and so runs shader
+    /// programs once they are linked in: its WGSL is also written without
+    /// `program_color`, for a renderer to link programs into.
+    links_programs: bool,
 }
 
 struct StorageArray {
@@ -632,6 +638,33 @@ fn scalar_kind(module: &naga::Module, handle: naga::Handle<naga::Type>) -> naga:
     }
 }
 
+/// The function a renderer that links shader programs replaces, in the WGSL
+/// of every module that reads the paint table.
+const PROGRAM_COLOR: &str = "fn program_color(";
+
+/// `source` without its `program_color`, the standard shaders' stand-in for
+/// the programs a renderer links in: what the renderer links them into.
+fn linkable_dialect(name: &str, source: &str) -> String {
+    assert_eq!(
+        source.matches(PROGRAM_COLOR).count(),
+        1,
+        "{name} must define {PROGRAM_COLOR}...) exactly once"
+    );
+    let start = source.find(PROGRAM_COLOR).unwrap();
+    let length = source[start..]
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("{name}: {PROGRAM_COLOR}...) has no end"))
+        + "\n}\n".len();
+    let mut linkable = String::with_capacity(source.len());
+    linkable.push_str(&source[..start]);
+    linkable.push_str(&source[start + length..]);
+    assert!(
+        !linkable.contains(PROGRAM_COLOR),
+        "{name}: {PROGRAM_COLOR}...) was not removed"
+    );
+    linkable
+}
+
 /// Closes the dual-source gap for natives: the second blend input becomes a second target.
 fn native_dialect(source: &str) -> String {
     source
@@ -841,108 +874,126 @@ fn write_native_shaders(out_dir: &std::path::Path) {
             pipeline_path: "QUADS",
             source: &shaders::quad::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: true,
         },
         NativeShaderModule {
             pipeline: &SMOOTHED_QUADS,
             pipeline_path: "SMOOTHED_QUADS",
             source: &shaders::quad::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: true,
         },
         NativeShaderModule {
             pipeline: &SHADOWS,
             pipeline_path: "SHADOWS",
             source: &shaders::shadow::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: true,
         },
         NativeShaderModule {
             pipeline: &SMOOTHED_SHADOWS,
             pipeline_path: "SMOOTHED_SHADOWS",
             source: &shaders::shadow::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: true,
         },
         NativeShaderModule {
             pipeline: &PATH_RASTERIZATION,
             pipeline_path: "PATH_RASTERIZATION",
             source: &shaders::path_rasterization::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: true,
         },
         NativeShaderModule {
             pipeline: &PATHS,
             pipeline_path: "PATHS",
             source: &shaders::path::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: false,
         },
         NativeShaderModule {
             pipeline: &UNDERLINES,
             pipeline_path: "UNDERLINES",
             source: &shaders::underline::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: false,
         },
         NativeShaderModule {
             pipeline: &MONOCHROME_SPRITES,
             pipeline_path: "MONOCHROME_SPRITES",
             source: &shaders::monochrome_sprite::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: false,
         },
         NativeShaderModule {
             pipeline: &SUBPIXEL_SPRITES,
             pipeline_path: "SUBPIXEL_SPRITES",
             source: &shaders::subpixel_sprite::WGSL_SOURCE,
             requires_dual_source_lowering: true,
+            links_programs: false,
         },
         NativeShaderModule {
             pipeline: &POLYCHROME_SPRITES,
             pipeline_path: "POLYCHROME_SPRITES",
             source: &shaders::polychrome_sprite::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: false,
         },
         NativeShaderModule {
             pipeline: &SMOOTHED_POLYCHROME_SPRITES,
             pipeline_path: "SMOOTHED_POLYCHROME_SPRITES",
             source: &shaders::polychrome_sprite::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: false,
         },
         NativeShaderModule {
             pipeline: &SURFACES,
             pipeline_path: "SURFACES",
             source: &shaders::surface::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: false,
         },
         NativeShaderModule {
             pipeline: &EMOJI_RASTERIZATION,
             pipeline_path: "EMOJI_RASTERIZATION",
             source: &shaders::emoji_rasterization::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: false,
         },
         NativeShaderModule {
             pipeline: &BLUR_DOWNSAMPLE,
             pipeline_path: "BLUR_DOWNSAMPLE",
             source: &shaders::blur::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: false,
         },
         NativeShaderModule {
             pipeline: &BLUR,
             pipeline_path: "BLUR",
             source: &shaders::blur::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: false,
         },
         NativeShaderModule {
             pipeline: &BLUR_COMPOSITE,
             pipeline_path: "BLUR_COMPOSITE",
             source: &shaders::blur::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: false,
         },
         NativeShaderModule {
             pipeline: &SMOOTHED_BLUR_COMPOSITE,
             pipeline_path: "SMOOTHED_BLUR_COMPOSITE",
             source: &shaders::blur::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: false,
         },
         NativeShaderModule {
             pipeline: &GROUP_COMPOSITE,
             pipeline_path: "GROUP_COMPOSITE",
             source: &shaders::group::WGSL_SOURCE,
             requires_dual_source_lowering: false,
+            links_programs: false,
         },
     ];
     let mut generated = String::from("// @generated by build.rs; do not edit.\n");
@@ -981,7 +1032,18 @@ fn write_native_shaders(out_dir: &std::path::Path) {
                 pipeline.label
             )
         });
-        let msl = write_msl(&current_module, &current_info, pipeline.label);
+        let msl = msl::write_msl(&current_module, &current_info, pipeline.label)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let linkable = if module.links_programs {
+            let name = format!("{}.linkable.wgsl", pipeline.label);
+            write_shader(out_dir, &name, &linkable_dialect(pipeline.label, &wgsl));
+            format!(
+                "Some(include_str!(concat!(env!(\"OUT_DIR\"), {:?})))",
+                format!("/{name}")
+            )
+        } else {
+            "None".into()
+        };
         // GLSL 3.30 and GLES 3.00 cannot use storage buffers. Generate them from
         // the same data-texture dialect that backs WGPU's WebGL2 tier. Naga
         // validates that IR, then checks each requested GLSL target floor.
@@ -1084,6 +1146,7 @@ fn write_native_shaders(out_dir: &std::path::Path) {
             GlslShaderStage {{ source: include_str!(concat!(env!("OUT_DIR"), {:?})) }},
         ),
         msl: include_str!(concat!(env!("OUT_DIR"), {:?})),
+        linkable_wgsl: {},
     }},"#,
             pipeline.label,
             module.pipeline_path,
@@ -1095,6 +1158,7 @@ fn write_native_shaders(out_dir: &std::path::Path) {
             gles_300_vertex_path,
             gles_300_fragment_path,
             msl_path,
+            linkable,
         )
         .unwrap();
     }
@@ -1367,82 +1431,4 @@ fn lower_draw_constants_to_sm50(hlsl: String, wgsl: &str, label: &str, register:
         );
     }
     lowered
-}
-
-fn write_msl(module: &naga::Module, info: &naga::valid::ModuleInfo, label: &str) -> String {
-    let mut resources = naga::back::msl::BindingMap::default();
-    for (_, variable) in module.global_variables.iter() {
-        let Some(binding) = &variable.binding else {
-            continue;
-        };
-        let target = match variable.space {
-            naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. } => {
-                let slot = shaders::interface::native_slot(binding.group, binding.binding);
-                assert!(
-                    slot < shaders::interface::MSL_BUFFER_SIZES_SLOT,
-                    "MSL buffer slot {slot} of {label} collides with the buffer sizes"
-                );
-                naga::back::msl::BindTarget {
-                    buffer: Some(slot as u8),
-                    ..Default::default()
-                }
-            }
-            naga::AddressSpace::Handle => match module.types[variable.ty].inner {
-                naga::TypeInner::Image { .. } => naga::back::msl::BindTarget {
-                    texture: Some(binding.binding.saturating_sub(1) as u8),
-                    ..Default::default()
-                },
-                naga::TypeInner::Sampler { .. } => naga::back::msl::BindTarget {
-                    sampler: Some(naga::back::msl::BindSamplerTarget::Resource(0)),
-                    ..Default::default()
-                },
-                ref ty => panic!("unsupported MSL resource type {ty:?} in {label}"),
-            },
-            space => panic!("unsupported MSL resource space {space:?} in {label}"),
-        };
-        resources.insert(*binding, target);
-    }
-    let entry_resources = naga::back::msl::EntryPointResources {
-        resources,
-        sizes_buffer: Some(shaders::interface::MSL_BUFFER_SIZES_SLOT as u8),
-        ..Default::default()
-    };
-    let per_entry_point_map = module
-        .entry_points
-        .iter()
-        .map(|entry| (entry.name.clone(), entry_resources.clone()))
-        .collect();
-    let options = naga::back::msl::Options {
-        lang_version: (2, 0),
-        per_entry_point_map,
-        fake_missing_bindings: false,
-        ..Default::default()
-    };
-    let source = naga::back::msl::write_string(
-        module,
-        info,
-        &options,
-        &naga::back::msl::PipelineOptions::default(),
-    )
-    .map(|(source, _)| source)
-    .unwrap_or_else(|error| panic!("failed to generate MSL for {label}: {error}"));
-    assert_msl_buffer_sizes_unread(&source, label);
-    source
-}
-
-/// Renderers bind `MSL_BUFFER_SIZES_BYTES` of placeholder sizes rather than tracking which
-/// runtime arrays each entry point reaches, which is sound only while nothing reads them.
-fn assert_msl_buffer_sizes_unread(source: &str, label: &str) {
-    assert!(
-        !source.contains("_buffer_sizes."),
-        "{label}: generated MSL reads runtime-array sizes, which renderers do not bind"
-    );
-    let sizes = source
-        .split_once("struct _mslBufferSizes {")
-        .and_then(|(_, rest)| rest.split_once("};"))
-        .map_or(0, |(members, _)| members.matches("uint size").count());
-    assert!(
-        sizes as u32 * 4 <= shaders::interface::MSL_BUFFER_SIZES_BYTES,
-        "{label}: generated MSL declares {sizes} runtime-array sizes, more than renderers bind"
-    );
 }

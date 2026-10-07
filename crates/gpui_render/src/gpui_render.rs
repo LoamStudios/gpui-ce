@@ -4,6 +4,8 @@ pub mod artifacts;
 pub mod blur;
 pub mod group;
 mod instances;
+pub mod link;
+pub mod msl;
 pub mod path_types;
 pub mod shaders;
 

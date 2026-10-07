@@ -6,5 +6,6 @@
 
 mod metal_atlas;
 mod metal_photos;
+mod metal_programs;
 pub mod metal_renderer;
 mod metal_targets;

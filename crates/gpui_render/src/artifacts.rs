@@ -143,6 +143,10 @@ pub struct NativeShader {
     /// GLSL ES 3.00, using the same downlevel transport.
     pub gles_300: GlslShader<Gles300>,
     pub msl: &'static str,
+    /// For a shader whose fragment stage reads the paint table: its WGSL
+    /// without `program_color`, which [`crate::link`] links shader programs
+    /// into.
+    pub linkable_wgsl: Option<&'static str>,
 }
 
 include!(concat!(env!("OUT_DIR"), "/native_shaders.rs"));
