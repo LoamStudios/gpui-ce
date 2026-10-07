@@ -263,28 +263,17 @@ pub mod group {
                 coverage *= dot(mask.xyz(), vec3f(0.2125, 0.7154, 0.0721));
             }
         }
-        let mut source = texture_sample_level(
+        let picture = texture_sample_level(
             GROUP_TEXTURE,
             GROUP_SAMPLER,
             (position - locals.source_origin) / locals.source_size,
             0.0,
         );
-        // The last of the group's filters, done as it is drawn: a colour
-        // matrix, or (in normal blend mode, which leaves the backdrop free)
-        // a merge over the picture bound there.
-        if locals.filter_kind == GroupFilter::ColorMatrix {
-            source = group_color_matrix(source);
+        if locals.blend_mode == GroupBlendMode::Normal && locals.filter_kind == GroupFilter::None {
+            return picture * coverage;
         }
+        let source = group_composite_filter(picture, position);
         if locals.blend_mode == GroupBlendMode::Normal {
-            if locals.filter_kind == GroupFilter::Merge {
-                let beneath = texture_sample_level(
-                    BACKDROP_TEXTURE,
-                    GROUP_SAMPLER,
-                    (position - locals.backdrop_origin) / locals.backdrop_size,
-                    0.0,
-                );
-                source = source + beneath * (1.0 - source.w);
-            }
             return source * coverage;
         }
         let backdrop = texture_sample_level(
@@ -298,6 +287,27 @@ pub mod group {
         let mixed = source_color * (1.0 - backdrop.w)
             + blend(locals.blend_mode, backdrop_color, source_color) * backdrop.w;
         vec4f(mixed.x, mixed.y, mixed.z, 1.0) * source.w * coverage
+    }
+
+    /// `picture`, the group's at `position`, through the last of its
+    /// filters, which the composite does as it draws it: a colour matrix,
+    /// or (in normal blend mode, which leaves the backdrop free) a merge
+    /// over the picture bound there.
+    pub fn group_composite_filter(picture: Vec4f, position: Vec2f) -> Vec4f {
+        let locals = get!(GROUP_LOCALS);
+        if locals.filter_kind == GroupFilter::ColorMatrix {
+            return group_color_matrix(picture);
+        }
+        if locals.filter_kind == GroupFilter::Merge {
+            let beneath = texture_sample_level(
+                BACKDROP_TEXTURE,
+                GROUP_SAMPLER,
+                (position - locals.backdrop_origin) / locals.backdrop_size,
+                0.0,
+            );
+            return picture + beneath * (1.0 - picture.w);
+        }
+        picture
     }
 
     /// The group's texture at viewport position `position`: transparent
