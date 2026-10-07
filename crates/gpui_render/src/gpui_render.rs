@@ -8,6 +8,7 @@ pub mod hlsl;
 mod instances;
 pub mod link;
 pub mod linked;
+pub mod meshes;
 pub mod msl;
 pub mod path_types;
 pub mod shaders;

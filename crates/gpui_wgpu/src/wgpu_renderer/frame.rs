@@ -75,6 +75,7 @@ impl PreparedTargets {
             return None;
         }
         renderer.resources_mut().upload_photo_tiles(scene);
+        renderer.resources_mut().meshes.get_mut().begin_frame();
         renderer.resources_mut().prepare_programs(scene);
         if renderer.resources().programs_pending {
             // Drawn with the fallback colours of programs still linking:
@@ -330,6 +331,9 @@ fn reserve_instances(scene: &Scene, reserve: &mut impl FnMut(usize, usize)) {
             PrimitiveBatch::Underlines(range) => {
                 reserve(std::mem::size_of::<Underline>(), range.len())
             }
+            PrimitiveBatch::Meshes(range) => {
+                reserve(std::mem::size_of::<gpui::MeshInstance>(), range.len())
+            }
             PrimitiveBatch::MonochromeSprites { range, .. } => {
                 reserve(std::mem::size_of::<MonochromeSprite>(), range.len())
             }
@@ -493,6 +497,7 @@ impl<'a> FrameEncoder<'a> {
         );
         self.instances.finish(&mut uploads);
         self.renderer.resources().finish_frame_uploads();
+        self.renderer.resources().meshes.borrow_mut().end_frame();
         let command_buffers = [uploads.finish(), self.encoder.finish()];
         result.map(|()| command_buffers)
     }
@@ -888,6 +893,9 @@ fn encode_inline_batch(
         }
         PrimitiveBatch::Underlines(range) => {
             renderer.draw_underlines(&scene.underlines[range.clone()], instances, pass)
+        }
+        PrimitiveBatch::Meshes(range) => {
+            renderer.draw_meshes(&scene.meshes[range.clone()], instances, pass)
         }
         PrimitiveBatch::MonochromeSprites { texture_id, range } => renderer
             .draw_monochrome_sprites(

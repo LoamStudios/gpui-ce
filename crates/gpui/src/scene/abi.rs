@@ -141,6 +141,28 @@ pub const SCENE_BUFFER_LAYOUTS: &[SceneBufferLayout] = &[
         transform,
         clip
     ),
+    layout!(
+        MeshInstance,
+        "MeshInstance",
+        order,
+        transform,
+        clip,
+        scale,
+        origin,
+        bounds,
+        content_mask,
+        paint,
+        padding
+    ),
+    layout!(
+        MeshVertex,
+        "MeshVertex",
+        position,
+        normal,
+        stroke,
+        extrude,
+        coverage
+    ),
 ];
 
 // These wrappers travel as shader scalars/vectors, without separate WGSL structs.

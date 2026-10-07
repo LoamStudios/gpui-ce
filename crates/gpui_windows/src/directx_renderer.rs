@@ -68,6 +68,8 @@ const _: () = assert!(
     "the scene tables must not reach group 1's registers"
 );
 const DATA_REGISTER: u32 = data_register(shader_interface::DATA_BUFFER_BINDING);
+/// The vertices of the mesh being drawn, beside the frame's mesh instances.
+const MESH_VERTICES_REGISTER: u32 = data_register(shader_interface::MESH_VERTICES_BINDING);
 /// The window's photo tile array, a texture beside the scene tables, and the sampler that
 /// filters it, which group 1's samplers follow.
 const PHOTO_TILES_REGISTER: u32 = global_register(shader_interface::PHOTO_TILES_BINDING);
@@ -132,6 +134,8 @@ pub(crate) struct DirectXRenderer {
     targets: Vec<FrameTarget>,
     path_rasterization_vertices: Vec<PathRasterizationVertex>,
     path_sprites: Vec<PathSprite>,
+    /// The meshes kept on the GPU, by id.
+    meshes: gpui_render::meshes::MeshCache<DirectXMesh>,
 
     /// The scene whose commands are being drawn: the window's, or a chunk inside it.
     level: DrawLevel,
@@ -151,6 +155,7 @@ struct SceneSlot {
     monochrome_sprites: u32,
     subpixel_sprites: u32,
     polychrome_sprites: u32,
+    meshes: u32,
     /// Its transform, clip and paint tables, for registers from [`SCENE_TABLES_REGISTER`].
     tables: [Option<ID3D11ShaderResourceView>; 3],
 }
@@ -275,6 +280,7 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    meshes: PipelineState<MeshInstance>,
     surfaces: SurfacePipeline,
     // Blur: not the generic PipelineState, since these sample a texture instead of
     // reading a structured instance buffer; parameters live in a cbuffer at [`DATA_REGISTER`].
@@ -593,6 +599,7 @@ impl DirectXRenderer {
             skip_draws: false,
             targets: Vec::new(),
             path_rasterization_vertices: Vec::new(),
+            meshes: gpui_render::meshes::MeshCache::new(),
             path_sprites: Vec::new(),
             level: DrawLevel::default(),
             chunk_slots: FxHashMap::default(),
@@ -743,6 +750,8 @@ impl DirectXRenderer {
             }
 
             self.resources.take();
+            // Its meshes live on the lost device.
+            self.meshes.clear();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
@@ -850,6 +859,7 @@ impl DirectXRenderer {
 
         self.upload_scene_buffers(scene)?;
         self.prepare_programs(scene)?;
+        self.meshes.begin_frame();
 
         // Render the scene into an offscreen texture when backdrop filters or blend modes read
         // what is already painted, then blit it to the swapchain; otherwise render straight to
@@ -912,6 +922,7 @@ impl DirectXRenderer {
         if let Some(resources) = self.resources.as_mut() {
             resources.target_pool.end_frame();
         }
+        self.meshes.end_frame();
         result?;
 
         // Present the offscreen scene by blitting it into the swapchain.
@@ -970,6 +981,10 @@ impl DirectXRenderer {
                 RenderCommand::Batch(PrimitiveBatch::Underlines(range)) => {
                     self.draw_underlines(instance_range(range, self.level.slot.underlines)?)
                 }
+                RenderCommand::Batch(PrimitiveBatch::Meshes(range)) => self.draw_meshes(
+                    &scene.meshes[range.clone()],
+                    instance_range(range, self.level.slot.meshes)?,
+                ),
                 RenderCommand::Batch(PrimitiveBatch::MonochromeSprites {
                     texture_id,
                     range,
@@ -1365,6 +1380,15 @@ impl DirectXRenderer {
             device_context,
             &sections(&scenes, |scene| &scene.polychrome_sprites),
         )?;
+        let mesh_instances: Vec<Vec<MeshInstance>> = scenes
+            .iter()
+            .map(|scene| scene.meshes.iter().map(|mesh| mesh.instance).collect())
+            .collect();
+        let meshes = pipelines.meshes.update_sections(
+            device,
+            device_context,
+            &mesh_instances.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        )?;
 
         for (index, scene) in scenes.iter().enumerate() {
             let tables = if index == 0 {
@@ -1386,6 +1410,7 @@ impl DirectXRenderer {
                 monochrome_sprites: monochrome_sprites[index],
                 subpixel_sprites: subpixel_sprites[index],
                 polychrome_sprites: polychrome_sprites[index],
+                meshes: meshes[index],
                 tables,
             };
             if index == 0 {
@@ -1589,6 +1614,40 @@ impl DirectXRenderer {
             Some(slice::from_ref(&path.srv)),
             instances,
         )
+    }
+
+    /// Draws `meshes`, whose instances are `instances` of the frame's, each
+    /// from its vertices and indices kept on the GPU, uploaded the first
+    /// time it is drawn.
+    fn draw_meshes(&mut self, meshes: &[MeshPrimitive], instances: InstanceRange) -> Result<()> {
+        let device = self
+            .devices
+            .as_ref()
+            .context("devices missing")?
+            .device
+            .clone();
+        let linked = self.frame_programs.clone();
+        let variant = linked.as_ref().map(|linked| &linked.meshes);
+        for (index, primitive) in meshes.iter().enumerate() {
+            let Some(mesh) = self
+                .meshes
+                .buffers(&primitive.mesh, |mesh| {
+                    DirectXMesh::upload(&device, mesh).log_err()
+                })
+                .cloned()
+            else {
+                continue;
+            };
+            let instance = instances.first() as usize + index;
+            self.pipelines.meshes.draw_mesh(
+                &self.frame_bindings()?,
+                &mesh,
+                InstanceRange::new(instance..instance + 1)
+                    .context("a mesh instance past the D3D11 instance limit")?,
+                variant,
+            )?;
+        }
+        Ok(())
     }
 
     fn draw_underlines(&mut self, instances: InstanceRange) -> Result<()> {
@@ -2320,6 +2379,13 @@ impl DirectXRenderPipelines {
             create_blend_state(device)?,
         )?
         .with_variant(device, ShaderModule::SmoothedPolychromeSprite)?;
+        let meshes = PipelineState::new(
+            device,
+            "mesh_pipeline",
+            ShaderModule::Mesh,
+            16,
+            create_blend_state(device)?,
+        )?;
 
         let blur_downsample = ShaderModule::BlurDownsample.bytecode()?;
         let blur_downsample_vertex = create_vertex_shader(device, blur_downsample.vertex)?;
@@ -2368,6 +2434,7 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            meshes,
             surfaces,
             blur_downsample_vertex,
             blur_downsample_fragment,
@@ -2756,6 +2823,118 @@ impl<T> PipelineState<T> {
             ctx.DrawInstanced(vertex_count, instances.count(), 0, 0);
         }
         Ok(())
+    }
+}
+
+impl PipelineState<MeshInstance> {
+    /// Draws `mesh` as instance `instance` of the frame's mesh instances,
+    /// with `linked` shaders, with shader programs linked in, in place of
+    /// the pipeline's own if given.
+    fn draw_mesh(
+        &self,
+        frame: &FrameBindings<'_>,
+        mesh: &DirectXMesh,
+        instance: InstanceRange,
+        linked: Option<&PipelineVariant>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            instance.end() as usize <= self.buffer_size,
+            "mesh instance {} exceeds the mesh buffer of {} elements",
+            instance.first(),
+            self.buffer_size,
+        );
+        let ctx = frame.device_context;
+        update_buffer(
+            ctx,
+            &frame.globals.draw_constants_buffer,
+            &[Dx11DrawConstants::for_instances(instance.first())],
+        )?;
+        let draw_constants = [Some(frame.globals.draw_constants_buffer.clone())];
+        unsafe {
+            ctx.VSSetShaderResources(SCENE_TABLES_REGISTER, Some(frame.scene_tables));
+            ctx.PSSetShaderResources(SCENE_TABLES_REGISTER, Some(frame.scene_tables));
+            frame.globals.bind_photo_tiles(ctx);
+            ctx.VSSetShaderResources(DATA_REGISTER, Some(slice::from_ref(&self.view)));
+            ctx.PSSetShaderResources(DATA_REGISTER, Some(slice::from_ref(&self.view)));
+            ctx.VSSetShaderResources(
+                MESH_VERTICES_REGISTER,
+                Some(slice::from_ref(&mesh.vertices)),
+            );
+            ctx.IASetIndexBuffer(&mesh.indices, DXGI_FORMAT_R32_UINT, 0);
+            ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.RSSetViewports(Some(slice::from_ref(frame.viewport)));
+            ctx.VSSetShader(
+                linked.map(|linked| &linked.vertex).unwrap_or(&self.vertex),
+                None,
+            );
+            ctx.PSSetShader(
+                linked
+                    .map(|linked| &linked.fragment)
+                    .unwrap_or(&self.fragment),
+                None,
+            );
+            ctx.VSSetConstantBuffers(0, Some(&frame.globals.cbuffers()));
+            ctx.PSSetConstantBuffers(0, Some(&frame.globals.cbuffers()));
+            ctx.VSSetConstantBuffers(self.draw_constants.register, Some(&draw_constants));
+            ctx.OMSetBlendState(&self.blend_state, None, 0xFFFFFFFF);
+            // `StartInstanceLocation` stays zero: the shader adds the base itself.
+            ctx.DrawIndexedInstanced(mesh.index_count, 1, 0, 0, 0);
+        }
+        Ok(())
+    }
+}
+
+/// A mesh kept on the GPU: a raw view of its vertices, and its indices.
+#[derive(Clone)]
+struct DirectXMesh {
+    vertices: Option<ID3D11ShaderResourceView>,
+    indices: ID3D11Buffer,
+    index_count: u32,
+}
+
+impl DirectXMesh {
+    fn upload(device: &ID3D11Device, mesh: &gpui::Mesh) -> Result<Self> {
+        // SAFETY: `MeshVertex` is `repr(C)` floats and indices are `u32`s.
+        let vertex_bytes = unsafe {
+            slice::from_raw_parts(
+                mesh.vertices().as_ptr().cast::<u8>(),
+                std::mem::size_of_val(mesh.vertices()),
+            )
+        };
+        let index_bytes = unsafe {
+            slice::from_raw_parts(
+                mesh.indices().as_ptr().cast::<u8>(),
+                std::mem::size_of_val(mesh.indices()),
+            )
+        };
+        let immutable = |bytes: &[u8], bind: u32, misc: u32| -> Result<ID3D11Buffer> {
+            let desc = D3D11_BUFFER_DESC {
+                ByteWidth: u32::try_from(bytes.len())
+                    .context("a mesh past the D3D11 buffer limit")?,
+                Usage: D3D11_USAGE_IMMUTABLE,
+                BindFlags: bind,
+                MiscFlags: misc,
+                ..Default::default()
+            };
+            let data = D3D11_SUBRESOURCE_DATA {
+                pSysMem: bytes.as_ptr().cast(),
+                ..Default::default()
+            };
+            let mut buffer = None;
+            unsafe { device.CreateBuffer(&desc, Some(&data), Some(&mut buffer)) }?;
+            buffer.context("CreateBuffer returned no mesh buffer")
+        };
+        let vertices = immutable(
+            vertex_bytes,
+            D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS.0 as u32,
+        )?;
+        let indices = immutable(index_bytes, D3D11_BIND_INDEX_BUFFER.0 as u32, 0)?;
+        Ok(Self {
+            vertices: create_buffer_view(device, &vertices)?,
+            indices,
+            index_count: mesh.indices().len() as u32,
+        })
     }
 }
 
@@ -3282,6 +3461,7 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         SmoothedPolychromeSprite,
+        Mesh,
         Surface,
         BlurDownsample,
         Blur,
@@ -3304,6 +3484,7 @@ pub(crate) mod shader_resources {
                 Self::SubpixelSprite => "subpixel_sprites",
                 Self::PolychromeSprite => "polychrome_sprites",
                 Self::SmoothedPolychromeSprite => "smoothed_polychrome_sprites",
+                Self::Mesh => "meshes",
                 Self::Surface => "surfaces",
                 Self::BlurDownsample => "blur_downsample",
                 Self::Blur => "blur",
@@ -3357,6 +3538,7 @@ pub(crate) mod shader_resources {
                         | DataLayout::TexturedInstances
                         | DataLayout::MonochromeSprites
                         | DataLayout::SubpixelSprites
+                        | DataLayout::Meshes
                 );
                 let bytecode = dx11_bytecode(shader).unwrap();
                 assert_eq!(

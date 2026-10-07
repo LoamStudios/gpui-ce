@@ -240,7 +240,11 @@ pub mod monochrome_sprite {
         // colour's alpha.
         let mut color = input.color;
         if sprite.paint != 0u32 {
-            color = table_paint_color(sprite.paint, scene_position(input.position.xy()));
+            color = table_paint_color(
+                sprite.paint,
+                scene_position(input.position.xy()),
+                vec2f(0.0, 0.0),
+            );
             color.w *= input.color.w;
         }
         let corrected = apply_contrast_and_gamma_correction(

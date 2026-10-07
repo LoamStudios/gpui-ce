@@ -6,11 +6,12 @@ use crate::{
     DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, Filter, FontId,
     Global, GlobalElementId, GlyphId, GlyphRenderMode, GpuSpecs, GroupBoundary, InputHandler,
     IntoElement, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent,
-    LayoutId, Lerp, LineLayoutIndex, MaskMode, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    Motion, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, RasterizedGlyphFormat, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedDirection,
+    LayoutId, Lerp, LineLayoutIndex, MaskMode, Mesh, MeshInstance, MeshPrimitive, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton, MouseEvent, MouseMoveEvent,
+    MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, RasterizedGlyphFormat, Render, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedDirection,
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels,
     Scene, SceneClip, SceneTransform, Shadow, SharedString, Size, StrikethroughStyle, Style,
     SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
@@ -6385,6 +6386,78 @@ impl Window {
             path.color = Background::paint(paint.paint).opacity(paint.color.a);
         }
         self.next_frame.scene.insert_primitive(path);
+    }
+
+    /// Paints `mesh` with its origin at `origin`, in the current element's
+    /// coordinates, filled with `paint`: a colour, or a gradient, photo or
+    /// shader program from [`Self::gradient`], [`Self::photo`] or
+    /// [`Self::program`]. It is drawn in scene order, under the element's
+    /// transform, inside its clips and groups, with an antialiased edge a
+    /// device pixel wide at any scale.
+    ///
+    /// Renderers upload a mesh's vertices once and keep them while it is
+    /// drawn, so drawing the same [`Mesh`] every frame costs only its
+    /// placement.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_mesh(
+        &mut self,
+        mesh: &Arc<Mesh>,
+        origin: Point<Pixels>,
+        paint: impl Into<Background>,
+    ) {
+        self.invalidator.debug_assert_paint();
+        if mesh.indices().is_empty() {
+            return;
+        }
+        let space = self.element_space();
+        let (transform, clip) = (self.scene_transform(), self.scene_clip());
+        let scale_factor = self.scale_factor();
+        let scale = self.paint_scale();
+        let origin = space.paint_point(origin).scale(scale_factor);
+        let mesh_bounds = mesh.bounds();
+        let bounds = Bounds {
+            origin: point(
+                origin.x + ScaledPixels(mesh_bounds.origin.x.0 * scale),
+                origin.y + ScaledPixels(mesh_bounds.origin.y.0 * scale),
+            ),
+            size: size(
+                ScaledPixels(mesh_bounds.size.width.0 * scale),
+                ScaledPixels(mesh_bounds.size.height.0 * scale),
+            ),
+        };
+        // The fringe reaches half a device pixel past the mesh, a mitre at
+        // most a few: grown by that in the transform's space.
+        let pixels_per_unit = match transform {
+            0 => 1.,
+            transform => {
+                let [[a, b], [c, d]] = self.next_frame.scene.transforms()[transform as usize]
+                    .transformation
+                    .rotation_scale;
+                (a * d - b * c).abs().sqrt().max(1e-6)
+            }
+        };
+        let opacity = self.element_opacity();
+        let paint: Background = paint.into();
+        let paint = self
+            .next_frame
+            .scene
+            .paint_ref(&paint.opacity(opacity), bounds, transform);
+        let instance = MeshInstance {
+            order: 0,
+            transform,
+            clip,
+            scale,
+            origin,
+            bounds: bounds.dilate(ScaledPixels(2. / pixels_per_unit)),
+            content_mask: self.snapped_content_mask(),
+            paint,
+            padding: 0,
+        };
+        self.next_frame.scene.insert_primitive(MeshPrimitive {
+            instance,
+            mesh: mesh.clone(),
+        });
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.

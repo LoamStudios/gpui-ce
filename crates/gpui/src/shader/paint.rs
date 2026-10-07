@@ -295,6 +295,24 @@ impl Pixel {
     pub fn scale(self) -> Scalar {
         self.fragment().scale()
     }
+
+    /// Stroke coordinates where a [`Mesh`](crate::Mesh) is painted:
+    /// [`Self::along`] and [`Self::across`]. Zero for anything else.
+    pub fn stroke(self) -> Vec2 {
+        self.fragment().stroke()
+    }
+
+    /// Distance along the stroke a mesh strip draws, in logical pixels,
+    /// from its start (see [`Mesh::strip`](crate::Mesh::strip)).
+    pub fn along(self) -> Scalar {
+        self.stroke().x()
+    }
+
+    /// Where across the stroke a mesh strip draws the fragment is: -1 on
+    /// its left edge, 0 at its middle, 1 on its right.
+    pub fn across(self) -> Scalar {
+        self.stroke().y()
+    }
 }
 
 /// Build a paint from a closure over the fragment. The closure runs once, on

@@ -319,6 +319,7 @@ impl ScenePlanRequirements {
         match batch {
             PrimitiveBatch::Shadows { range, .. }
             | PrimitiveBatch::Quads { range, .. }
+            | PrimitiveBatch::Meshes(range)
             | PrimitiveBatch::Underlines(range) => {
                 self.instance_batch_count += usize::from(!range.is_empty());
             }
@@ -357,6 +358,7 @@ struct SceneLengths {
     shadows: usize,
     quads: usize,
     paths: usize,
+    meshes: usize,
     underlines: usize,
     monochrome_sprites: usize,
     subpixel_sprites: usize,
@@ -372,6 +374,7 @@ impl SceneLengths {
             shadows: scene.shadows.len(),
             quads: scene.quads.len(),
             paths: scene.paths.len(),
+            meshes: scene.meshes.len(),
             underlines: scene.underlines.len(),
             monochrome_sprites: scene.monochrome_sprites.len(),
             subpixel_sprites: scene.subpixel_sprites.len(),
@@ -400,6 +403,8 @@ pub enum PrimitiveBatch {
         rasterization_vertex_count: usize,
         sprite_count: usize,
     },
+    /// Meshes, each drawn from its own retained vertices.
+    Meshes(Range<usize>),
     Underlines(Range<usize>),
     MonochromeSprites {
         texture_id: AtlasTextureId,
@@ -486,6 +491,7 @@ impl PrimitiveBatch {
                 range.len()
             ),
             Self::Paths { range, .. } => format!("paths ({})", range.len()),
+            Self::Meshes(range) => format!("meshes ({})", range.len()),
             Self::Underlines(range) => format!("underlines ({})", range.len()),
             Self::MonochromeSprites { texture_id, range } => format!(
                 "monochrome sprites ({}) on atlas {}",

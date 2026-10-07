@@ -19,22 +19,24 @@ pub(crate) struct ProgramPipelines {
     pub(crate) shadows: metal::RenderPipelineState,
     pub(crate) smoothed_shadows: metal::RenderPipelineState,
     pub(crate) path_rasterization: metal::RenderPipelineState,
+    pub(crate) meshes: metal::RenderPipelineState,
     pub(crate) monochrome_sprites: metal::RenderPipelineState,
 }
 
 /// The pipelines that read the paint table, with `programs` linked in.
 ///
 /// Quads and smoothed quads share one shader module, as do shadows; the
-/// four modules are linked and compiled in parallel, as compiling them is
+/// five modules are linked and compiled in parallel, as compiling them is
 /// most of the work.
 pub(crate) fn link_pipelines(
     device: &metal::Device,
     programs: &[Program],
 ) -> Result<ProgramPipelines, String> {
-    let modules: [&[&str]; 4] = [
+    let modules: [&[&str]; 5] = [
         &["quads", "smoothed_quads"],
         &["shadows", "smoothed_shadows"],
         &["path_rasterization"],
+        &["meshes"],
         &["monochrome_sprites"],
     ];
     let mut linked = std::thread::scope(|scope| {
@@ -62,6 +64,7 @@ pub(crate) fn link_pipelines(
         shadows: next(),
         smoothed_shadows: next(),
         path_rasterization: next(),
+        meshes: next(),
         monochrome_sprites: next(),
     })
 }

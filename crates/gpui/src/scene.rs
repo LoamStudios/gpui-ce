@@ -22,8 +22,10 @@ pub use plan::*;
 mod paint;
 pub use paint::*;
 mod abi;
+mod mesh;
 #[doc(hidden)]
 pub use abi::{SCENE_BUFFER_LAYOUTS, SceneBufferLayout};
+pub use mesh::*;
 
 #[allow(non_camel_case_types, unused)]
 #[expect(missing_docs)]
@@ -69,6 +71,8 @@ pub struct Scene {
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
+    /// Meshes, each drawn from its own retained vertices.
+    pub meshes: Vec<MeshPrimitive>,
     pub underlines: Vec<Underline>,
     pub monochrome_sprites: Vec<MonochromeSprite>,
     pub subpixel_sprites: Vec<SubpixelSprite>,
@@ -121,6 +125,7 @@ impl Scene {
         self.primitive_bounds.clear();
         self.layer_stack.clear();
         self.paths.clear();
+        self.meshes.clear();
         self.shadows.clear();
         self.quads.clear();
         self.underlines.clear();
@@ -209,6 +214,12 @@ impl Scene {
                     region(path.bounds, &path.content_mask, 0);
                 }
             }
+            PrimitiveBatch::Meshes(range) => {
+                for mesh in &self.meshes[range.clone()] {
+                    let mesh = &mesh.instance;
+                    region(mesh.bounds, &mesh.content_mask, mesh.transform);
+                }
+            }
             PrimitiveBatch::Underlines(range) => {
                 for underline in &self.underlines[range.clone()] {
                     region(
@@ -270,6 +281,11 @@ impl Scene {
             PrimitiveBatch::Paths { range, .. } => {
                 for path in &mut self.paths[range.clone()] {
                     path.color = path.color.opacity(opacity);
+                }
+            }
+            PrimitiveBatch::Meshes(range) => {
+                for mesh in &mut self.meshes[range.clone()] {
+                    mesh.instance.paint = mesh.instance.paint.opacity(opacity);
                 }
             }
             PrimitiveBatch::Underlines(range) => {
@@ -1082,6 +1098,7 @@ impl Scene {
                 path.id = PathId(self.paths.len());
                 self.paths.push(path);
             }
+            Primitive::Mesh(mesh) => self.meshes.push(mesh.clone()),
             Primitive::Underline(underline) => self.underlines.push(*underline),
             Primitive::MonochromeSprite(sprite) => self.monochrome_sprites.push(*sprite),
             Primitive::SubpixelSprite(sprite) => self.subpixel_sprites.push(*sprite),
@@ -1316,6 +1333,7 @@ impl Scene {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
+        self.meshes.sort_by_key(|mesh| mesh.instance.order);
         self.underlines.sort_by_key(|underline| underline.order);
         self.monochrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
@@ -1468,6 +1486,7 @@ pub(crate) enum PrimitiveKind {
     #[default]
     Quad,
     Path,
+    Mesh,
     Underline,
     MonochromeSprite,
     SubpixelSprite,
@@ -1648,6 +1667,7 @@ pub enum Primitive {
     Shadow(Shadow),
     Quad(Quad),
     Path(Path<ScaledPixels>),
+    Mesh(MeshPrimitive),
     Underline(Underline),
     MonochromeSprite(MonochromeSprite),
     SubpixelSprite(SubpixelSprite),
@@ -1763,6 +1783,7 @@ impl Primitive {
             Primitive::Shadow(shadow) => &shadow.bounds,
             Primitive::Quad(quad) => &quad.bounds,
             Primitive::Path(path) => &path.bounds,
+            Primitive::Mesh(mesh) => &mesh.instance.bounds,
             Primitive::Underline(underline) => &underline.bounds,
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
@@ -1779,6 +1800,7 @@ impl Primitive {
             Primitive::Shadow(shadow) => &mut shadow.content_mask,
             Primitive::Quad(quad) => &mut quad.content_mask,
             Primitive::Path(path) => &mut path.content_mask,
+            Primitive::Mesh(mesh) => &mut mesh.instance.content_mask,
             Primitive::Underline(underline) => &mut underline.content_mask,
             Primitive::MonochromeSprite(sprite) => &mut sprite.content_mask,
             Primitive::SubpixelSprite(sprite) => &mut sprite.content_mask,
@@ -1795,6 +1817,7 @@ impl Primitive {
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
             Primitive::Path(path) => &path.content_mask,
+            Primitive::Mesh(mesh) => &mesh.instance.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
@@ -1811,6 +1834,7 @@ impl Primitive {
             Primitive::Shadow(shadow) => shadow.order = order,
             Primitive::Quad(quad) => quad.order = order,
             Primitive::Path(path) => path.order = order,
+            Primitive::Mesh(mesh) => mesh.instance.order = order,
             Primitive::Underline(underline) => underline.order = order,
             Primitive::MonochromeSprite(sprite) => sprite.order = order,
             Primitive::SubpixelSprite(sprite) => sprite.order = order,
@@ -1872,6 +1896,13 @@ impl Primitive {
                     mask(&mut vertex.content_mask);
                 }
             }
+            Primitive::Mesh(mesh) => {
+                let mesh = &mut mesh.instance;
+                mesh.origin = placement.point(mesh.origin);
+                mesh.scale *= placement.scale;
+                mesh.bounds = placement.bounds(mesh.bounds);
+                mask(&mut mesh.content_mask);
+            }
             Primitive::Underline(underline) => {
                 underline.bounds = placement.bounds(underline.bounds);
                 underline.thickness = length(underline.thickness);
@@ -1918,6 +1949,7 @@ impl Primitive {
             Primitive::Shadow(shadow) => shadow.transform,
             Primitive::Quad(quad) => quad.transform,
             Primitive::Underline(underline) => underline.transform,
+            Primitive::Mesh(mesh) => mesh.instance.transform,
             Primitive::MonochromeSprite(sprite) => sprite.transform,
             Primitive::SubpixelSprite(sprite) => sprite.transform,
             Primitive::PolychromeSprite(sprite) => sprite.transform,
@@ -1936,6 +1968,7 @@ impl Primitive {
             Primitive::Quad(quad) => {
                 smallvec::smallvec![&mut quad.background, &mut quad.border_color]
             }
+            Primitive::Mesh(mesh) => smallvec::smallvec![&mut mesh.instance.paint],
             _ => SmallVec::new(),
         }
     }
@@ -1949,6 +1982,7 @@ impl Primitive {
             Primitive::Underline(underline) => {
                 Some((&mut underline.transform, &mut underline.clip))
             }
+            Primitive::Mesh(mesh) => Some((&mut mesh.instance.transform, &mut mesh.instance.clip)),
             Primitive::MonochromeSprite(sprite) => Some((&mut sprite.transform, &mut sprite.clip)),
             Primitive::SubpixelSprite(sprite) => Some((&mut sprite.transform, &mut sprite.clip)),
             Primitive::PolychromeSprite(sprite) => Some((&mut sprite.transform, &mut sprite.clip)),
@@ -1966,6 +2000,7 @@ impl Primitive {
             Primitive::Shadow(shadow) => shadow.order,
             Primitive::Quad(quad) => quad.order,
             Primitive::Path(path) => path.order,
+            Primitive::Mesh(mesh) => mesh.instance.order,
             Primitive::Underline(underline) => underline.order,
             Primitive::MonochromeSprite(sprite) => sprite.order,
             Primitive::SubpixelSprite(sprite) => sprite.order,
@@ -2012,6 +2047,12 @@ impl Primitive {
                     vertex.xy_position = vertex.xy_position + geometry_offset;
                     moved(&mut vertex.content_mask);
                 }
+            }
+            Primitive::Mesh(mesh) => {
+                let mesh = &mut mesh.instance;
+                mesh.origin = mesh.origin + geometry_offset;
+                mesh.bounds = mesh.bounds + geometry_offset;
+                moved(&mut mesh.content_mask);
             }
             Primitive::Underline(underline) => {
                 underline.bounds = underline.bounds + geometry_offset;
@@ -2069,6 +2110,8 @@ struct BatchIterator<'a> {
     paths_start: usize,
     paths: &'a [Path<ScaledPixels>],
     paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
+    meshes_start: usize,
+    meshes_iter: Peekable<slice::Iter<'a, MeshPrimitive>>,
     underlines_start: usize,
     underlines_iter: Peekable<slice::Iter<'a, Underline>>,
     monochrome_sprites_start: usize,
@@ -2097,6 +2140,8 @@ impl<'a> BatchIterator<'a> {
             paths_start: 0,
             paths: &scene.paths,
             paths_iter: scene.paths.iter().peekable(),
+            meshes_start: 0,
+            meshes_iter: scene.meshes.iter().peekable(),
             underlines_start: 0,
             underlines_iter: scene.underlines.iter().peekable(),
             monochrome_sprites_start: 0,
@@ -2140,6 +2185,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             ),
             (self.quads_iter.peek().map(|q| q.order), PrimitiveKind::Quad),
             (self.paths_iter.peek().map(|q| q.order), PrimitiveKind::Path),
+            (
+                self.meshes_iter.peek().map(|mesh| mesh.instance.order),
+                PrimitiveKind::Mesh,
+            ),
             (
                 self.underlines_iter.peek().map(|u| u.order),
                 PrimitiveKind::Underline,
@@ -2270,6 +2319,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                     rasterization_vertex_count,
                     sprite_count,
                 })
+            }
+            PrimitiveKind::Mesh => {
+                let meshes_start = self.meshes_start;
+                let mut meshes_end = meshes_start + 1;
+                self.meshes_iter.next();
+                while self
+                    .meshes_iter
+                    .next_if(|mesh| {
+                        precedes_limit(mesh.instance.order, batch_kind, max_order_and_kind)
+                    })
+                    .is_some()
+                {
+                    meshes_end += 1;
+                }
+                self.meshes_start = meshes_end;
+                Some(PrimitiveBatch::Meshes(meshes_start..meshes_end))
             }
             PrimitiveKind::Underline => {
                 let underlines_start = self.underlines_start;
@@ -3486,6 +3551,61 @@ mod tests {
         assert!(
             matches!(&replayed.paint_operations[0], PaintOperation::Raster(_, source) if matches!(&**source, RasterSource::Glyph(glyph) if glyph.params.scale_factor == 4.)),
             "and recorded with its new source, for the next replay"
+        );
+    }
+
+    /// A replayed mesh shares its vertices with the recording, and is
+    /// moved, zoomed and turned by its instance alone.
+    #[test]
+    fn a_replayed_mesh_moves_by_its_instance() {
+        let mesh = std::sync::Arc::new(Mesh::from_polygon(
+            &[(0., 0.), (10., 0.), (0., 10.)].map(|(x, y)| point(px(x), px(y))),
+            peniko::Fill::NonZero,
+        ));
+        let mut recorded = Scene::default();
+        recorded.insert_primitive(MeshPrimitive {
+            instance: MeshInstance {
+                scale: 2.,
+                origin: point(sp(10.), sp(20.)),
+                bounds: Bounds::new(point(sp(10.), sp(20.)), Size::new(sp(20.), sp(20.))),
+                content_mask: mask(),
+                paint: crate::white().into(),
+                ..Default::default()
+            },
+            mesh: mesh.clone(),
+        });
+        let all = 0..recorded.paint_operations.len();
+
+        let mut moved = Scene::default();
+        moved.replay_at(all.clone(), &recorded, point(sp(30.), sp(40.)), &mask());
+        let instance = moved.meshes[0].instance;
+        assert!(std::sync::Arc::ptr_eq(&moved.meshes[0].mesh, &mesh));
+        assert_eq!(instance.origin, point(sp(40.), sp(60.)));
+        assert_eq!((instance.scale, instance.transform), (2., 0));
+
+        let mut zoomed = Scene::default();
+        let full = ContentMask {
+            bounds: Bounds::new(point(sp(0.), sp(0.)), Size::new(sp(500.), sp(500.))),
+            ..Default::default()
+        };
+        let zoom = TransformationMatrix {
+            rotation_scale: [[3., 0.], [0., 3.]],
+            translation: [5., 5.],
+        };
+        zoomed.replay_placed(all.clone(), &recorded, &zoom, &full, &mut |_| None);
+        let instance = zoomed.meshes[0].instance;
+        assert_eq!(instance.origin, point(sp(35.), sp(65.)));
+        assert_eq!((instance.scale, instance.transform), (6., 0));
+
+        let mut turned = Scene::default();
+        let turn = TransformationMatrix::unit().rotate(Radians(0.5));
+        turned.replay_placed(all, &recorded, &turn, &full, &mut |_| None);
+        let instance = turned.meshes[0].instance;
+        assert_eq!(instance.origin, point(sp(10.), sp(20.)));
+        assert_ne!(instance.transform, 0, "turned on the GPU");
+        assert_eq!(
+            turned.transforms()[instance.transform as usize].transformation,
+            turn
         );
     }
 

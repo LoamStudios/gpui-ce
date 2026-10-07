@@ -697,8 +697,9 @@ mod source {
     /// The colour of shader program `id` at a fragment of the box it fills
     /// (its normalized and logical-pixel position in the box, the box's
     /// size, the device-pixel position of the box's origin, and device
-    /// pixels per logical pixel), with its parameters from word `base` of
-    /// the paint table, as unpremultiplied sRGB-encoded RGBA.
+    /// pixels per logical pixel, and stroke coordinates where a mesh is
+    /// painted), with its parameters from word `base` of the paint table, as
+    /// unpremultiplied sRGB-encoded RGBA.
     ///
     /// The standard shaders run no programs, so this is `fallback`. A
     /// renderer that links programs replaces this function, which must stay
@@ -710,6 +711,7 @@ mod source {
         _size: Vec2f,
         _origin: Vec2f,
         _scale: f32,
+        _stroke: Vec2f,
         _base: u32,
         fallback: Vec4f,
     ) -> Vec4f {
@@ -725,7 +727,12 @@ mod source {
     ///
     /// Its geometry is the box's size and the program's id; its parameter
     /// words take the place of stops; `radii` is its fallback colour.
-    pub fn program_paint_color(paint: ScenePaint, point: Vec2f, viewport_position: Vec2f) -> Vec4f {
+    pub fn program_paint_color(
+        paint: ScenePaint,
+        point: Vec2f,
+        viewport_position: Vec2f,
+        stroke: Vec2f,
+    ) -> Vec4f {
         let size = paint.geometry.xy();
         // Logical pixels per device pixel is the transformation's scale.
         let units_per_pixel = sqrt(max(
@@ -740,13 +747,15 @@ mod source {
             size,
             viewport_position - point * scale,
             scale,
+            stroke,
             paint.first_stop,
             paint.radii,
         )
     }
 
-    /// The colour of paint-table entry `index` at a viewport position.
-    pub fn table_paint_color(index: u32, viewport_position: Vec2f) -> Vec4f {
+    /// The colour of paint-table entry `index` at a viewport position, and,
+    /// where a mesh is painted, stroke coordinates, which programs read.
+    pub fn table_paint_color(index: u32, viewport_position: Vec2f, stroke: Vec2f) -> Vec4f {
         let paint = scene_paint(index);
         let point =
             TransformationMatrix::transform_position(paint.transformation, viewport_position);
@@ -754,7 +763,7 @@ mod source {
             return photo_color(paint, point);
         }
         if paint.kind == PaintKind::Program {
-            return program_paint_color(paint, point, viewport_position);
+            return program_paint_color(paint, point, viewport_position, stroke);
         }
         if paint.kind == PaintKind::Stripes || paint.kind == PaintKind::Checkerboard {
             let mut color =
@@ -1250,10 +1259,20 @@ mod source {
     /// The colour `paint` draws at `viewport_position`, given `solid`, its
     /// prepared colour.
     pub fn paint_color(paint: PaintRef, viewport_position: Vec2f, solid: Vec4f) -> Vec4f {
+        paint_color_at(paint, viewport_position, solid, vec2f(0.0, 0.0))
+    }
+
+    /// [`paint_color`], with the stroke coordinates of a mesh's fragment.
+    pub fn paint_color_at(
+        paint: PaintRef,
+        viewport_position: Vec2f,
+        solid: Vec4f,
+        stroke: Vec2f,
+    ) -> Vec4f {
         if paint.paint == 0u32 {
             return solid;
         }
-        let mut color = table_paint_color(paint.paint, viewport_position);
+        let mut color = table_paint_color(paint.paint, viewport_position, stroke);
         color.w *= solid.w;
         color
     }

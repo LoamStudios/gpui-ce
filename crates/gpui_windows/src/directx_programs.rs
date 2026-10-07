@@ -36,6 +36,7 @@ pub(crate) struct LinkedShaders {
     pub(crate) shadows: PipelineVariant,
     pub(crate) smoothed_shadows: PipelineVariant,
     pub(crate) path_rasterization: PipelineVariant,
+    pub(crate) meshes: PipelineVariant,
     pub(crate) monochrome_sprites: PipelineVariant,
 }
 
@@ -53,17 +54,18 @@ unsafe impl Send for LinkingDevice {}
 
 /// The shaders that read the paint table, with `programs` linked in.
 ///
-/// Quads and smoothed quads share one module, as do shadows; the four
+/// Quads and smoothed quads share one module, as do shadows; the five
 /// modules are translated and compiled in parallel, as compiling them is
 /// most of the work.
 pub(crate) fn link_shaders(
     device: &LinkingDevice,
     programs: &[Program],
 ) -> Result<LinkedShaders, String> {
-    let modules: [&[&str]; 4] = [
+    let modules: [&[&str]; 5] = [
         &["quads", "smoothed_quads"],
         &["shadows", "smoothed_shadows"],
         &["path_rasterization"],
+        &["meshes"],
         &["monochrome_sprites"],
     ];
     let mut linked = std::thread::scope(|scope| {
@@ -91,6 +93,7 @@ pub(crate) fn link_shaders(
         shadows: next(),
         smoothed_shadows: next(),
         path_rasterization: next(),
+        meshes: next(),
         monochrome_sprites: next(),
     })
 }

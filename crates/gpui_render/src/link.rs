@@ -113,8 +113,8 @@ fn paint_param(index: u32) -> vec4<f32> {
     });
     source.push_str(
         "
-fn program_color(id: u32, uv: vec2<f32>, position: vec2<f32>, size: vec2<f32>, origin: vec2<f32>, scale: f32, base: u32, fallback: vec4<f32>) -> vec4<f32> {
-    let fragment = Fragment(uv, position, size, origin, scale);
+fn program_color(id: u32, uv: vec2<f32>, position: vec2<f32>, size: vec2<f32>, origin: vec2<f32>, scale: f32, stroke: vec2<f32>, base: u32, fallback: vec4<f32>) -> vec4<f32> {
+    let fragment = Fragment(uv, position, size, origin, scale, stroke);
     switch id {
 ",
     );
@@ -268,6 +268,7 @@ mod tests {
                 "shadows",
                 "smoothed_shadows",
                 "path_rasterization",
+                "meshes",
                 "monochrome_sprites"
             ]
         );
@@ -343,6 +344,7 @@ mod tests {
             crate::shaders::interface::QUADS,
             crate::shaders::interface::SHADOWS,
             crate::shaders::interface::PATH_RASTERIZATION,
+            crate::shaders::interface::MESHES,
         ] {
             let mut output = String::new();
             naga::back::glsl::Writer::new(
@@ -379,6 +381,7 @@ mod tests {
                 crate::shaders::interface::QUADS,
                 crate::shaders::interface::SHADOWS,
                 crate::shaders::interface::PATH_RASTERIZATION,
+                crate::shaders::interface::MESHES,
             ] {
                 assert!(
                     module
