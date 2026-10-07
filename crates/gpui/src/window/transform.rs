@@ -69,7 +69,7 @@ impl ElementSpace {
         }
         // Paint at the transform's scale, so text and edges are rasterized
         // at the size they appear, and let the scene transform place it.
-        let mut scale = (a * d - b * c).abs().sqrt().max(f32::MIN_POSITIVE);
+        let mut scale = raster_scale([[a, b], [c, d]]);
         if (scale - 1.).abs() < 1e-5 {
             // A rotation, up to rounding: paint at the element's own size.
             scale = 1.;
@@ -142,6 +142,28 @@ impl ElementSpace {
         }
         self.to_element.apply(point)
     }
+}
+
+/// The scale to paint at under the linear map `rotation_scale`: its larger
+/// singular value, the most it stretches anything, so nothing painted is
+/// magnified on the GPU and blurred. A map that stretches one way more than
+/// it does the other is shrunk along the other on the GPU, which averages up
+/// to `MAX_SPRITE_TAPS` texels a pixel; beyond that ratio the scale gives
+/// way toward the smaller singular value.
+pub(crate) fn raster_scale(rotation_scale: [[f32; 2]; 2]) -> f32 {
+    /// `MAX_SPRITE_TAPS` in the sprite shaders.
+    const MAX_MINIFICATION: f32 = 8.;
+    let [[a, b], [c, d]] = rotation_scale;
+    let sum_of_squares = a * a + b * b + c * c + d * d;
+    let determinant = (a * d - b * c).abs();
+    let spread = (sum_of_squares * sum_of_squares - 4. * determinant * determinant)
+        .max(0.)
+        .sqrt();
+    let largest = ((sum_of_squares + spread) / 2.).sqrt();
+    let smallest = determinant / largest.max(f32::MIN_POSITIVE);
+    largest
+        .min(smallest * MAX_MINIFICATION)
+        .max(f32::MIN_POSITIVE)
 }
 
 /// The axis-aligned bounds of `bounds` under `transformation`.

@@ -94,3 +94,8 @@ harness = false
 name = "chunks_render"
 path = "tests/chunks_render.rs"
 harness = false
+
+[[test]]
+name = "text_render"
+path = "tests/text_render.rs"
+harness = false
