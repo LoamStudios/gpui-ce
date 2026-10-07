@@ -97,6 +97,8 @@ pub(super) struct WgpuPipelines {
     pub(super) smoothed_blur_composite: WgpuRenderPipeline,
     /// Composites an isolated group into its parent (premultiplied).
     pub(super) group_composite: WgpuRenderPipeline,
+    /// Runs a pass of a group's filters, other than a blur.
+    pub(super) group_filter: WgpuRenderPipeline,
     /// Builds the pipelines that read the paint table again with shader
     /// programs linked in.
     pub(super) linker: PaintLinker,
@@ -111,6 +113,7 @@ pub(super) struct LinkedPaintPipelines {
     pub(super) path_rasterization: WgpuRenderPipeline,
     pub(super) meshes: Option<WgpuRenderPipeline>,
     pub(super) monochrome_sprites: WgpuRenderPipeline,
+    pub(super) group_filter: WgpuRenderPipeline,
 }
 
 /// What building the pipelines that read the paint table takes, to build
@@ -122,7 +125,9 @@ pub(super) struct PaintLinker {
     instance_layout: wgpu::PipelineLayout,
     monochrome_layout: wgpu::PipelineLayout,
     mesh_layout: Option<wgpu::PipelineLayout>,
+    group_layout: wgpu::PipelineLayout,
     scene_target: wgpu::ColorTargetState,
+    composite_target: wgpu::ColorTargetState,
     path_rasterization_target: wgpu::ColorTargetState,
     path_sample_count: u32,
     dialect: link::Dialect,
@@ -149,6 +154,7 @@ impl PaintLinker {
                 specification,
                 match specification.data_layout {
                     shader::DataLayout::MonochromeSprites => &self.monochrome_layout,
+                    shader::DataLayout::Group => &self.group_layout,
                     shader::DataLayout::Meshes => self
                         .mesh_layout
                         .as_ref()
@@ -175,6 +181,7 @@ impl PaintLinker {
                 .is_some()
                 .then(|| create(shader::MESHES, &self.scene_target, 1)),
             monochrome_sprites: create(shader::MONOCHROME_SPRITES, &self.scene_target, 1),
+            group_filter: create(shader::GROUP_FILTER, &self.composite_target, 1),
         };
         // Without threads to block, wasm relies on Naga's validation above.
         #[cfg(not(target_family = "wasm"))]
@@ -663,7 +670,9 @@ impl WgpuPipelines {
             instance_layout: instance_layout.clone(),
             monochrome_layout: monochrome_layout.clone(),
             mesh_layout: mesh_layout.clone(),
+            group_layout: group_layout.clone(),
             scene_target: scene_target.clone(),
+            composite_target: composite_target.clone(),
             path_rasterization_target: path_rasterization_target.clone(),
             path_sample_count,
             dialect: match tier {
@@ -739,6 +748,7 @@ impl WgpuPipelines {
                 1,
                 &shader_module,
             ),
+            group_filter: create(shader::GROUP_FILTER, &composite_target, 1, &shader_module),
         }
     }
 }

@@ -286,13 +286,16 @@ impl FrameRequirements {
             storage_bytes,
             instance_batches,
             uniforms: FrameUniformRequirements {
-                // A blurred group takes the three blur passes of a backdrop filter, and no
-                // blur composite: the group's composite has uniforms of its own.
+                // A group's blur takes at most the three blur passes of a backdrop filter,
+                // and no blur composite: the group's composite has uniforms of its own.
                 filter_count: FILTER_UNIFORMS_PER_COMPOSITE
-                    * (planned.backdrop_filter_count + planned.isolated_group_count) as u64
+                    * (planned.backdrop_filter_count + planned.group_blur_count) as u64
                     + u64::from(planned.uses_offscreen_target),
                 surface_count: planned.surface_count as u64,
-                group_count: planned.isolated_group_count as u64,
+                // A composite per isolated group, and one per pass of its filters that
+                // does not blur.
+                group_count: (planned.isolated_group_count + planned.group_filter_pass_count)
+                    as u64,
                 target_count: FRAME_TARGET_GLOBALS
                     + planned.isolated_group_count as u64
                     + CHUNK_TARGET_GLOBALS * planned.chunk_count as u64,

@@ -34,6 +34,10 @@ pub struct ScenePlanRequirements {
     pub surface_count: usize,
     pub backdrop_filter_count: usize,
     pub isolated_group_count: usize,
+    /// Passes of isolated groups' filters that blur, each up to three draws.
+    pub group_blur_count: usize,
+    /// Other passes of isolated groups' filters, each one draw.
+    pub group_filter_pass_count: usize,
     /// Chunks drawn, not counting those inside them, whose own requirements
     /// are added to these.
     pub chunk_count: usize,
@@ -171,6 +175,16 @@ impl ScenePlan {
                         let drawn = match target {
                             GroupTarget::Isolated { region } => {
                                 requirements.isolated_group_count += 1;
+                                if start.is_filtered() {
+                                    for pass in start.filter_plan().passes {
+                                        match pass {
+                                            crate::FilterPass::Blur { .. } => {
+                                                requirements.group_blur_count += 1
+                                            }
+                                            _ => requirements.group_filter_pass_count += 1,
+                                        }
+                                    }
+                                }
                                 requirements.uses_offscreen_target |=
                                     start.blend_mode != BlendMode::Normal;
                                 Some(region)
