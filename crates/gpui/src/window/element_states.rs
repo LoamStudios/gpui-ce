@@ -1,16 +1,23 @@
 //! The states elements keep across frames, held in one map for as long as
-//! their elements are drawn.
+//! their elements are drawn in consecutive frames.
 //!
 //! A state belongs to the subframe it was last used in: the innermost cached
 //! view being drawn then, or none. A frame that reuses a cached view uses
 //! none of the states inside it, yet keeps them, since its subframe is still
 //! drawn. So rather than move each state used into the next frame, as a
-//! frame of flat lists would, the map is swept now and then: a state stays
-//! while it was used in the last frame drawn or its subframe is still drawn.
+//! frame of flat lists would, the end of each frame lets go of what stopped
+//! being drawn, looking only at what could have:
+//!
+//! - the states used in the frame before, which this frame did not use and
+//!   whose subframe it does not draw;
+//! - the subframes drawn in the frame before, which this frame does not
+//!   draw, with the states in them and in the subframes inside them.
+//!
+//! A frame that only reuses a cached view looks at none of its states.
 
 use super::{ElementStateBox, GlobalElementId, SubframeId};
-use collections::FxHashMap;
-use std::any::TypeId;
+use collections::{FxHashMap, FxHashSet};
+use std::{any::TypeId, mem};
 
 pub(crate) type ElementStateKey = (GlobalElementId, TypeId);
 
@@ -25,21 +32,27 @@ struct Entry {
 #[derive(Default)]
 pub(crate) struct ElementStates {
     states: FxHashMap<ElementStateKey, Entry>,
+    /// The states last used in each subframe.
+    members: FxHashMap<SubframeId, FxHashSet<ElementStateKey>>,
     /// The subframe each subframe was last drawn in, if any.
     parents: FxHashMap<SubframeId, Option<SubframeId>>,
+    /// The subframes each subframe has had drawn in it.
+    children: FxHashMap<SubframeId, Vec<SubframeId>>,
     /// The last frame each subframe was recorded or reused in, as itself
     /// rather than inside another.
     drawn: FxHashMap<SubframeId, usize>,
-    /// How many states the last sweep kept.
-    kept: usize,
+    /// The states used in the frame being drawn, and in the one before.
+    used: Vec<ElementStateKey>,
+    used_before: Vec<ElementStateKey>,
+    /// The subframes drawn in the frame being drawn, and in the one before.
+    drawn_now: Vec<SubframeId>,
+    drawn_before: Vec<SubframeId>,
 }
 
 impl ElementStates {
     /// Takes the state at `key` out, to be used in `frame`, if it is still
     /// alive: used in `frame` or `last_frame`, or inside a subframe drawn in
-    /// one of them. A state whose element went undrawn for a frame is dropped
-    /// here, though the lazy sweep has not yet let it go, so a state lasts
-    /// only while its element is drawn in consecutive frames.
+    /// one of them.
     pub(crate) fn take(
         &mut self,
         key: &ElementStateKey,
@@ -47,6 +60,11 @@ impl ElementStates {
         frame: usize,
     ) -> Option<ElementStateBox> {
         let entry = self.states.remove(key)?;
+        if let Some(subframe) = entry.subframe
+            && let Some(members) = self.members.get_mut(&subframe)
+        {
+            members.remove(key);
+        }
         let alive = entry.frame == frame
             || entry.frame == last_frame
             || entry.subframe.is_some_and(|subframe| {
@@ -67,6 +85,13 @@ impl ElementStates {
         subframe: Option<SubframeId>,
         frame: usize,
     ) {
+        if let Some(subframe) = subframe {
+            self.members
+                .entry(subframe)
+                .or_default()
+                .insert(key.clone());
+        }
+        self.used.push(key.clone());
         self.states.insert(
             key,
             Entry {
@@ -81,29 +106,64 @@ impl ElementStates {
     /// there, or reused there whole.
     pub(crate) fn drawn(&mut self, subframe: SubframeId, parent: Option<SubframeId>, frame: usize) {
         self.parents.insert(subframe, parent);
+        if let Some(parent) = parent {
+            self.children.entry(parent).or_default().push(subframe);
+        }
         self.drawn.insert(subframe, frame);
+        self.drawn_now.push(subframe);
     }
 
-    /// Lets go of the states neither used in `frame` nor in a subframe drawn
-    /// in it, once there are twice as many as the last sweep kept, so a sweep
-    /// costs no more than the frames since the last one.
+    /// Lets go of the states that `frame`, just drawn, stopped drawing: those
+    /// used in the frame before and not since, outside a subframe `frame`
+    /// draws, and those in a subframe drawn before and not in `frame`.
     pub(crate) fn sweep(&mut self, frame: usize) {
-        if self.states.len() < 2 * self.kept + 1024 {
-            return;
-        }
         let mut alive: FxHashMap<SubframeId, bool> = FxHashMap::default();
-        let (parents, drawn) = (&self.parents, &self.drawn);
-        self.states.retain(|_, entry| {
-            entry.frame == frame
-                || entry
-                    .subframe
-                    .is_some_and(|subframe| is_drawn(subframe, frame, parents, drawn, &mut alive))
-        });
-        self.parents
-            .retain(|subframe, _| alive.get(subframe).copied().unwrap_or(false));
-        self.drawn
-            .retain(|subframe, _| alive.get(subframe).copied().unwrap_or(false));
-        self.kept = self.states.len();
+
+        for key in mem::take(&mut self.used_before) {
+            let Some(entry) = self.states.get(&key) else {
+                continue;
+            };
+            let kept = entry.frame == frame
+                || entry.subframe.is_some_and(|subframe| {
+                    is_drawn(subframe, frame, &self.parents, &self.drawn, &mut alive)
+                });
+            if !kept {
+                let subframe = entry.subframe;
+                self.states.remove(&key);
+                if let Some(members) = subframe.and_then(|subframe| self.members.get_mut(&subframe))
+                {
+                    members.remove(&key);
+                }
+            }
+        }
+
+        let mut gone = Vec::new();
+        for subframe in mem::take(&mut self.drawn_before) {
+            if !is_drawn(subframe, frame, &self.parents, &self.drawn, &mut alive) {
+                gone.push(subframe);
+            }
+        }
+        while let Some(subframe) = gone.pop() {
+            // A subframe drawn in another since is still drawn.
+            if self.drawn.get(&subframe) == Some(&frame) {
+                continue;
+            }
+            for key in self.members.remove(&subframe).unwrap_or_default() {
+                if self
+                    .states
+                    .get(&key)
+                    .is_some_and(|entry| entry.subframe == Some(subframe))
+                {
+                    self.states.remove(&key);
+                }
+            }
+            self.parents.remove(&subframe);
+            self.drawn.remove(&subframe);
+            gone.extend(self.children.remove(&subframe).unwrap_or_default());
+        }
+
+        self.used_before = mem::take(&mut self.used);
+        self.drawn_before = mem::take(&mut self.drawn_now);
     }
 }
 
@@ -149,67 +209,88 @@ mod tests {
         }
     }
 
-    #[test]
-    fn states_inside_a_reused_subframe_outlive_a_sweep() {
-        let mut states = ElementStates::default();
-        let (page, item, dropped) = (SubframeId::next(), SubframeId::next(), SubframeId::next());
-        // Frame 1 records a page with an item in it, and another view.
-        states.drawn(page, None, 1);
-        states.drawn(item, Some(page), 1);
-        states.drawn(dropped, None, 1);
-        states.put(key(0), state(), Some(item), 1);
-        states.put(key(1), state(), Some(dropped), 1);
-        states.put(key(2), state(), None, 1);
-        // Frame 2 reuses the page whole, and draws nothing else.
-        states.drawn(page, None, 2);
-        for n in 3..1100 {
-            states.put(key(n), state(), None, 2);
-        }
-        states.sweep(2);
+    /// Uses the state at `n` in `frame`, inside `subframe`, as an element
+    /// drawn there does.
+    fn use_state(states: &mut ElementStates, n: usize, subframe: Option<SubframeId>, frame: usize) {
+        let state = states.take(&key(n), frame - 1, frame).unwrap_or_else(state);
+        states.put(key(n), state, subframe, frame);
+    }
 
-        assert!(
-            states.take(&key(0), 2, 3).is_some(),
-            "the item's state is kept"
-        );
-        assert!(
-            states.take(&key(1), 2, 3).is_none(),
-            "the dropped view's state goes"
-        );
-        assert!(
-            states.take(&key(2), 2, 3).is_none(),
-            "an unused state at the root goes"
-        );
-        assert!(
-            states.take(&key(3), 2, 3).is_some(),
-            "a state used this frame is kept"
-        );
+    fn held(states: &ElementStates, n: usize) -> bool {
+        states.states.contains_key(&key(n))
     }
 
     #[test]
-    fn a_state_whose_element_skipped_a_frame_is_not_handed_back() {
+    fn states_inside_a_reused_subframe_are_kept_until_it_is_dropped() {
         let mut states = ElementStates::default();
-        let (page, popup) = (SubframeId::next(), SubframeId::next());
-        // Frame 1 draws a popup at the root and a page with an item in it.
+        let (page, item) = (SubframeId::next(), SubframeId::next());
+        // Frame 1 records a page with an item in it.
         states.drawn(page, None, 1);
-        states.drawn(popup, None, 1);
-        states.put(key(0), state(), None, 1);
-        states.put(key(1), state(), Some(popup), 1);
-        states.put(key(2), state(), Some(page), 1);
-        // Frame 2 reuses the page whole and draws nothing else; no sweep runs.
-        states.drawn(page, None, 2);
+        use_state(&mut states, 0, Some(page), 1);
+        states.drawn(item, Some(page), 1);
+        use_state(&mut states, 1, Some(item), 1);
+        states.sweep(1);
 
-        // Frame 3 draws everything again.
+        // Frames 2 and 3 reuse the page whole.
+        for frame in 2..=3 {
+            states.drawn(page, None, frame);
+            states.sweep(frame);
+            assert!(held(&states, 0) && held(&states, 1), "frame {frame}");
+        }
+
+        // Frame 4 draws neither.
+        states.sweep(4);
         assert!(
-            states.take(&key(0), 2, 3).is_none(),
-            "a root element missing from frame 2 starts over"
+            states.states.is_empty(),
+            "the page and the item inside it are let go"
         );
+        assert!(states.drawn.is_empty() && states.parents.is_empty());
+    }
+
+    #[test]
+    fn a_state_whose_element_skipped_a_frame_is_dropped_at_its_end() {
+        let mut states = ElementStates::default();
+        use_state(&mut states, 0, None, 1);
+        use_state(&mut states, 1, None, 1);
+        states.sweep(1);
+
+        use_state(&mut states, 1, None, 2);
+        states.sweep(2);
         assert!(
-            states.take(&key(1), 2, 3).is_none(),
-            "a view missing from frame 2 starts over"
+            !held(&states, 0),
+            "an element missing from frame 2 is let go"
         );
-        assert!(
-            states.take(&key(2), 2, 3).is_some(),
-            "a view reused whole in frame 2 keeps its states"
-        );
+        assert!(held(&states, 1), "an element drawn again is kept");
+    }
+
+    #[test]
+    fn a_view_rendered_again_keeps_the_states_it_uses_and_its_reused_children() {
+        let mut states = ElementStates::default();
+        let (outer, inner) = (SubframeId::next(), SubframeId::next());
+        states.drawn(outer, None, 1);
+        use_state(&mut states, 0, Some(outer), 1);
+        use_state(&mut states, 1, Some(outer), 1);
+        states.drawn(inner, Some(outer), 1);
+        use_state(&mut states, 2, Some(inner), 1);
+        states.sweep(1);
+
+        // Frame 2 renders the outer view again, as a new subframe, using one
+        // of its states and reusing the inner view whole.
+        let outer_again = SubframeId::next();
+        states.drawn(outer_again, None, 2);
+        use_state(&mut states, 0, Some(outer_again), 2);
+        states.drawn(inner, Some(outer_again), 2);
+        states.sweep(2);
+
+        assert!(held(&states, 0), "a state the view used again is kept");
+        assert!(!held(&states, 1), "a state it stopped using is let go");
+        assert!(held(&states, 2), "the reused inner view keeps its state");
+    }
+
+    #[test]
+    fn a_stale_state_is_not_handed_back() {
+        let mut states = ElementStates::default();
+        states.put(key(0), state(), None, 1);
+        assert!(states.take(&key(0), 2, 3).is_none());
     }
 }
