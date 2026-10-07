@@ -725,6 +725,36 @@ mod source {
         get!(TRANSFORMS)[transform as usize].transformation
     }
 
+    /// How many viewport pixels one unit of a transform-table entry's space
+    /// spans: exact for a rotation with a uniform scale, and the geometric
+    /// mean of the two scales otherwise.
+    pub fn pixels_per_unit(transform: u32) -> f32 {
+        if transform == 0u32 {
+            return 1.0;
+        }
+        sqrt(abs(determinant(
+            scene_transformation(transform).rotation_scale,
+        )))
+    }
+
+    /// How far, in viewport pixels, a transformed primitive is drawn past its
+    /// bounds, so the pixels its edges partly cover are shaded. An untransformed
+    /// primitive's edges lie along pixel rows and columns, and need none.
+    pub const TRANSFORMED_EDGE_MARGIN: f32 = 1.0;
+
+    /// `bounds`, in the space of transform-table entry `transform`, grown by
+    /// [`TRANSFORMED_EDGE_MARGIN`] pixels when the entry is not the identity.
+    pub fn drawn_bounds(bounds: Bounds, transform: u32) -> Bounds {
+        if transform == 0u32 {
+            return bounds;
+        }
+        let margin = TRANSFORMED_EDGE_MARGIN / pixels_per_unit(transform);
+        Bounds {
+            origin: bounds.origin - vec2f(margin, margin),
+            size: bounds.size + vec2f(2.0 * margin, 2.0 * margin),
+        }
+    }
+
     /// A viewport position in the space of a transform-table entry.
     pub fn local_position(transform: u32, viewport_position: Vec2f) -> Vec2f {
         if transform == 0u32 {

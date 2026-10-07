@@ -104,15 +104,34 @@ fn render() {
 
     // The rotated card: its unrotated top-left corner is now white, and a
     // point above its unrotated top edge, on the turned diagonal, is red.
+    // (101, 101) is 4.6 pixels outside the turned card's nearest edge.
     assert!(
-        is(104., 104., WHITE),
+        is(101., 101., WHITE),
         "the turned-away corner is empty: {:?}",
-        pixel(104., 104.)
+        pixel(101., 101.)
     );
     assert!(
         is(200., 85., [255, 0, 0]),
         "the card turned into it: {:?}",
         pixel(200., 85.)
+    );
+
+    // The rotated card's edges are smoothed: where its right edge crosses
+    // the rows through its center, between (265, 140) and (277, 160), it
+    // partly covers some pixels, which are neither red nor white. Unsmoothed,
+    // every pixel there is one or the other, and the edge is a staircase.
+    let (left, right) = ((265. * scale) as u32, (277. * scale) as u32);
+    let (top, bottom) = ((140. * scale) as u32, (160. * scale) as u32);
+    let partly_covered = (top..bottom)
+        .flat_map(|y| (left..right).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let [r, g, b, _] = image.get_pixel(x, y).0;
+            r > 230 && g.abs_diff(b) < 24 && (40..215).contains(&g)
+        })
+        .count();
+    assert!(
+        partly_covered >= (bottom - top) as usize / 2,
+        "the rotated card's edge is smoothed: {partly_covered} pixels between red and white"
     );
 
     // The rotated frame clips along its own edges: the child fills the

@@ -541,7 +541,7 @@ pub mod quad {
     pub fn prepare_quad_vertex(vertex_id: u32, instance_id: u32, quad: Quad) -> QuadVertexData {
         let vertex = transformed_rectangle_vertex(
             vertex_id,
-            quad.bounds,
+            drawn_bounds(quad.bounds, quad.transform),
             scene_transformation(quad.transform),
         );
         QuadVertexData {
@@ -600,18 +600,27 @@ pub mod quad {
             scene_position(input.position.xy()),
             input.fill_solid,
         );
-        if Edges::is_zero(quad.border_widths) && Corners::is_zero(quad.corner_radii) {
+        // An untransformed quad's edges lie along pixel rows and columns, so a
+        // plain one covers every pixel it is drawn on. A transformed quad's
+        // edges cross pixels, and every one of its pixels is measured.
+        let transformed = quad.transform != 0u32;
+        if !transformed && Edges::is_zero(quad.border_widths) && Corners::is_zero(quad.corner_radii)
+        {
             return blend_color(fill_color, fade);
         }
 
         let geometry = quad_geometry(quad, point);
-        if is_unaffected_background(geometry) {
+        if !transformed && is_unaffected_background(geometry) {
             return blend_color(fill_color, fade);
         }
 
+        // Distances in the quad's own space, measured in viewport pixels.
+        let scale = pixels_per_unit(quad.transform);
         let distances = border_distances(geometry);
+        let outer = distances.outer * scale;
+        let inner = distances.inner * scale;
         let mut color = fill_color;
-        if max(distances.inner, distances.outer) < PIXEL_ANTIALIAS_RADIUS {
+        if max(inner, outer) < PIXEL_ANTIALIAS_RADIUS {
             let mut border_color = paint_color(
                 quad.border_color,
                 scene_position(input.position.xy()),
@@ -621,14 +630,14 @@ pub mod quad {
                 border_color.w *= dashed_border_alpha(quad, geometry);
             }
             let blended_border = over(fill_color, border_color);
-            let factor = antialiased_coverage(distances.inner);
+            let factor = antialiased_coverage(inner);
             color = mix(
                 fill_color,
                 blended_border,
                 vec4f(factor, factor, factor, factor),
             );
         }
-        blend_color(color, antialiased_coverage(distances.outer) * fade)
+        blend_color(color, antialiased_coverage(outer) * fade)
     }
 
     #[derive(Wgsl)]
@@ -721,7 +730,10 @@ pub mod quad {
                 prepared,
             );
 
-            return blend_color(fill_color, antialiased_coverage(distance) * fade);
+            return blend_color(
+                fill_color,
+                antialiased_coverage(distance * pixels_per_unit(quad.transform)) * fade,
+            );
         }
 
         let geometry = quad_geometry(quad, point);
@@ -771,14 +783,17 @@ pub mod quad {
         let straight_border_inner_corner_to_point = corner_to_point + reduced_border;
         let near_curve = rectangle_sample.signed_distance.segment != FIGMA_SEGMENT_STRAIGHT;
 
-        if straight_border_inner_corner_to_point.x < -PIXEL_ANTIALIAS_RADIUS
+        if quad.transform == 0u32
+            && straight_border_inner_corner_to_point.x < -PIXEL_ANTIALIAS_RADIUS
             && straight_border_inner_corner_to_point.y < -PIXEL_ANTIALIAS_RADIUS
             && !near_curve
         {
             return blend_color(fill_color, fade);
         }
 
-        let outer = rectangle_sample.signed_distance.distance;
+        // Distances in the quad's own space, measured in viewport pixels.
+        let scale = pixels_per_unit(quad.transform);
+        let outer = rectangle_sample.signed_distance.distance * scale;
         let mut inner = 0.0;
 
         if near_curve {
@@ -789,12 +804,12 @@ pub mod quad {
             );
             let effective_width = length(border * normal)
                 - PIXEL_ANTIALIAS_RADIUS * (1.0 - length(active_sides * normal));
-            inner = -(outer + effective_width);
+            inner = -(outer + effective_width * scale);
         } else {
             inner = -max(
                 straight_border_inner_corner_to_point.x,
                 straight_border_inner_corner_to_point.y,
-            );
+            ) * scale;
         }
 
         let mut color = fill_color;
