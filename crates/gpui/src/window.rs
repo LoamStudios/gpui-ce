@@ -4,22 +4,22 @@ use crate::{
     BorderStyle, Bounds, BoxShadow, Capslock, ColorExt, Context, Corners, CursorHideMode,
     CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree,
     DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, Filter, FontId,
-    Global, GlobalElementId, GlyphId, GlyphRenderMode, GpuSpecs, GroupBoundary, InputHandler,
-    IntoElement, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent,
-    LayoutId, Lerp, LineLayoutIndex, MaskMode, Mesh, MeshInstance, MeshPrimitive, Modifiers,
-    ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton, MouseEvent, MouseMoveEvent,
-    MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    Global, GlobalElementId, GlyphId, GlyphRenderMode, GlyphTransform, GpuSpecs, GroupBoundary,
+    InputHandler, IntoElement, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    KeystrokeEvent, LayoutId, Lerp, LineLayoutIndex, MaskMode, Mesh, MeshInstance, MeshPrimitive,
+    Modifiers, ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton, MouseEvent,
+    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
     PromptLevel, Quad, RasterizedGlyphFormat, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedDirection,
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels,
     Scene, SceneClip, SceneTransform, Shadow, SharedString, Size, StrikethroughStyle, Style,
     SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
-    TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Transition, TransitionState, Underline, UnderlineStyle, UnicodeBidi, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
-    WindowParams, WindowTextSystem,
+    TRANSFORMED_SUBPIXEL_VARIANTS, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
+    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Transition, TransitionState, Underline, UnderlineStyle, UnicodeBidi,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem,
     gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer},
     interactive::TouchEvent,
     point, px, rems, size, transparent_black,
@@ -91,7 +91,7 @@ use element_states::ElementStates;
 pub(crate) use retained::SubframeId;
 use retained::{Entry, ListIndex, RetainedList};
 pub(crate) use transform::{
-    ElementSpace, HitboxClip, Placement, TransformedClip, transformed_bounds,
+    ElementSpace, HitboxClip, Placement, TransformedClip, raster_scale, transformed_bounds,
 };
 mod prompts;
 
@@ -117,6 +117,16 @@ fn rasterize_glyph(
 ) -> Result<Option<RasterizedGlyph>> {
     let (integer_origin, subpixel_variant) = if source.color {
         quantize_color_glyph_origin(source.origin)
+    } else if let Some(matrix) = source.transform {
+        // Turned or skewed: rasterized as it is drawn, quantized for its
+        // size, and placed in the viewport as it is.
+        let em = source.params.font_size.0 * source.params.scale_factor;
+        source.params.transform = GlyphTransform::quantize(matrix, em);
+        if source.params.transform.is_axis_aligned() {
+            quantize_glyph_origin(source.origin)
+        } else {
+            quantize_transformed_glyph_origin(source.origin)
+        }
     } else {
         quantize_glyph_origin(source.origin)
     };
@@ -269,6 +279,24 @@ fn quantize_glyph_origin(origin: Point<ScaledPixels>) -> (Point<ScaledPixels>, P
 
     let (integer_x, variant_x) = axis(origin.x, SUBPIXEL_VARIANTS_X);
     let (integer_y, variant_y) = axis(origin.y, SUBPIXEL_VARIANTS_Y);
+    (point(integer_x, integer_y), point(variant_x, variant_y))
+}
+
+/// [`quantize_glyph_origin`] for a glyph under a [`GlyphTransform`], whose
+/// origin's fraction matters down as much as across.
+fn quantize_transformed_glyph_origin(
+    origin: Point<ScaledPixels>,
+) -> (Point<ScaledPixels>, Point<u8>) {
+    fn axis(value: ScaledPixels) -> (ScaledPixels, u8) {
+        let variants = TRANSFORMED_SUBPIXEL_VARIANTS;
+        let quantized = round_half_toward_zero(value.0 * variants as f32) / variants as f32;
+        let integer = quantized.floor();
+        let variant = ((quantized - integer) * variants as f32).round() as u8;
+        (ScaledPixels(integer), variant.min(variants - 1))
+    }
+
+    let (integer_x, variant_x) = axis(origin.x);
+    let (integer_y, variant_y) = axis(origin.y);
     (point(integer_x, integer_y), point(variant_x, variant_y))
 }
 
@@ -1221,6 +1249,19 @@ impl ViewChunk {
             moved: self.operations_moved,
         }
     }
+}
+
+/// The largest and smallest singular values of a linear map: the most and
+/// least it stretches anything.
+fn singular_values(rotation_scale: [[f32; 2]; 2]) -> (f32, f32) {
+    let [[a, b], [c, d]] = rotation_scale;
+    let sum_of_squares = a * a + b * b + c * c + d * d;
+    let determinant = (a * d - b * c).abs();
+    let spread = (sum_of_squares * sum_of_squares - 4. * determinant * determinant)
+        .max(0.)
+        .sqrt();
+    let largest = ((sum_of_squares + spread) / 2.).sqrt();
+    (largest, determinant / largest.max(f32::MIN_POSITIVE))
 }
 
 /// How far a chunk's scale may drift from the one it was prepared at while
@@ -4901,22 +4942,27 @@ impl Window {
         true
     }
 
-    /// Prepares `chunk` again at the scale it is drawn at, so its text and
-    /// icons are rasterized for it rather than stretched, once its placement
-    /// has settled or has stretched it past [`CHUNK_STRETCH_LIMIT`]. A
-    /// placement that only zooms and moves is folded into the chunk; one that
-    /// turns it is left on the GPU.
+    /// Prepares `chunk` again at the scale and angle it is drawn at, so its
+    /// text and icons are rasterized for it rather than stretched or turned
+    /// on the GPU, once its placement has settled or has stretched it past
+    /// [`CHUNK_STRETCH_LIMIT`]. A placement that only zooms and moves is
+    /// folded into the chunk's geometry; one that turns or skews it is folded
+    /// into its transform table, with its glyphs rasterized turned.
     fn prepare_chunk_at_its_scale(&mut self, chunk: &mut ViewChunk, cx: &App) {
         let settled = chunk.previous_placement == Some(chunk.placement);
         chunk.previous_placement = Some(chunk.placement);
-        let Some(uniform) = crate::scene::UniformPlacement::of(&chunk.placement) else {
-            return;
+        let stretched = match crate::scene::UniformPlacement::of(&chunk.placement) {
+            Some(uniform) => {
+                if (uniform.scale - 1.).abs() < 0.01 {
+                    return;
+                }
+                uniform.scale > CHUNK_STRETCH_LIMIT || uniform.scale < 1. / CHUNK_STRETCH_LIMIT
+            }
+            None => {
+                let (largest, smallest) = singular_values(chunk.placement.rotation_scale);
+                largest > CHUNK_STRETCH_LIMIT || smallest < 1. / CHUNK_STRETCH_LIMIT
+            }
         };
-        if (uniform.scale - 1.).abs() < 0.01 {
-            return;
-        }
-        let stretched =
-            uniform.scale > CHUNK_STRETCH_LIMIT || uniform.scale < 1. / CHUNK_STRETCH_LIMIT;
         if !settled && !stretched {
             // Draw once more, to prepare it if it has settled by then.
             self.chunk_settling = true;
@@ -6687,26 +6733,56 @@ impl Window {
             subpixel_variant: Point::default(),
             scale_factor,
             raster_style,
+            transform: GlyphTransform::IDENTITY,
+        };
+        // Off the pixel grid, the glyph is rasterized turned as it is drawn,
+        // and placed in the viewport, rather than rasterized upright and
+        // turned on the GPU, which would resample it and soften it.
+        let (glyph_origin, transform) = match self.element_space().scene_transformation {
+            Some(transformation) => (
+                transformation
+                    .apply(glyph_origin.map(|value| px(value.0)))
+                    .map(|value| ScaledPixels(value.0)),
+                Some(transformation.rotation_scale),
+            ),
+            None => (glyph_origin, None),
         };
 
-        self.paint_glyph_from_atlas(glyph_origin, params, false, color, element_opacity)
+        self.paint_glyph_from_atlas(
+            glyph_origin,
+            transform,
+            params,
+            false,
+            color,
+            element_opacity,
+        )
     }
 
     /// Paints a glyph whose origin, in device pixels, is `origin`, recording
     /// where it came from so a replay at another scale can rasterize it again.
+    /// A glyph with a `glyph_transform` is rasterized under it and placed in
+    /// the viewport, at `origin` there; any other is placed by the current
+    /// space's transform-table entry.
     fn paint_glyph_from_atlas(
         &mut self,
         origin: Point<ScaledPixels>,
+        glyph_transform: Option<[[f32; 2]; 2]>,
         params: RenderGlyphParams,
         color_glyph: bool,
         mask_color: Hsla,
         opacity: f32,
     ) -> Result<()> {
-        let (transform, clip) = (self.scene_transform(), self.scene_clip());
+        let transform = if glyph_transform.is_some() {
+            0
+        } else {
+            self.scene_transform()
+        };
+        let clip = self.scene_clip();
         let source = GlyphSource {
             params,
             origin,
             color: color_glyph,
+            transform: glyph_transform,
         };
         let Some(glyph) = rasterize_glyph(&self.sprite_atlas, &self.text_system, source)? else {
             return Ok(());
@@ -6865,9 +6941,17 @@ impl Window {
             subpixel_variant: Point::default(),
             scale_factor,
             raster_style,
+            transform: GlyphTransform::IDENTITY,
         };
 
-        self.paint_glyph_from_atlas(glyph_origin, params, true, color, self.element_opacity())
+        self.paint_glyph_from_atlas(
+            glyph_origin,
+            None,
+            params,
+            true,
+            color,
+            self.element_opacity(),
+        )
     }
 
     /// Paint a monochrome SVG into the scene for the next frame at the current stacking context.
@@ -10494,6 +10578,158 @@ mod tests {
         assert_eq!(
             test_window.update(|_, window, _| drawn_modes(window)),
             [(10., GlyphRenderMode::Grayscale)]
+        );
+    }
+
+    /// A line of glyphs, painted under a turn about its middle.
+    struct TurningGlyphsView {
+        degrees: Rc<Cell<f64>>,
+    }
+
+    /// How many glyphs [`TurningGlyphsView`] paints.
+    const TURNING_GLYPHS: usize = 12;
+
+    impl Render for TurningGlyphsView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let degrees = self.degrees.get();
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    let turn = kurbo::Affine::rotate_about(
+                        degrees.to_radians(),
+                        kurbo::Point::new(100., 100.),
+                    );
+                    window.with_transform(turn, |window| {
+                        for index in 0..TURNING_GLYPHS {
+                            window
+                                .paint_glyph(
+                                    point(px(20. + 13.37 * index as f32), px(100.)),
+                                    FontId(7),
+                                    GlyphId(1),
+                                    px(16.),
+                                    hsla(0., 0., 0., 1.),
+                                )
+                                .unwrap();
+                        }
+                    });
+                },
+            )
+            .size_full()
+        }
+    }
+
+    #[test]
+    fn turned_glyphs_are_rasterized_turned_and_placed_in_the_viewport() {
+        let text_system = Arc::new(RasterFormatTextSystem::default());
+        let mut app = TestApp::with_text_system(text_system.clone());
+        let degrees = Rc::new(Cell::new(30.));
+        let mut test_window = app.open_window(move |_, _| TurningGlyphsView { degrees });
+        test_window.draw();
+
+        test_window.update(|_, window, _| {
+            let scene = &window.rendered_frame.scene;
+            assert_eq!(scene.monochrome_sprites.len(), TURNING_GLYPHS);
+            assert!(
+                scene
+                    .monochrome_sprites
+                    .iter()
+                    .all(|sprite| sprite.transform == 0),
+                "turned glyphs are drawn in the viewport, not turned on the GPU"
+            );
+        });
+        let rasterized = text_system.rasterized.lock().unwrap().clone();
+        assert!(!rasterized.is_empty());
+        for params in &rasterized {
+            let [[a, b], [c, d]] = params.transform.matrix();
+            let (sin, cos) = 30f32.to_radians().sin_cos();
+            assert!(
+                (a - cos).abs() < 0.01
+                    && (b + sin).abs() < 0.01
+                    && (c - sin).abs() < 0.01
+                    && (d - cos).abs() < 0.01,
+                "the glyph is rasterized under the turn, not {:?}",
+                params.transform
+            );
+            assert!(params.subpixel_variant.x < TRANSFORMED_SUBPIXEL_VARIANTS);
+            assert!(params.subpixel_variant.y < TRANSFORMED_SUBPIXEL_VARIANTS);
+        }
+    }
+
+    #[test]
+    fn glyphs_turning_slowly_are_rasterized_once_per_step_not_once_per_frame() {
+        let text_system = Arc::new(RasterFormatTextSystem::default());
+        let mut app = TestApp::with_text_system(text_system.clone());
+        let degrees = Rc::new(Cell::new(30.));
+        let mut test_window = app.open_window({
+            let degrees = degrees.clone();
+            move |_, _| TurningGlyphsView { degrees }
+        });
+        // Three hundred frames turning a twentieth of a degree in all, less
+        // than a quantization step for glyphs this size.
+        const FRAMES: usize = 300;
+        for frame in 0..FRAMES {
+            degrees.set(30. + frame as f64 * 0.05 / FRAMES as f64);
+            test_window.update(|_, _, cx| cx.notify());
+            test_window.draw();
+        }
+        let rasterized = text_system.rasterized.lock().unwrap().clone();
+        let transforms: collections::FxHashSet<_> =
+            rasterized.iter().map(|params| params.transform).collect();
+        // At most two steps, each with at most every subpixel variant: the
+        // atlas holds no more than that however many frames are drawn.
+        let bound = 2 * usize::from(TRANSFORMED_SUBPIXEL_VARIANTS).pow(2);
+        assert!(
+            transforms.len() <= 2,
+            "{} quantized transforms for a twentieth of a degree",
+            transforms.len()
+        );
+        assert!(
+            rasterized.len() <= bound,
+            "{} glyphs rasterized over {FRAMES} frames, more than {bound}",
+            rasterized.len()
+        );
+    }
+
+    #[test]
+    fn a_turned_cached_view_rasterizes_its_glyphs_turned() {
+        let text_system = Arc::new(RasterFormatTextSystem::default());
+        let mut app = TestApp::with_text_system(text_system.clone());
+        let renders = Rc::new(Cell::new(0));
+        let transform = Rc::new(Cell::new(kurbo::Affine::IDENTITY));
+        let mut test_window = app.open_window({
+            let (renders, transform) = (renders.clone(), transform.clone());
+            move |_, cx| TurnedGlyphView {
+                glyph: cx.new(|_| CachedGlyphView { renders }),
+                transform,
+            }
+        });
+        test_window.draw();
+        let upright_renders = renders.get();
+
+        transform.set(kurbo::Affine::rotate(0.5));
+        test_window.update(|_, _, cx| cx.notify());
+        test_window.draw();
+        assert_eq!(
+            renders.get(),
+            upright_renders,
+            "the grayscale view is reused under the turn"
+        );
+        test_window.update(|_, window, _| {
+            let scene = &window.rendered_frame.scene;
+            assert_eq!(scene.monochrome_sprites.len(), 1);
+            assert_eq!(
+                scene.monochrome_sprites[0].transform, 0,
+                "the reused glyph is drawn in the viewport, not turned on the GPU"
+            );
+        });
+        let rasterized = text_system.rasterized.lock().unwrap().clone();
+        let turned = rasterized.last().unwrap();
+        let [[a, b], _] = turned.transform.matrix();
+        let (sin, cos) = 0.5f32.sin_cos();
+        assert!(
+            (a - cos).abs() < 0.01 && (b + sin).abs() < 0.01,
+            "the reused glyph is rasterized again under the turn, not {:?}",
+            turned.transform
         );
     }
 

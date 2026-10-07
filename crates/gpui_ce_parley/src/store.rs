@@ -862,7 +862,14 @@ impl SwashGlyphRasterizer {
         let mut font_ref = SwashFontRef::from_index(face.data(), face.face_index as usize)
             .context("Swash could not parse the stored font face")?;
         font_ref.key = cache_key;
-        let subpixel_offset = subpixel_offset(params);
+        let turned = !params.transform.is_identity();
+        let subpixel_offset = if turned {
+            // In device pixels, y up, as the turned outline is.
+            let offset = params.subpixel_offset();
+            Vector::new(offset.x, -offset.y)
+        } else {
+            subpixel_offset(params)
+        };
         let mut scaler = self
             .scale_context
             .builder(font_ref)
@@ -872,9 +879,14 @@ impl SwashGlyphRasterizer {
                     .iter()
                     .map(|coordinate| coordinate.to_bits()),
             )
-            .hint(true)
+            // Hinting fits an outline to the pixel grid, which a turned
+            // glyph's doesn't run along.
+            .hint(!turned)
             .build();
-        let sources: &[Source] = if params.raster_style.mode == GlyphRenderMode::Color {
+        let sources: &[Source] = if turned {
+            // A bitmap strike can't be turned without resampling it.
+            &[Source::Outline]
+        } else if params.raster_style.mode == GlyphRenderMode::Color {
             &[
                 Source::ColorOutline(0),
                 Source::ColorBitmap(StrikeWith::BestFit),
@@ -902,12 +914,20 @@ impl SwashGlyphRasterizer {
             renderer.embolden(f32::from(params.font_size) * params.scale_factor / 48.0);
         }
 
-        if let Some(degrees) = face.synthesis.skew_degrees {
-            renderer.transform(Some(Transform::skew(
-                Angle::from_degrees(degrees),
-                Angle::ZERO,
-            )));
-        }
+        let skew = face
+            .synthesis
+            .skew_degrees
+            .map(|degrees| Transform::skew(Angle::from_degrees(degrees), Angle::ZERO));
+        let turn = turned.then(|| {
+            // The glyph's transform, y down, as a map of the outline's y-up
+            // space.
+            let [[a, b], [c, d]] = params.transform.matrix();
+            Transform::new(a, -c, -b, d, 0., 0.)
+        });
+        renderer.transform(match (skew, turn) {
+            (Some(skew), Some(turn)) => Some(skew.then(&turn)),
+            (skew, turn) => skew.or(turn),
+        });
 
         let glyph_id: u16 = params.glyph_id.0.try_into()?;
         Ok(renderer.render(&mut scaler, glyph_id))
@@ -995,6 +1015,7 @@ mod tests {
             subpixel_variant: point(0, 0),
             scale_factor: 1.0,
             raster_style: PreparedRasterStyle::independent(GlyphRenderMode::Color),
+            transform: gpui::GlyphTransform::IDENTITY,
         };
         let rendered = rasterizer.rasterize(cbdt_face, &params(emoji)).unwrap();
         assert!(rendered.pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
@@ -1030,6 +1051,7 @@ mod tests {
             subpixel_variant: point(0, 0),
             scale_factor: 1.0,
             raster_style: PreparedRasterStyle::independent(GlyphRenderMode::Grayscale),
+            transform: gpui::GlyphTransform::IDENTITY,
         };
         rasterizer.rasterize(native_face, &native_params).unwrap();
         assert_eq!(rasterizer.native.raster_calls, 1);
@@ -1228,6 +1250,7 @@ mod tests {
                 subpixel_variant: point(SUBPIXEL_VARIANTS_X - 1, 0),
                 scale_factor,
                 raster_style: style,
+                transform: gpui::GlyphTransform::IDENTITY,
             };
 
             assert_eq!(
@@ -1275,6 +1298,7 @@ mod tests {
             subpixel_variant: point(0, 0),
             scale_factor: 1.0,
             raster_style: PreparedRasterStyle::independent(GlyphRenderMode::Grayscale),
+            transform: gpui::GlyphTransform::IDENTITY,
         };
         let mut rasterizer = SwashGlyphRasterizer::default();
         let default = rasterizer.rasterize(default_face, &params).unwrap();
@@ -1289,6 +1313,147 @@ mod tests {
             .unwrap();
 
         assert_ne!(optical.pixels, default.pixels);
+    }
+
+    /// A turned glyph is rasterized turned: its ink is where the turn takes
+    /// the upright glyph's, moved by its subpixel offset, and as much of it.
+    #[test]
+    fn portable_rasterization_turns_a_glyph_as_it_is_drawn() {
+        let source = Blob::from(SOURCE_SERIF.data.to_vec());
+        let font = FontRef::new(source.as_ref()).unwrap();
+        let coords = vec![NormalizedCoord::default(); font.axes().len()];
+        let variations =
+            verified_design_variations(&font, &coords, Synthesis::default(), &[]).unwrap();
+        let face = RasterFace {
+            font_id: FontId(1),
+            source_id: source.id(),
+            source: &source,
+            face_index: 0,
+            normalized_coords: &coords,
+            variations: &variations,
+            synthesis: FontSynthesis::default(),
+            has_color_glyphs: false,
+        };
+        let upright = RenderGlyphParams {
+            font_id: face.font_id,
+            glyph_id: GlyphId(font.charmap().map('R').unwrap().to_u32()),
+            font_size: px(48.0),
+            subpixel_variant: point(0, 0),
+            scale_factor: 1.0,
+            raster_style: PreparedRasterStyle::independent(GlyphRenderMode::Grayscale),
+            transform: gpui::GlyphTransform::IDENTITY,
+        };
+        // The ink's total and centroid, in device pixels from the origin.
+        let ink = |glyph: &RasterizedGlyph| {
+            let width = glyph.bounds.size.width.0 as usize;
+            let (mut total, mut x, mut y) = (0., 0., 0.);
+            for (index, &coverage) in glyph.pixels.iter().enumerate() {
+                let coverage = f32::from(coverage);
+                total += coverage;
+                x += coverage * ((index % width) as f32 + 0.5 + glyph.bounds.origin.x.0 as f32);
+                y += coverage * ((index / width) as f32 + 0.5 + glyph.bounds.origin.y.0 as f32);
+            }
+            (total, x / total, y / total)
+        };
+        let mut rasterizer = SwashGlyphRasterizer::default();
+        let (upright_total, upright_x, upright_y) =
+            ink(&rasterizer.rasterize(face, &upright).unwrap());
+
+        for (degrees, variant) in [(30f32, point(1, 2)), (-75., point(3, 0)), (7., point(0, 3))] {
+            let (sin, cos) = degrees.to_radians().sin_cos();
+            let transform = gpui::GlyphTransform::quantize([[cos, -sin], [sin, cos]], 48.);
+            let params = RenderGlyphParams {
+                subpixel_variant: variant,
+                transform,
+                ..upright.clone()
+            };
+            let offset = params.subpixel_offset();
+            let (total, x, y) = ink(&rasterizer.rasterize(face, &params).unwrap());
+            let expected = (
+                cos * upright_x - sin * upright_y + offset.x,
+                sin * upright_x + cos * upright_y + offset.y,
+            );
+            assert!(
+                (x - expected.0).abs() < 0.3 && (y - expected.1).abs() < 0.3,
+                "turned {degrees}°, the ink is centered at ({x}, {y}), not {expected:?}"
+            );
+            assert!(
+                (total / upright_total - 1.).abs() < 0.03,
+                "turned {degrees}°, the glyph has {total} ink, upright {upright_total}"
+            );
+        }
+    }
+
+    /// Quantizing a turn moves a glyph's outline no further than subpixel
+    /// positioning does: its raster differs from one under the exact turn by
+    /// no more than an edge moved an eighth of a pixel would.
+    #[test]
+    fn a_quantized_turn_rasterizes_like_the_exact_turn() {
+        let source = Blob::from(SOURCE_SERIF.data.to_vec());
+        let font = FontRef::new(source.as_ref()).unwrap();
+        let coords = vec![NormalizedCoord::default(); font.axes().len()];
+        let variations =
+            verified_design_variations(&font, &coords, Synthesis::default(), &[]).unwrap();
+        let face = RasterFace {
+            font_id: FontId(1),
+            source_id: source.id(),
+            source: &source,
+            face_index: 0,
+            normalized_coords: &coords,
+            variations: &variations,
+            synthesis: FontSynthesis::default(),
+            has_color_glyphs: false,
+        };
+        let mut rasterizer = SwashGlyphRasterizer::default();
+        let mut worst = (0u8, 0f32);
+        for (character, size) in [('R', 32.), ('g', 32.), ('W', 96.)] {
+            // Turns halfway between steps, where quantization is furthest off.
+            for tenths in (0..900).step_by(37) {
+                let degrees = tenths as f32 / 10. + 0.0437;
+                let (sin, cos) = degrees.to_radians().sin_cos();
+                let matrix = [[cos, -sin], [sin, cos]];
+                let params = |transform| RenderGlyphParams {
+                    font_id: face.font_id,
+                    glyph_id: GlyphId(font.charmap().map(character).unwrap().to_u32()),
+                    font_size: px(size),
+                    subpixel_variant: point(0, 0),
+                    scale_factor: 1.0,
+                    raster_style: PreparedRasterStyle::independent(GlyphRenderMode::Grayscale),
+                    transform,
+                };
+                let quantized = rasterizer
+                    .rasterize(face, &params(gpui::GlyphTransform::quantize(matrix, size)))
+                    .unwrap();
+                // The finest step there is: as good as exact.
+                let exact = rasterizer
+                    .rasterize(face, &params(gpui::GlyphTransform::quantize(matrix, 1e9)))
+                    .unwrap();
+                let at = |glyph: &RasterizedGlyph, x: i32, y: i32| {
+                    let local = (x - glyph.bounds.origin.x.0, y - glyph.bounds.origin.y.0);
+                    let (width, height) = (glyph.bounds.size.width.0, glyph.bounds.size.height.0);
+                    if local.0 < 0 || local.1 < 0 || local.0 >= width || local.1 >= height {
+                        return 0;
+                    }
+                    glyph.pixels[(local.1 * width + local.0) as usize]
+                };
+                let union = quantized.bounds.union(&exact.bounds);
+                let (mut largest, mut total, mut count) = (0u8, 0u32, 0u32);
+                for y in union.origin.y.0..union.origin.y.0 + union.size.height.0 {
+                    for x in union.origin.x.0..union.origin.x.0 + union.size.width.0 {
+                        let difference = at(&quantized, x, y).abs_diff(at(&exact, x, y));
+                        largest = largest.max(difference);
+                        total += u32::from(difference);
+                        count += 1;
+                    }
+                }
+                worst.0 = worst.0.max(largest);
+                worst.1 = worst.1.max(total as f32 / count as f32);
+            }
+        }
+        // An edge moved an eighth of a pixel changes its pixels' coverage by
+        // up to an eighth: 32 levels.
+        assert!(worst.0 <= 40, "a pixel's coverage differs by {}", worst.0);
+        assert!(worst.1 < 2., "pixels differ by {:.2} on average", worst.1);
     }
 
     #[test]
@@ -1328,6 +1493,7 @@ mod tests {
             subpixel_variant: point(0, 0),
             scale_factor: 1.0,
             raster_style,
+            transform: gpui::GlyphTransform::IDENTITY,
         };
 
         let raster = SwashGlyphRasterizer::default()
@@ -1366,6 +1532,7 @@ mod tests {
             subpixel_variant: point(0, 0),
             scale_factor: 1.0,
             raster_style: PreparedRasterStyle::independent(GlyphRenderMode::Grayscale),
+            transform: gpui::GlyphTransform::IDENTITY,
         };
         let mut rasterizer = SwashGlyphRasterizer::default();
         let space = GlyphId(font.charmap().map(' ').unwrap().to_u32());
@@ -1407,6 +1574,7 @@ mod tests {
             subpixel_variant: point(0, 0),
             scale_factor: 1.0,
             raster_style: PreparedRasterStyle::independent(GlyphRenderMode::Color),
+            transform: gpui::GlyphTransform::IDENTITY,
         };
 
         let empty = SwashGlyphRasterizer::default()

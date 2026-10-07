@@ -264,19 +264,37 @@ impl DirectWriteGlyphRenderer {
             isSideways: BOOL(0),
             bidiLevel: 0,
         };
-        let transform = DWRITE_MATRIX {
-            m11: params.scale_factor,
-            m12: 0.0,
-            m21: 0.0,
-            m22: params.scale_factor,
-            dx: 0.0,
-            dy: 0.0,
+        let turned = !params.transform.is_identity();
+        let (transform, baseline_origin_x, baseline_origin_y) = if turned {
+            // The glyph's map to device pixels, with its subpixel offset
+            // after it, in device pixels.
+            let [[a, b], [c, d]] = params.transform.scaled(params.scale_factor);
+            let offset = params.subpixel_offset();
+            let transform = DWRITE_MATRIX {
+                m11: a,
+                m12: c,
+                m21: b,
+                m22: d,
+                dx: offset.x,
+                dy: offset.y,
+            };
+            (transform, 0.0, 0.0)
+        } else {
+            let transform = DWRITE_MATRIX {
+                m11: params.scale_factor,
+                m12: 0.0,
+                m21: 0.0,
+                m22: params.scale_factor,
+                dx: 0.0,
+                dy: 0.0,
+            };
+            let baseline_origin_x =
+                params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32 / params.scale_factor;
+            let baseline_origin_y = params.subpixel_variant.y as f32
+                / gpui::SUBPIXEL_VARIANTS_Y as f32
+                / params.scale_factor;
+            (transform, baseline_origin_x, baseline_origin_y)
         };
-        let baseline_origin_x =
-            params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32 / params.scale_factor;
-        let baseline_origin_y = params.subpixel_variant.y as f32
-            / gpui::SUBPIXEL_VARIANTS_Y as f32
-            / params.scale_factor;
 
         let mut rendering_mode = DWRITE_RENDERING_MODE1::default();
         let mut grid_fit_mode = DWRITE_GRID_FIT_MODE::default();
@@ -299,6 +317,10 @@ impl DirectWriteGlyphRenderer {
             DWRITE_RENDERING_MODE1_OUTLINE => DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
             m => m,
         };
+        // A turned glyph doesn't run along the pixel grid to be fitted to it.
+        if turned {
+            grid_fit_mode = DWRITE_GRID_FIT_MODE_DISABLED;
+        }
 
         let antialias_mode = if params.raster_style.mode == GlyphRenderMode::Subpixel {
             DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE
@@ -1543,6 +1565,7 @@ mod tests {
                 requested_mode: GlyphRenderMode::Color,
                 foreground_dependency: ForegroundDependency::Full,
             }),
+            transform: gpui::GlyphTransform::IDENTITY,
         }
     }
 
@@ -1805,6 +1828,7 @@ mod tests {
             subpixel_variant,
             scale_factor,
             raster_style,
+            transform: gpui::GlyphTransform::IDENTITY,
         })
     }
 
