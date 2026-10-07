@@ -8,6 +8,16 @@ pub const SUBPIXEL_DUAL_SOURCE_WGSL: &str =
 /// Downlevel (WebGL2/GLES) dialect: scene arrays travel via an `rgba32uint` data texture.
 pub const BASE_DOWNLEVEL_WGSL: &str =
     include_str!(concat!(env!("OUT_DIR"), "/gpui_base_downlevel.wgsl"));
+/// [`BASE_WGSL`] without `program_color`, which [`crate::link`] links shader
+/// programs into.
+pub const BASE_LINKABLE_WGSL: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/gpui_base.linkable.wgsl"));
+/// [`BASE_DOWNLEVEL_WGSL`] without `program_color`, which [`crate::link`]
+/// links shader programs into.
+pub const BASE_DOWNLEVEL_LINKABLE_WGSL: &str = include_str!(concat!(
+    env!("OUT_DIR"),
+    "/gpui_base_downlevel.linkable.wgsl"
+));
 
 #[derive(Clone, Copy)]
 pub struct GeneratedBinding {

@@ -127,6 +127,17 @@ fn main() {
         downlevel_dialect("gpui_base_downlevel.wgsl", &base.source),
     );
     downlevel.validate_and_write(&out_dir);
+    // Both without `program_color`, for wgpu renderers to link programs into.
+    write_shader(
+        &out_dir,
+        "gpui_base.linkable.wgsl",
+        &linkable_dialect("gpui_base.wgsl", &base.source),
+    );
+    write_shader(
+        &out_dir,
+        "gpui_base_downlevel.linkable.wgsl",
+        &linkable_dialect("gpui_base_downlevel.wgsl", &downlevel.source),
+    );
 
     let quad = shader_source("quad interface", &shaders::quad::WGSL_SOURCE);
     let monochrome = shader_source(

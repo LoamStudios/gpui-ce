@@ -111,6 +111,15 @@ impl<P: Send + Sync + 'static> LinkedPrograms<P> {
         self.cap = cap.max(1);
     }
 
+    /// Forgets the pipelines linked and any link in progress, keeping the
+    /// programs seen, to link them again for pipelines built anew.
+    pub fn clear(&mut self) {
+        self.linked.clear();
+        self.pipelines = None;
+        self.pending = None;
+        self.failed.clear();
+    }
+
     /// How long the last link took.
     pub fn last_link_time(&self) -> Option<Duration> {
         self.last_link_time
