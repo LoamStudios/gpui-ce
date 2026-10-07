@@ -91,7 +91,7 @@ use element_states::ElementStates;
 pub(crate) use retained::SubframeId;
 use retained::{Entry, ListIndex, RetainedList};
 pub(crate) use transform::{
-    ElementSpace, HitboxClip, Placement, TransformedClip, transformed_bounds,
+    ElementSpace, HitboxClip, Placement, TransformedClip, raster_scale, transformed_bounds,
 };
 mod prompts;
 
@@ -1249,6 +1249,19 @@ impl ViewChunk {
             moved: self.operations_moved,
         }
     }
+}
+
+/// The largest and smallest singular values of a linear map: the most and
+/// least it stretches anything.
+fn singular_values(rotation_scale: [[f32; 2]; 2]) -> (f32, f32) {
+    let [[a, b], [c, d]] = rotation_scale;
+    let sum_of_squares = a * a + b * b + c * c + d * d;
+    let determinant = (a * d - b * c).abs();
+    let spread = (sum_of_squares * sum_of_squares - 4. * determinant * determinant)
+        .max(0.)
+        .sqrt();
+    let largest = ((sum_of_squares + spread) / 2.).sqrt();
+    (largest, determinant / largest.max(f32::MIN_POSITIVE))
 }
 
 /// How far a chunk's scale may drift from the one it was prepared at while
@@ -4929,22 +4942,27 @@ impl Window {
         true
     }
 
-    /// Prepares `chunk` again at the scale it is drawn at, so its text and
-    /// icons are rasterized for it rather than stretched, once its placement
-    /// has settled or has stretched it past [`CHUNK_STRETCH_LIMIT`]. A
-    /// placement that only zooms and moves is folded into the chunk; one that
-    /// turns it is left on the GPU.
+    /// Prepares `chunk` again at the scale and angle it is drawn at, so its
+    /// text and icons are rasterized for it rather than stretched or turned
+    /// on the GPU, once its placement has settled or has stretched it past
+    /// [`CHUNK_STRETCH_LIMIT`]. A placement that only zooms and moves is
+    /// folded into the chunk's geometry; one that turns or skews it is folded
+    /// into its transform table, with its glyphs rasterized turned.
     fn prepare_chunk_at_its_scale(&mut self, chunk: &mut ViewChunk, cx: &App) {
         let settled = chunk.previous_placement == Some(chunk.placement);
         chunk.previous_placement = Some(chunk.placement);
-        let Some(uniform) = crate::scene::UniformPlacement::of(&chunk.placement) else {
-            return;
+        let stretched = match crate::scene::UniformPlacement::of(&chunk.placement) {
+            Some(uniform) => {
+                if (uniform.scale - 1.).abs() < 0.01 {
+                    return;
+                }
+                uniform.scale > CHUNK_STRETCH_LIMIT || uniform.scale < 1. / CHUNK_STRETCH_LIMIT
+            }
+            None => {
+                let (largest, smallest) = singular_values(chunk.placement.rotation_scale);
+                largest > CHUNK_STRETCH_LIMIT || smallest < 1. / CHUNK_STRETCH_LIMIT
+            }
         };
-        if (uniform.scale - 1.).abs() < 0.01 {
-            return;
-        }
-        let stretched =
-            uniform.scale > CHUNK_STRETCH_LIMIT || uniform.scale < 1. / CHUNK_STRETCH_LIMIT;
         if !settled && !stretched {
             // Draw once more, to prepare it if it has settled by then.
             self.chunk_settling = true;
@@ -10669,6 +10687,49 @@ mod tests {
             rasterized.len() <= bound,
             "{} glyphs rasterized over {FRAMES} frames, more than {bound}",
             rasterized.len()
+        );
+    }
+
+    #[test]
+    fn a_turned_cached_view_rasterizes_its_glyphs_turned() {
+        let text_system = Arc::new(RasterFormatTextSystem::default());
+        let mut app = TestApp::with_text_system(text_system.clone());
+        let renders = Rc::new(Cell::new(0));
+        let transform = Rc::new(Cell::new(kurbo::Affine::IDENTITY));
+        let mut test_window = app.open_window({
+            let (renders, transform) = (renders.clone(), transform.clone());
+            move |_, cx| TurnedGlyphView {
+                glyph: cx.new(|_| CachedGlyphView { renders }),
+                transform,
+            }
+        });
+        test_window.draw();
+        let upright_renders = renders.get();
+
+        transform.set(kurbo::Affine::rotate(0.5));
+        test_window.update(|_, _, cx| cx.notify());
+        test_window.draw();
+        assert_eq!(
+            renders.get(),
+            upright_renders,
+            "the grayscale view is reused under the turn"
+        );
+        test_window.update(|_, window, _| {
+            let scene = &window.rendered_frame.scene;
+            assert_eq!(scene.monochrome_sprites.len(), 1);
+            assert_eq!(
+                scene.monochrome_sprites[0].transform, 0,
+                "the reused glyph is drawn in the viewport, not turned on the GPU"
+            );
+        });
+        let rasterized = text_system.rasterized.lock().unwrap().clone();
+        let turned = rasterized.last().unwrap();
+        let [[a, b], _] = turned.transform.matrix();
+        let (sin, cos) = 0.5f32.sin_cos();
+        assert!(
+            (a - cos).abs() < 0.01 && (b + sin).abs() < 0.01,
+            "the reused glyph is rasterized again under the turn, not {:?}",
+            turned.transform
         );
     }
 

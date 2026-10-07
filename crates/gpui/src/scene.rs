@@ -519,6 +519,58 @@ impl Scene {
             PaintOperation::Raster(sprite, source) => {
                 let mut sprite = sprite.clone();
                 let Some(uniform) = uniform.filter(|_| sprite.transform() == 0) else {
+                    // A glyph placed by a turn or skew is rasterized as it is
+                    // placed, and drawn in the viewport, rather than turned
+                    // on the GPU and resampled.
+                    if uniform.is_none()
+                        && sprite.transform() == 0
+                        && let (Primitive::MonochromeSprite(_), RasterSource::Glyph(glyph)) =
+                            (&sprite, &**source)
+                        && !glyph.color
+                        && let Some(glyph) = glyph.placed_by(placement)
+                    {
+                        let bounds = crate::window::transformed_bounds(
+                            placement,
+                            sprite.bounds().map(|value| px(value.0)),
+                        )
+                        .map(|value| ScaledPixels(value.0));
+                        self.place(
+                            &mut sprite,
+                            prev_scene,
+                            adopted,
+                            placed,
+                            placement,
+                            uniform,
+                            content_mask,
+                        );
+                        let Primitive::MonochromeSprite(drawn) = &mut sprite else {
+                            unreachable!()
+                        };
+                        drawn.transform = 0;
+                        drawn.bounds = bounds;
+                        let source = RasterSource::Glyph(glyph);
+                        if bounds.intersect(&drawn.content_mask.bounds).is_empty() {
+                            return Some(ReplayOperation::Primitive(
+                                sprite,
+                                None,
+                                Some(Box::new(source)),
+                            ));
+                        }
+                        let Some(raster) = rasterize(source.clone()) else {
+                            drawn.bounds = Bounds::new(bounds.origin, Size::default());
+                            return Some(ReplayOperation::Primitive(
+                                sprite,
+                                None,
+                                Some(Box::new(source)),
+                            ));
+                        };
+                        (drawn.bounds, drawn.tile) = (raster.bounds, raster.tile);
+                        return Some(ReplayOperation::Primitive(
+                            sprite,
+                            None,
+                            Some(Box::new(raster.source)),
+                        ));
+                    }
                     self.place(
                         &mut sprite,
                         prev_scene,
@@ -618,6 +670,13 @@ impl Scene {
             return;
         }
 
+        // A mask that cuts the primitive is turned with it, as a clip in the
+        // clip table placed by the placement's transform-table entry.
+        let cut_by = primitive.table_entries().is_some().then(|| {
+            let mask = primitive.content_mask().bounds;
+            let bounds = prev_scene.viewport_bounds(primitive);
+            (!bounds.is_contained_within(&mask)).then_some(mask)
+        });
         // Masks are viewport-aligned: they keep the bounds that contain them.
         let mask = |mask: &mut ContentMask<ScaledPixels>| {
             *mask = ContentMask {
@@ -685,6 +744,22 @@ impl Scene {
                     }
                 } else {
                     self.adopt_placed_entries(primitive, prev_scene, adopted, placement);
+                }
+                if let Some(Some(bounds)) = cut_by {
+                    let transform = *placed.transform.get_or_insert_with(|| {
+                        self.push_transform(SceneTransform {
+                            transformation: *placement,
+                            inverse: placement.inverse().unwrap_or(TransformationMatrix::UNIT),
+                        })
+                    });
+                    if let Some((_, clip)) = primitive.table_entries() {
+                        *clip = self.push_clip(SceneClip {
+                            bounds,
+                            corner_radii: Corners::default(),
+                            transform,
+                            parent: *clip,
+                        });
+                    }
                 }
             }
         }
@@ -1567,6 +1642,41 @@ pub(crate) struct GlyphSource {
     /// transform, its origin is in the viewport, and its sprite has no
     /// transform-table entry. `None` for a glyph along the grid.
     pub(crate) transform: Option<[[f32; 2]; 2]>,
+}
+
+impl GlyphSource {
+    /// This glyph, recorded drawn in the viewport, placed by `placement`, a
+    /// turn or skew of the viewport: rasterized under the map from its
+    /// outline to where it now lands. `None` for a placement that flattens
+    /// it.
+    pub(crate) fn placed_by(&self, placement: &TransformationMatrix) -> Option<Self> {
+        let linear = self
+            .transform
+            .unwrap_or(TransformationMatrix::UNIT.rotation_scale);
+        let scale_factor = self.params.scale_factor;
+        let full = TransformationMatrix {
+            rotation_scale: placement.rotation_scale,
+            translation: [0., 0.],
+        }
+        .compose(TransformationMatrix {
+            rotation_scale: linear.map(|row| row.map(|entry| entry * scale_factor)),
+            translation: [0., 0.],
+        })
+        .rotation_scale;
+        // The split between scale and transform, as painting under the
+        // placement would make it.
+        let scale = crate::window::raster_scale(full);
+        if !(scale.is_finite() && scale > 1e-3) {
+            return None;
+        }
+        let mut glyph = self.clone();
+        glyph.params.scale_factor = scale;
+        glyph.transform = Some(full.map(|row| row.map(|entry| entry / scale)));
+        glyph.origin = placement
+            .apply(self.origin.map(|value| px(value.0)))
+            .map(|value| ScaledPixels(value.0));
+        Some(glyph)
+    }
 }
 
 /// Where an SVG's sprite came from.
