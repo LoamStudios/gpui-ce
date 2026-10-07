@@ -3681,7 +3681,7 @@ mod tests {
             transform: 0,
             clip: 0,
             order: 0,
-            padding: 0,
+            paint: 0,
             bounds: scaled(10.0, 60.0, 30.0, 30.0),
             content_mask: full_mask(),
             color: green.into(),

@@ -104,6 +104,8 @@ impl StorageArray {
 
 fn main() {
     println!("cargo:rerun-if-changed=src/shaders");
+    println!("cargo:rerun-if-changed=src/msl.rs");
+    println!("cargo:rerun-if-changed=src/path_types.rs");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set"));
 
@@ -934,7 +936,7 @@ fn write_native_shaders(out_dir: &std::path::Path) {
             pipeline_path: "MONOCHROME_SPRITES",
             source: &shaders::monochrome_sprite::WGSL_SOURCE,
             requires_dual_source_lowering: false,
-            links_programs: false,
+            links_programs: true,
         },
         NativeShaderModule {
             pipeline: &SUBPIXEL_SPRITES,

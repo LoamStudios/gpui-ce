@@ -176,7 +176,7 @@ fn every_primitive_kind_renders() {
         transform: 0,
         clip: 0,
         order: 0,
-        padding: 0,
+        paint: 0,
         bounds: mono_bounds,
         content_mask: full_mask(),
         color: green.into(),

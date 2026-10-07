@@ -233,7 +233,8 @@ mod tests {
                 "smoothed_quads",
                 "shadows",
                 "smoothed_shadows",
-                "path_rasterization"
+                "path_rasterization",
+                "monochrome_sprites"
             ]
         );
         for shader in linkable() {

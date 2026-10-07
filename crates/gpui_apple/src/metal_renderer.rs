@@ -291,8 +291,13 @@ fn bind_scene_uniforms(encoder: &metal::RenderCommandEncoderRef, uniforms: &Scen
         encoder.set_fragment_buffer(slot, Some(&tables.buffer), offset);
     }
     encoder.set_fragment_texture(PHOTO_TILES_SLOT, Some(&uniforms.photo_tiles));
-    // Every pipeline samples with the same sampler, so a photo paint may share
-    // the slot with a pipeline's own texture.
+    // Photo paints are filtered by a sampler of their own, as a pipeline with
+    // a texture of its own may draw them too; a pipeline that has none
+    // shares slot 0 with them, as it always did.
+    encoder.set_fragment_sampler_state(
+        gpui_render::msl::MSL_SCENE_SAMPLER_SLOT as u64,
+        Some(&uniforms.sampler),
+    );
     encoder.set_fragment_sampler_state(SAMPLER_SLOT, Some(&uniforms.sampler));
 }
 
@@ -2132,7 +2137,10 @@ impl MetalRenderer {
         }
 
         let texture = self.sprite_atlas.metal_texture(texture_id);
-        command_encoder.set_render_pipeline_state(&self.monochrome_sprites_pipeline_state);
+        command_encoder.set_render_pipeline_state(match &self.frame_programs {
+            Some(programs) => &programs.monochrome_sprites,
+            None => &self.monochrome_sprites_pipeline_state,
+        });
         bind_scene_uniforms(command_encoder, scene_uniforms);
 
         let buffer_contents =
@@ -2725,7 +2733,7 @@ mod tests {
             transform: 0,
             clip: 0,
             order: 0,
-            padding: 0,
+            paint: 0,
             bounds,
             content_mask: ContentMask {
                 bounds,

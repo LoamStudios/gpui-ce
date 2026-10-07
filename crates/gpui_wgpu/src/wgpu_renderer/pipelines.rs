@@ -107,6 +107,7 @@ pub(super) struct LinkedPaintPipelines {
     pub(super) shadows: WgpuRenderPipeline,
     pub(super) smoothed_shadows: WgpuRenderPipeline,
     pub(super) path_rasterization: WgpuRenderPipeline,
+    pub(super) monochrome_sprites: WgpuRenderPipeline,
 }
 
 /// What building the pipelines that read the paint table takes, to build
@@ -116,6 +117,7 @@ pub(super) struct LinkedPaintPipelines {
 pub(super) struct PaintLinker {
     device: wgpu::Device,
     instance_layout: wgpu::PipelineLayout,
+    monochrome_layout: wgpu::PipelineLayout,
     scene_target: wgpu::ColorTargetState,
     path_rasterization_target: wgpu::ColorTargetState,
     path_sample_count: u32,
@@ -141,7 +143,10 @@ impl PaintLinker {
             create_render_pipeline(
                 &self.device,
                 specification,
-                &self.instance_layout,
+                match specification.data_layout {
+                    shader::DataLayout::MonochromeSprites => &self.monochrome_layout,
+                    _ => &self.instance_layout,
+                },
                 target,
                 samples,
                 &module,
@@ -157,6 +162,7 @@ impl PaintLinker {
                 &self.path_rasterization_target,
                 self.path_sample_count,
             ),
+            monochrome_sprites: create(shader::MONOCHROME_SPRITES, &self.scene_target, 1),
         };
         // Without threads to block, wasm relies on Naga's validation above.
         #[cfg(not(target_family = "wasm"))]
@@ -607,6 +613,7 @@ impl WgpuPipelines {
         let linker = PaintLinker {
             device: device.clone(),
             instance_layout: instance_layout.clone(),
+            monochrome_layout: monochrome_layout.clone(),
             scene_target: scene_target.clone(),
             path_rasterization_target: path_rasterization_target.clone(),
             path_sample_count,

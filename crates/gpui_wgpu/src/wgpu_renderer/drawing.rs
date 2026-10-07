@@ -69,14 +69,12 @@ impl WgpuRenderer {
         pass: &mut wgpu::RenderPass<'_>,
     ) -> frame::DrawResult {
         let texture = self.atlas.get_texture_info(texture_id);
-        self.draw_instances_with_texture(
-            sprites,
-            texture_id,
-            &texture,
-            &self.resources().pipelines.monochrome_sprites,
-            instances,
-            pass,
-        )
+        let resources = self.resources();
+        let pipeline = match &resources.frame_programs {
+            Some(programs) => &programs.monochrome_sprites,
+            None => &resources.pipelines.monochrome_sprites,
+        };
+        self.draw_instances_with_texture(sprites, texture_id, &texture, pipeline, instances, pass)
     }
 
     pub(super) fn draw_subpixel_sprites(

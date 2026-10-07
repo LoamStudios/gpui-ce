@@ -1759,6 +1759,9 @@ pub struct Window {
     /// Inset transitions use these bounds to resolve `auto` from the child's rendered position.
     style_transition_containing_bounds: Option<Bounds<Pixels>>,
     pub(crate) element_opacity: f32,
+    /// What the glyphs painted now are filled with, in place of their
+    /// colour; see [`Window::with_text_fill`].
+    text_paint: Option<crate::ScenePaintRef>,
     /// How many composited groups enclose what is being painted: each draws
     /// into a target of its own; see [`Window::with_compositing`].
     composited_groups: usize,
@@ -2535,6 +2538,7 @@ impl Window {
             element_spaces: Vec::new(),
             transformed_clips: Vec::new(),
             element_opacity: 1.0,
+            text_paint: None,
             composited_groups: 0,
             requested_autoscroll: None,
             last_text_input_configuration: None,
@@ -2771,7 +2775,7 @@ mod atlas_eviction_tests {
         let mut scene = Scene::default();
         scene.insert_primitive(MonochromeSprite {
             order: 0,
-            padding: 0,
+            paint: 0,
             bounds: Bounds::new(
                 point(ScaledPixels(0.), ScaledPixels(0.)),
                 size(ScaledPixels(10.), ScaledPixels(10.)),
@@ -3042,6 +3046,42 @@ impl Window {
             style.refine(refinement);
         }
         style
+    }
+
+    /// The [fill](TextStyle::fill) of the current text style, if any: the
+    /// innermost set, as [`Window::text_style`] would resolve it, without
+    /// resolving the rest.
+    pub fn text_fill(&self) -> Option<crate::Fill> {
+        self.text_style_stack
+            .iter()
+            .rev()
+            .find_map(|refinement| refinement.fill.clone())
+    }
+
+    /// Fills the glyphs `f` paints with `fill`, in place of their colour,
+    /// spanning `bounds`, in the current element's coordinates: a gradient
+    /// or a paint is evaluated in that box's own logical pixels, as when it
+    /// fills an element there, and its glyphs are antialiased in grayscale.
+    /// Emoji keep their colours.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_text_fill<R>(
+        &mut self,
+        fill: &crate::Fill,
+        bounds: Bounds<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        let background = fill.background(bounds, self);
+        let (snapped, transform) = (self.snap_bounds(bounds), self.scene_transform());
+        let paint = self
+            .next_frame
+            .scene
+            .paint_ref(&background, snapped, transform);
+        let previous = self.text_paint.replace(paint);
+        let result = f(self);
+        self.text_paint = previous;
+        result
     }
 
     /// Returns the resolved direction of the current measured or prepainted layout node.
@@ -6455,7 +6495,8 @@ impl Window {
             .paint_point(origin)
             .scale(self.scale_factor());
 
-        let requested_mode = if self.should_use_subpixel_rendering(font_id, font_size) {
+        let filled = self.text_paint.is_some_and(|paint| paint.paint != 0);
+        let requested_mode = if !filled && self.should_use_subpixel_rendering(font_id, font_size) {
             GlyphRenderMode::Subpixel
         } else {
             GlyphRenderMode::Grayscale
@@ -6496,6 +6537,12 @@ impl Window {
         };
         let (bounds, tile, format) = (glyph.bounds, glyph.tile, glyph.format);
         let content_mask = self.snapped_content_mask();
+        // Filled glyphs take the fill's colour, or its paint faded by its
+        // alpha; emoji are drawn below as they are.
+        let (color, paint) = match self.text_paint {
+            Some(fill) => (fill.color.opacity(opacity), fill.paint),
+            None => (mask_color.opacity(opacity).into(), 0),
+        };
 
         let source = glyph.source;
         match format {
@@ -6505,10 +6552,10 @@ impl Window {
                         transform,
                         clip,
                         order: 0,
-                        padding: 0,
+                        paint,
                         bounds,
                         content_mask,
-                        color: mask_color.opacity(opacity).into(),
+                        color,
                         tile,
                         transformation: TransformationMatrix::unit(),
                     }
@@ -6525,7 +6572,7 @@ impl Window {
                         padding: 0,
                         bounds,
                         content_mask,
-                        color: mask_color.opacity(opacity).into(),
+                        color,
                         tile,
                         transformation: TransformationMatrix::unit(),
                     }
@@ -6692,7 +6739,7 @@ impl Window {
                 transform,
                 clip,
                 order: 0,
-                padding: 0,
+                paint: 0,
                 bounds,
                 content_mask,
                 color: color.opacity(element_opacity).into(),
