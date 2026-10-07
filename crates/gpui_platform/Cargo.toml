@@ -122,6 +122,11 @@ path = "tests/meshes_render.rs"
 harness = false
 
 [[test]]
+name = "filters_bench"
+path = "tests/filters_bench.rs"
+harness = false
+
+[[test]]
 name = "meshes_bench"
 path = "tests/meshes_bench.rs"
 harness = false
