@@ -82,6 +82,11 @@ path = "tests/groups_render.rs"
 harness = false
 
 [[test]]
+name = "filters_render"
+path = "tests/filters_render.rs"
+harness = false
+
+[[test]]
 name = "paints_render"
 path = "tests/paints_render.rs"
 harness = false

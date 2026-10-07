@@ -1,5 +1,5 @@
 use super::{AtlasTextureId, BatchIterator, BlendMode, GroupBoundary, Scene};
-use crate::{Bounds, ScaledPixels};
+use crate::{Bounds, ScaledPixels, point};
 use smallvec::SmallVec;
 use std::ops::Range;
 
@@ -118,9 +118,18 @@ impl ScenePlan {
                         let start = &scene.group_boundaries[group.boundary_index];
                         let matched = matched_starts[group.boundary_index];
                         let region = group.region.map(|region| {
-                            region
-                                .dilate(ScaledPixels(start.filter_extent()))
-                                .intersect(&start.content_mask.bounds)
+                            let outsets = start.filter_outsets();
+                            Bounds::from_corners(
+                                point(
+                                    region.origin.x - ScaledPixels(outsets.left),
+                                    region.origin.y - ScaledPixels(outsets.top),
+                                ),
+                                point(
+                                    region.right() + ScaledPixels(outsets.right),
+                                    region.bottom() + ScaledPixels(outsets.bottom),
+                                ),
+                            )
+                            .intersect(&start.content_mask.bounds)
                         });
                         let target = match region {
                             Some(region) if matched && start.masked => {
@@ -263,7 +272,7 @@ fn foldable_batches(
     commands: &[RenderCommand],
 ) -> Option<SmallVec<[PrimitiveBatch; 4]>> {
     if start.blend_mode != BlendMode::Normal
-        || start.max_blur_radius() > 0.0
+        || start.is_filtered()
         || start.masked
         || start.mask_mode.is_some()
     {

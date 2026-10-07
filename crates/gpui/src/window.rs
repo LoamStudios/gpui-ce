@@ -5808,8 +5808,8 @@ impl Window {
         let scale_factor = self.paint_scale();
         let filters: SmallVec<[ScaledFilter; 4]> = filters
             .iter()
-            .filter(|filter| !filter.is_identity())
-            .map(|filter| filter.scale(scale_factor))
+            .filter(|filter| filter.is_blur())
+            .filter_map(|filter| self.scaled_filter(filter, bounds))
             .collect();
         if filters.is_empty() {
             return;
@@ -5851,6 +5851,28 @@ impl Window {
         bounds: Bounds<Pixels>,
         _corner_radii: Corners<Pixels>,
         _corner_smoothing: f32,
+        filters: &[Filter],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_compositing(bounds, 1.0, BlendMode::Normal, filters, f)
+    }
+
+    /// Paints what `f` paints as one picture, run through `filters` in order
+    /// and composited into what is beneath it: CSS's `filter` on an element,
+    /// whose bounds are `bounds`, and its children. The picture is rendered
+    /// into a target of its own, grown to hold what the filters spread, such
+    /// as a blur or a drop shadow; programs are evaluated over `bounds`.
+    ///
+    /// ```ignore
+    /// window.with_filter(bounds, &[Filter::exposure(0.5), Filter::saturate(1.3)], |window| {
+    ///     window.paint_quad(fill(bounds, photo_background));
+    /// });
+    /// ```
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_filter<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
         filters: &[Filter],
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
@@ -5987,11 +6009,9 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.paint_scale();
         let filters: SmallVec<[ScaledFilter; 4]> = filters
             .iter()
-            .filter(|filter| !filter.is_identity())
-            .map(|filter| filter.scale(scale_factor))
+            .filter_map(|filter| self.scaled_filter(filter, bounds))
             .collect();
         let opacity = opacity.clamp(0.0, 1.0);
         if filters.is_empty() && opacity >= 1.0 && blend_mode == BlendMode::Normal && mask.is_none()
@@ -6049,6 +6069,77 @@ impl Window {
         });
 
         result
+    }
+
+    /// `filter`, set on an element whose bounds are `bounds`, in the
+    /// viewport's device pixels: `None` if it has no effect, or is a program
+    /// that does not compile.
+    fn scaled_filter(&mut self, filter: &Filter, bounds: Bounds<Pixels>) -> Option<ScaledFilter> {
+        if filter.is_identity() {
+            return None;
+        }
+        let paint_scale = self.paint_scale();
+        let length = |length: Pixels| ScaledPixels(length.0 * paint_scale);
+        Some(match filter {
+            Filter::Blur(std_deviation) => ScaledFilter::Blur(length(*std_deviation)),
+            Filter::ColorMatrix(matrix) => ScaledFilter::ColorMatrix(*matrix),
+            Filter::DropShadow(shadow) => {
+                let offset = self.element_offset_in_window(shadow.offset);
+                let scale_factor = self.scale_factor();
+                let rgba = crate::hsla_to_rgba(shadow.color);
+                let alpha = rgba.alpha.clamp(0., 1.);
+                ScaledFilter::DropShadow {
+                    offset: point(
+                        ScaledPixels(offset.x.0 * scale_factor),
+                        ScaledPixels(offset.y.0 * scale_factor),
+                    ),
+                    // CSS measures a shadow's blur as twice its deviation.
+                    std_deviation: length(shadow.blur_radius / 2.),
+                    color: [
+                        rgba.color.red * alpha,
+                        rgba.color.green * alpha,
+                        rgba.color.blue * alpha,
+                        alpha,
+                    ],
+                }
+            }
+            Filter::Program(program) => {
+                let compiled = match program.paint.compile() {
+                    Ok(compiled) => compiled,
+                    Err(error) => {
+                        log::error!("a filter program did not compile: {error}");
+                        return None;
+                    }
+                };
+                let to_viewport = TransformationMatrix::from(
+                    kurbo::Affine::scale(f64::from(self.scale_factor()))
+                        * self.element_to_window()
+                        * kurbo::Affine::translate((
+                            f64::from(bounds.origin.x.0),
+                            f64::from(bounds.origin.y.0),
+                        )),
+                );
+                let to_local = to_viewport.inverse().unwrap_or(TransformationMatrix::UNIT);
+                let rgba = crate::hsla_to_rgba(program.paint.fallback_color());
+                let paint = self.next_frame.scene.push_program(
+                    &compiled,
+                    [bounds.size.width.0, bounds.size.height.0],
+                    to_local,
+                    [
+                        rgba.color.red,
+                        rgba.color.green,
+                        rgba.color.blue,
+                        rgba.alpha,
+                    ],
+                );
+                ScaledFilter::Program {
+                    paint,
+                    program: compiled.program.id(),
+                    to_viewport,
+                    extent: length(program.extent),
+                }
+            }
+        })
     }
 
     fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
@@ -6242,6 +6333,10 @@ impl Window {
                 return fallback.into();
             }
         };
+        if compiled.program.reads_input() {
+            log::error!("a shader paint that reads a filter's input fills nothing");
+            return fallback.into();
+        }
         let to_viewport = kurbo::Affine::scale(f64::from(self.scale_factor()))
             * self.element_to_window()
             * kurbo::Affine::translate((

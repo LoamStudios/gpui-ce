@@ -78,6 +78,8 @@ struct ProgramInner {
     id: u32,
     entry_point: String,
     source: String,
+    /// Whether it reads a filter's input, through `program_input`.
+    reads_input: bool,
     lanes: Box<[Lanes]>,
     slots: usize,
 }
@@ -148,6 +150,14 @@ impl Program {
         &self.0.source
     }
 
+    /// Whether it reads a filter's input, so runs only as a filter: its
+    /// source calls `fn program_input(fragment: Fragment, offset:
+    /// vec2<f32>) -> vec4<f32>`, which renderers provide where they run
+    /// filters.
+    pub fn reads_input(&self) -> bool {
+        self.0.reads_input
+    }
+
     /// Number of `vec4<f32>` parameter slots each use of the program reads.
     pub fn parameter_slots(&self) -> usize {
         self.0.slots
@@ -216,27 +226,38 @@ pub(crate) fn compile(root: &Arc<Node>) -> Result<CompiledPaint, ShaderError> {
     })
 }
 
-/// Evaluate an expression on the CPU, at `fragment` if it reads one.
-pub(crate) fn evaluate(node: &Node, fragment: Option<Fragment>) -> Option<Val> {
+/// A filter's input on the CPU: premultiplied colour at a logical-pixel
+/// position in the element.
+pub(crate) type Input<'a> = &'a dyn Fn(wgsl_rs::std::Vec2f) -> wgsl_rs::std::Vec4f;
+
+/// Evaluate an expression on the CPU, at `fragment` if it reads one, and
+/// with `input` if it reads a filter's.
+pub(crate) fn evaluate(
+    node: &Node,
+    fragment: Option<Fragment>,
+    input: Option<Input>,
+) -> Option<Val> {
     if node.depth > MAX_DEPTH {
         return None;
     }
     Evaluator {
         fragment,
+        input,
         bindings: FxHashMap::default(),
         memo: FxHashMap::default(),
     }
     .eval(node)
 }
 
-struct Evaluator {
+struct Evaluator<'a> {
     fragment: Option<Fragment>,
+    input: Option<Input<'a>>,
     /// The state and index of each enclosing loop.
     bindings: FxHashMap<*const Node, Val>,
     memo: FxHashMap<*const Node, Val>,
 }
 
-impl Evaluator {
+impl<'a> Evaluator<'a> {
     /// An evaluator for a body that sees these bindings, and `extra`.
     fn nested(&self, fragment: Option<Fragment>, extra: &[(&Node, Val)]) -> Self {
         let mut bindings = self.bindings.clone();
@@ -247,6 +268,7 @@ impl Evaluator {
         );
         Self {
             fragment,
+            input: self.input,
             bindings,
             memo: FxHashMap::default(),
         }
@@ -289,6 +311,13 @@ impl Evaluator {
                 match op {
                     Op::Uniform(value) | Op::Constant(value) => *value,
                     Op::Fragment => Val::Fragment(self.fragment?),
+                    Op::Input => {
+                        let fragment = Fragment::from_val(args[0]);
+                        let Val::Vec2(offset) = args[1] else {
+                            return None;
+                        };
+                        Val::Vec4((self.input?)(fragment.position + offset))
+                    }
                     Op::Member(name) => eval_member(name, args[0]),
                     Op::Unary(_, eval) | Op::Binary(_, eval) | Op::Call(_, eval) => eval(&args),
                     Op::Construct => eval_construct(node.ty, &args),
@@ -318,6 +347,7 @@ enum OpCode {
     Param,
     Constant([u32; 4]),
     Fragment,
+    Input,
     Member(&'static str),
     Unary(ir::UnOp),
     Binary(ir::BinOp),
@@ -370,7 +400,7 @@ impl Canonical {
                 (leaf(*value, node.rate, &mut self.params)?, SmallVec::new())
             }
             _ if node.folds() => {
-                let value = evaluate(node, None).expect("foldable expressions evaluate");
+                let value = evaluate(node, None, None).expect("foldable expressions evaluate");
                 (leaf(value, node.rate, &mut self.params)?, SmallVec::new())
             }
             Op::Invalid(message) => return Err(ShaderError::Source(message.to_string())),
@@ -394,6 +424,7 @@ impl Canonical {
                 let args = args?;
                 let op = match op {
                     Op::Fragment => OpCode::Fragment,
+                    Op::Input => OpCode::Input,
                     Op::Member(name) => OpCode::Member(name),
                     Op::Unary(op, _) => OpCode::Unary(*op),
                     Op::Binary(op, _) => OpCode::Binary(*op),
@@ -487,6 +518,7 @@ impl Canonical {
             id: lowering.id,
             entry_point,
             source,
+            reads_input: self.codes.iter().any(|code| code.op == OpCode::Input),
             lanes: lanes.into(),
             slots: slots as usize,
         })))
@@ -714,6 +746,7 @@ impl Lowering<'_> {
                     },
                     OpCode::Construct => call(vector_constructor(code.ty), args),
                     OpCode::Select => call("select", args),
+                    OpCode::Input => call("program_input", args),
                     // Loop leaves are bound by their loop's body.
                     OpCode::Param
                     | OpCode::Constant(_)
@@ -806,6 +839,7 @@ pub fn prelude_source() -> &'static str {
 fn validate(source: &str) -> Result<(), ShaderError> {
     const GLUE: &str = "
 fn paint_param(index: u32) -> vec4<f32> { return vec4<f32>(0.0); }
+fn program_input(fragment: Fragment, offset: vec2<f32>) -> vec4<f32> { return vec4<f32>(0.0); }
 ";
     // Renderers clip per pixel around paints, as UI shaders do, so derivatives
     // in loops that exit early are accepted.

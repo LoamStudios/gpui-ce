@@ -3,11 +3,14 @@
 
 use crate::shaders::common::Bounds as ShaderBounds;
 pub use crate::shaders::{
-    common::{GroupBlendMode, GroupMask},
+    common::{GroupBlendMode, GroupFilter, GroupMask},
     group::GroupUniforms,
 };
-use gpui::{BlendMode, Bounds, DevicePixels, MaskMode, ScaledPixels, Size, point, size};
-use wgsl_rs::std::vec2f;
+use gpui::{
+    BlendMode, Bounds, ColorMatrix, DevicePixels, FilterColorSpace, MaskMode, Point, ScaledPixels,
+    Size, TransformationMatrix, point, size,
+};
+use wgsl_rs::std::{vec2f, vec4f};
 
 /// Group targets are sized in steps of this many device pixels, so that a
 /// pool of them is reused as groups change size, as they do while animating.
@@ -108,6 +111,75 @@ impl GroupUniforms {
                 Some((_, MaskMode::Luminance)) => GroupMask::Luminance,
             },
             padding: 0,
+            filter_kind: GroupFilter::None,
+            filter_linear: 0,
+            filter_paint: 0,
+            filter_padding: 0,
+            filter_offset: vec2f(0., 0.),
+            input_translation: vec2f(0., 0.),
+            input_matrix: vec4f(1., 0., 0., 1.),
+            matrix_red: vec4f(1., 0., 0., 0.),
+            matrix_green: vec4f(0., 1., 0., 0.),
+            matrix_blue: vec4f(0., 0., 1., 0.),
+            matrix_alpha: vec4f(0., 0., 0., 1.),
+            matrix_offset: vec4f(0., 0., 0., 0.),
+        }
+    }
+
+    /// A filter pass of `kind` over a group's `target`: it reads the
+    /// picture bound as the group's texture and writes one covering
+    /// `target`, unclipped.
+    fn filter_pass(target: Bounds<DevicePixels>, kind: GroupFilter) -> Self {
+        let mask = Bounds {
+            origin: target.origin.map(|value| ScaledPixels(value.0 as f32)),
+            size: target.size.map(|value| ScaledPixels(value.0 as f32)),
+        };
+        Self {
+            filter_kind: kind,
+            ..Self::composite(target, mask, 1., BlendMode::Normal, Some(target), None)
+        }
+    }
+
+    /// A pass applying `matrix` to the picture, moved by `offset` device
+    /// pixels.
+    pub fn color_matrix(
+        target: Bounds<DevicePixels>,
+        matrix: &ColorMatrix,
+        offset: Point<ScaledPixels>,
+    ) -> Self {
+        let [red, green, blue, alpha, offsets] =
+            matrix.shader_rows().map(|[x, y, z, w]| vec4f(x, y, z, w));
+        Self {
+            filter_linear: u32::from(matrix.color_space == FilterColorSpace::LinearRgb),
+            matrix_red: red,
+            matrix_green: green,
+            matrix_blue: blue,
+            matrix_alpha: alpha,
+            matrix_offset: offsets,
+            filter_offset: vec2f(offset.x.0, offset.y.0),
+            ..Self::filter_pass(target, GroupFilter::ColorMatrix)
+        }
+    }
+
+    /// A pass compositing the picture over the one bound as the backdrop.
+    pub fn merge(target: Bounds<DevicePixels>) -> Self {
+        Self::filter_pass(target, GroupFilter::Merge)
+    }
+
+    /// A pass running the filter program of paint-table entry `paint`,
+    /// which reads the picture through `to_viewport`, from the element's
+    /// logical pixels to the viewport's device pixels.
+    pub fn program(
+        target: Bounds<DevicePixels>,
+        paint: u32,
+        to_viewport: &TransformationMatrix,
+    ) -> Self {
+        let [[a, b], [c, d]] = to_viewport.rotation_scale;
+        Self {
+            filter_paint: paint,
+            input_matrix: vec4f(a, b, c, d),
+            input_translation: vec2f(to_viewport.translation[0], to_viewport.translation[1]),
+            ..Self::filter_pass(target, GroupFilter::Program)
         }
     }
 }

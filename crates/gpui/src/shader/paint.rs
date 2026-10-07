@@ -171,13 +171,40 @@ impl Paint {
 
     /// Evaluate this paint on the CPU, returning premultiplied RGBA.
     /// Returns `None` for excessive depth, or an expression that cannot
-    /// compile. Derivatives evaluate to zero, so edges
-    /// antialiased with [`Scalar::coverage`] are hard on the CPU.
+    /// compile, or one that reads a filter's [input](Pixel::input).
+    /// Derivatives evaluate to zero, so edges antialiased with
+    /// [`Scalar::coverage`] are hard on the CPU.
     pub fn evaluate(&self, fragment: Fragment) -> Option<Vec4f> {
-        match evaluate(&self.node, Some(fragment))? {
+        match evaluate(&self.node, Some(fragment), None)? {
             Val::Vec4(rgba) => Some(rgba),
             _ => None,
         }
+    }
+
+    /// Evaluate this paint on the CPU as a filter, whose
+    /// [input](Pixel::input) at a logical-pixel position in the element is
+    /// `input(position)`, premultiplied RGBA. Otherwise as
+    /// [`Self::evaluate`].
+    pub fn evaluate_filter(
+        &self,
+        fragment: Fragment,
+        input: &dyn Fn(Vec2f) -> Vec4f,
+    ) -> Option<Vec4f> {
+        match evaluate(&self.node, Some(fragment), Some(input))? {
+            Val::Vec4(rgba) => Some(rgba),
+            _ => None,
+        }
+    }
+
+    /// Whether this paint reads a filter's [input](Pixel::input).
+    pub fn reads_input(&self) -> bool {
+        fn reads(node: &Node, seen: &mut collections::FxHashSet<*const Node>) -> bool {
+            if !seen.insert(std::ptr::from_ref(node)) {
+                return false;
+            }
+            matches!(node.op, Op::Input) || node.args.iter().any(|arg| reads(arg, seen))
+        }
+        reads(&self.node, &mut collections::FxHashSet::default())
     }
 
     /// Compile and validate this paint. Clones share the result.
@@ -300,6 +327,24 @@ impl Pixel {
     /// [`Self::along`] and [`Self::across`]. Zero for anything else.
     pub fn stroke(self) -> Vec2 {
         self.fragment().stroke()
+    }
+
+    /// The picture a filter program reads, at this fragment: premultiplied
+    /// colour. Only a paint run as a filter (see
+    /// [`Filter::program`](crate::Filter::program)) has one; as a fill it
+    /// does not compile into the renderer, and draws its fallback colour.
+    pub fn input(self) -> Paint {
+        self.input_at(super::vec2(0.0, 0.0))
+    }
+
+    /// The picture a filter program reads, `offset` logical pixels from
+    /// this fragment in the element's own space: premultiplied colour,
+    /// sampled between pixels linearly. See [`Self::input`].
+    pub fn input_at(self, offset: impl Operand<Value = Vec2f>) -> Paint {
+        Paint::premultiplied(Expr::<Vec4f>::make(
+            Op::Input,
+            [self.fragment().node, offset.into_expr().node],
+        ))
     }
 
     /// Distance along the stroke a mesh strip draws, in logical pixels,

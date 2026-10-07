@@ -18,6 +18,25 @@ const RADIUS_TO_STANDARD_DEVIATION: f32 = 0.5;
 pub const GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS: f32 = 3.0;
 pub const MAX_GAUSSIAN_SAMPLES_PER_SIDE: u32 = 32;
 
+/// Group filters blur at full resolution below this standard deviation, in
+/// device pixels, and at half resolution from it, where the difference
+/// does not show.
+pub const FULL_RESOLUTION_MAX_DEVIATION: f32 = 4.0;
+
+/// The kernel that blurs a group's picture with standard deviation
+/// `std_deviation`, in device pixels, and whether it runs at full
+/// resolution: `None` for no blur. At half resolution, a kernel's deviation
+/// of `std_deviation / 2` texels is `std_deviation` pixels.
+pub fn group_blur_kernel(std_deviation: f32) -> Option<(BlurKernel, bool)> {
+    let full_resolution = std_deviation < FULL_RESOLUTION_MAX_DEVIATION;
+    let radius = if full_resolution {
+        2. * std_deviation
+    } else {
+        std_deviation
+    };
+    Some((BlurKernel::for_radius(radius)?, full_resolution))
+}
+
 #[derive(Clone, Copy)]
 pub enum BlurAxis {
     Horizontal,

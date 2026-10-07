@@ -9,7 +9,8 @@ use gpui_render::{artifacts::NativeShader, link::link_msl};
 use metal::MTLPixelFormat;
 
 use crate::metal_renderer::{
-    PATH_SAMPLE_COUNT, build_path_rasterization_pipeline_state, build_pipeline_state, native_shader,
+    PATH_SAMPLE_COUNT, build_path_rasterization_pipeline_state, build_path_sprite_pipeline_state,
+    build_pipeline_state, native_shader,
 };
 
 /// The pipelines that read the paint table, with programs linked in.
@@ -21,23 +22,25 @@ pub(crate) struct ProgramPipelines {
     pub(crate) path_rasterization: metal::RenderPipelineState,
     pub(crate) meshes: metal::RenderPipelineState,
     pub(crate) monochrome_sprites: metal::RenderPipelineState,
+    pub(crate) group_filter: metal::RenderPipelineState,
 }
 
 /// The pipelines that read the paint table, with `programs` linked in.
 ///
 /// Quads and smoothed quads share one shader module, as do shadows; the
-/// five modules are linked and compiled in parallel, as compiling them is
+/// six modules are linked and compiled in parallel, as compiling them is
 /// most of the work.
 pub(crate) fn link_pipelines(
     device: &metal::Device,
     programs: &[Program],
 ) -> Result<ProgramPipelines, String> {
-    let modules: [&[&str]; 5] = [
+    let modules: [&[&str]; 6] = [
         &["quads", "smoothed_quads"],
         &["shadows", "smoothed_shadows"],
         &["path_rasterization"],
         &["meshes"],
         &["monochrome_sprites"],
+        &["group_filter"],
     ];
     let mut linked = std::thread::scope(|scope| {
         let threads = modules.map(|labels| {
@@ -66,6 +69,7 @@ pub(crate) fn link_pipelines(
         path_rasterization: next(),
         meshes: next(),
         monochrome_sprites: next(),
+        group_filter: next(),
     })
 }
 
@@ -87,7 +91,14 @@ fn link_module(
     Ok(shaders
         .iter()
         .map(|shader| {
-            if shader.label == "path_rasterization" {
+            if shader.label == "group_filter" {
+                build_path_sprite_pipeline_state(
+                    device,
+                    &library,
+                    shader,
+                    MTLPixelFormat::BGRA8Unorm,
+                )
+            } else if shader.label == "path_rasterization" {
                 build_path_rasterization_pipeline_state(
                     device,
                     &library,

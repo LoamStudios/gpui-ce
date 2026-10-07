@@ -26,6 +26,28 @@ pub mod group {
         pub blend_mode: GroupBlendMode,
         pub mask: GroupMask,
         pub padding: u32,
+        /// For a filter pass (`fragment_group_filter`), which writes a new
+        /// picture covering `bounds` from the group's texture: what it does.
+        pub filter_kind: GroupFilter,
+        /// For a colour matrix: 1 to apply it in linear light.
+        pub filter_linear: u32,
+        /// For a program: its paint-table entry.
+        pub filter_paint: u32,
+        pub filter_padding: u32,
+        /// For a colour matrix: how far the picture it reads is moved, in
+        /// device pixels.
+        pub filter_offset: Vec2f,
+        /// For a program: the translation from the element's logical pixels
+        /// to the viewport, and the linear part, row-major.
+        pub input_translation: Vec2f,
+        pub input_matrix: Vec4f,
+        /// For a colour matrix: the coefficients of R, G, B and A in each
+        /// output channel, then the offsets.
+        pub matrix_red: Vec4f,
+        pub matrix_green: Vec4f,
+        pub matrix_blue: Vec4f,
+        pub matrix_alpha: Vec4f,
+        pub matrix_offset: Vec4f,
     }
     uniform!(group(1), binding(0), GROUP_LOCALS: GroupUniforms);
     texture!(group(1), binding(1), GROUP_TEXTURE: Texture2D<f32>);
@@ -261,5 +283,136 @@ pub mod group {
         let mixed = source_color * (1.0 - backdrop.w)
             + blend(locals.blend_mode, backdrop_color, source_color) * backdrop.w;
         vec4f(mixed.x, mixed.y, mixed.z, 1.0) * source.w * coverage
+    }
+
+    /// The group's texture at viewport position `position`: transparent
+    /// outside it.
+    pub fn group_source(position: Vec2f) -> Vec4f {
+        let locals = get!(GROUP_LOCALS);
+        let uv = (position - locals.source_origin) / locals.source_size;
+        if uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0 {
+            return transparent();
+        }
+        texture_sample_level(GROUP_TEXTURE, GROUP_SAMPLER, uv, 0.0)
+    }
+
+    /// The picture a filter program reads, at `position` in the element's
+    /// logical pixels: what `program_input` returns where filters run.
+    pub fn group_filter_input(position: Vec2f) -> Vec4f {
+        let locals = get!(GROUP_LOCALS);
+        let m = locals.input_matrix;
+        let viewport = vec2f(
+            m.x * position.x + m.y * position.y,
+            m.z * position.x + m.w * position.y,
+        ) + locals.input_translation;
+        group_source(viewport)
+    }
+
+    /// `color`, premultiplied, through the pass's colour matrix: applied to
+    /// straight colour, in linear light if the pass asks, and clamped.
+    pub fn group_color_matrix(color: Vec4f) -> Vec4f {
+        let locals = get!(GROUP_LOCALS);
+        let mut rgb = unpremultiply(color);
+        if locals.filter_linear != 0u32 {
+            rgb = srgb_to_linear(rgb);
+        }
+        let straight = vec4f(rgb.x, rgb.y, rgb.z, color.w);
+        let transformed = vec4f(
+            dot(locals.matrix_red, straight),
+            dot(locals.matrix_green, straight),
+            dot(locals.matrix_blue, straight),
+            dot(locals.matrix_alpha, straight),
+        ) + locals.matrix_offset;
+        let clamped = clamp(
+            transformed,
+            vec4f(0.0, 0.0, 0.0, 0.0),
+            vec4f(1.0, 1.0, 1.0, 1.0),
+        );
+        let mut out = clamped.xyz();
+        if locals.filter_linear != 0u32 {
+            out = linear_to_srgb(out);
+        }
+        vec4f(
+            out.x * clamped.w,
+            out.y * clamped.w,
+            out.z * clamped.w,
+            clamped.w,
+        )
+    }
+
+    /// The colour of filter program `id`, premultiplied, at a fragment of
+    /// the element it runs over, as [`program_color`] takes one.
+    ///
+    /// The standard shaders run no programs, so this is `fallback`. A
+    /// renderer that links programs replaces this function, which must stay
+    /// the only one by its name, with one that runs them.
+    pub fn program_filter_color(
+        _id: u32,
+        _uv: Vec2f,
+        _position: Vec2f,
+        _size: Vec2f,
+        _origin: Vec2f,
+        _scale: f32,
+        _stroke: Vec2f,
+        _base: u32,
+        fallback: Vec4f,
+    ) -> Vec4f {
+        vec4f(
+            fallback.x * fallback.w,
+            fallback.y * fallback.w,
+            fallback.z * fallback.w,
+            fallback.w,
+        )
+    }
+
+    /// The colour of the filter program of paint-table entry `index` at
+    /// `viewport_position`, premultiplied.
+    pub fn group_filter_program(index: u32, viewport_position: Vec2f) -> Vec4f {
+        let paint = scene_paint(index);
+        let point =
+            TransformationMatrix::transform_position(paint.transformation, viewport_position);
+        let size = paint.geometry.xy();
+        let units_per_pixel = sqrt(max(
+            abs(determinant(paint.transformation.rotation_scale)),
+            MIN_PROGRAM_BOX_SIZE,
+        ));
+        let scale = 1.0 / units_per_pixel;
+        program_filter_color(
+            u32(paint.geometry.z),
+            point / max(size, vec2f(MIN_PROGRAM_BOX_SIZE, MIN_PROGRAM_BOX_SIZE)),
+            point,
+            size,
+            viewport_position - point * scale,
+            scale,
+            vec2f(0.0, 0.0),
+            paint.first_stop,
+            paint.radii,
+        )
+    }
+
+    /// One pass of a group's filters: the group's picture, in its texture,
+    /// recoloured by a matrix, merged over another picture, or run through a
+    /// program, into a new picture covering the same viewport rectangle.
+    #[fragment]
+    pub fn fragment_group_filter(input: GroupVarying) -> Vec4f {
+        let locals = get!(GROUP_LOCALS);
+        let position = scene_position(input.position.xy());
+        if locals.filter_kind == GroupFilter::Program {
+            return group_filter_program(locals.filter_paint, position);
+        }
+        let source = group_source(position - locals.filter_offset);
+        if locals.filter_kind == GroupFilter::ColorMatrix {
+            return group_color_matrix(source);
+        }
+        if locals.filter_kind == GroupFilter::Merge {
+            let beneath = texture_sample_level(
+                BACKDROP_TEXTURE,
+                GROUP_SAMPLER,
+                (position - locals.backdrop_origin) / locals.backdrop_size,
+                0.0,
+            );
+            return source + beneath * (1.0 - source.w);
+        }
+        source
     }
 }
