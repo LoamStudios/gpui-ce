@@ -5349,7 +5349,10 @@ impl Window {
         let key = (global_id.clone(), TypeId::of::<S>());
         let (subframe, frame) = (self.subframe_stack.last().copied(), self.next_frame.id);
 
-        if let Some(any) = self.element_states.take(&key) {
+        if let Some(any) = self
+            .element_states
+            .take(&key, self.rendered_frame.id, frame)
+        {
             let ElementStateBox {
                 inner,
                 #[cfg(debug_assertions)]

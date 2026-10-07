@@ -35,9 +35,28 @@ pub(crate) struct ElementStates {
 }
 
 impl ElementStates {
-    /// Takes the state at `key` out, to be used.
-    pub(crate) fn take(&mut self, key: &ElementStateKey) -> Option<ElementStateBox> {
-        self.states.remove(key).map(|entry| entry.state)
+    /// Takes the state at `key` out, to be used in `frame`, if it is still
+    /// alive: used in `frame` or `last_frame`, or inside a subframe drawn in
+    /// one of them. A state whose element went undrawn for a frame is dropped
+    /// here, though the lazy sweep has not yet let it go, so a state lasts
+    /// only while its element is drawn in consecutive frames.
+    pub(crate) fn take(
+        &mut self,
+        key: &ElementStateKey,
+        last_frame: usize,
+        frame: usize,
+    ) -> Option<ElementStateBox> {
+        let entry = self.states.remove(key)?;
+        let alive = entry.frame == frame
+            || entry.frame == last_frame
+            || entry.subframe.is_some_and(|subframe| {
+                let mut alive = FxHashMap::default();
+                [last_frame, frame].into_iter().any(|drawn_in| {
+                    alive.clear();
+                    is_drawn(subframe, drawn_in, &self.parents, &self.drawn, &mut alive)
+                })
+            });
+        alive.then_some(entry.state)
     }
 
     /// Puts `state` back at `key`, used in `frame`, in `subframe`.
@@ -148,18 +167,49 @@ mod tests {
         }
         states.sweep(2);
 
-        assert!(states.take(&key(0)).is_some(), "the item's state is kept");
         assert!(
-            states.take(&key(1)).is_none(),
+            states.take(&key(0), 2, 3).is_some(),
+            "the item's state is kept"
+        );
+        assert!(
+            states.take(&key(1), 2, 3).is_none(),
             "the dropped view's state goes"
         );
         assert!(
-            states.take(&key(2)).is_none(),
+            states.take(&key(2), 2, 3).is_none(),
             "an unused state at the root goes"
         );
         assert!(
-            states.take(&key(3)).is_some(),
+            states.take(&key(3), 2, 3).is_some(),
             "a state used this frame is kept"
+        );
+    }
+
+    #[test]
+    fn a_state_whose_element_skipped_a_frame_is_not_handed_back() {
+        let mut states = ElementStates::default();
+        let (page, popup) = (SubframeId::next(), SubframeId::next());
+        // Frame 1 draws a popup at the root and a page with an item in it.
+        states.drawn(page, None, 1);
+        states.drawn(popup, None, 1);
+        states.put(key(0), state(), None, 1);
+        states.put(key(1), state(), Some(popup), 1);
+        states.put(key(2), state(), Some(page), 1);
+        // Frame 2 reuses the page whole and draws nothing else; no sweep runs.
+        states.drawn(page, None, 2);
+
+        // Frame 3 draws everything again.
+        assert!(
+            states.take(&key(0), 2, 3).is_none(),
+            "a root element missing from frame 2 starts over"
+        );
+        assert!(
+            states.take(&key(1), 2, 3).is_none(),
+            "a view missing from frame 2 starts over"
+        );
+        assert!(
+            states.take(&key(2), 2, 3).is_some(),
+            "a view reused whole in frame 2 keeps its states"
         );
     }
 }
