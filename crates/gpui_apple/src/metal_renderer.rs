@@ -469,6 +469,9 @@ pub struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+    /// How long the GPU took over the last frame rendered to an image.
+    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+    last_gpu_time: Option<std::time::Duration>,
 }
 
 impl MetalRenderer {
@@ -736,6 +739,8 @@ impl MetalRenderer {
             path_sample_count: PATH_SAMPLE_COUNT,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
+            #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+            last_gpu_time: None,
         }
     }
 
@@ -915,6 +920,14 @@ impl MetalRenderer {
         self.programs.set_cap(cap);
     }
 
+    /// How long the GPU took over the last frame [rendered to an
+    /// image](Self::render_scene_to_image), for benchmarks.
+    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn last_gpu_time(&self) -> Option<std::time::Duration> {
+        self.last_gpu_time
+    }
+
     /// What drawing meshes has cost: uploads, and the meshes kept.
     #[doc(hidden)]
     pub fn mesh_stats(&self) -> gpui_render::meshes::MeshStats {
@@ -1012,6 +1025,7 @@ impl MetalRenderer {
         }
         command_buffer.commit();
         command_buffer.wait_until_completed();
+        self.last_gpu_time = Some(gpu_time(&command_buffer));
         self.instance_buffer_pool.lock().release(instance_buffer);
 
         let width = size.width.0 as u32;
@@ -2627,6 +2641,20 @@ fn required_instance_buffer_size(scene: &Scene) -> usize {
         }
     }
     required
+}
+
+/// How long the GPU spent on `command_buffer`, which has completed.
+#[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+fn gpu_time(command_buffer: &metal::CommandBufferRef) -> std::time::Duration {
+    let object = command_buffer.as_ptr() as *const objc2::runtime::AnyObject;
+    // SAFETY: a completed `MTLCommandBuffer` answers both, in seconds.
+    let (start, end): (f64, f64) = unsafe {
+        (
+            objc2::msg_send![&*object, GPUStartTime],
+            objc2::msg_send![&*object, GPUEndTime],
+        )
+    };
+    std::time::Duration::from_secs_f64((end - start).max(0.))
 }
 
 /// A mesh kept on the GPU: its vertices, then its indices, in one buffer.

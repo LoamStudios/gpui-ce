@@ -3434,6 +3434,14 @@ impl Window {
             .render_to_image(&self.rendered_frame.scene)
     }
 
+    /// The scene of the most recently rendered frame, for benchmarks that
+    /// render it themselves.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn rendered_scene(&self) -> &Scene {
+        &self.rendered_frame.scene
+    }
+
     /// Returns the current frame's quad and glyph sprite counts.
     #[cfg(any(test, feature = "test-support"))]
     pub fn rendered_primitive_counts(&self) -> (usize, usize, usize, usize) {
