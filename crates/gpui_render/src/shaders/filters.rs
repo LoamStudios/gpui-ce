@@ -106,9 +106,18 @@ pub mod blur {
         pub source_size: Vec2f,
         pub target_size: Vec2f,
         pub corner_smoothing: f32,
-        pub padding0: u32,
+        /// For a downsample: how many source texels, along each axis, make
+        /// one of the target's (2, 4, 8 or 16).
+        pub downsample_factor: u32,
         /// Where the blurred source's first texel sits in the viewport.
         pub source_origin: Vec2f,
+        /// With `tinted` 1, the pass reads the source's coverage in this
+        /// colour, premultiplied, moved by `tint_offset` (in the source's
+        /// texture coordinates): a drop shadow, cast as it is blurred.
+        pub tint: Vec4f,
+        pub tint_offset: Vec2f,
+        pub tinted: u32,
+        pub padding1: u32,
     }
     uniform!(group(1), binding(0), BLUR_LOCALS: BlurUniforms);
     texture!(group(1), binding(1), BLUR_TEXTURE: Texture2D<f32>);
@@ -169,33 +178,89 @@ pub mod blur {
         }
     }
 
+    /// Each target texel averages the `downsample_factor`² source texels it
+    /// covers, a box prefilter: one bilinear sample at the middle of each
+    /// 2×2 of them.
     #[fragment]
     pub fn fragment_blur_downsample(input: BlurVarying) -> Vec4f {
-        if get!(BLUR_LOCALS).downsample_mode == DownsampleMode::HalfResolution {
-            let destination = floor(input.position.xy());
-            let source_coordinates = min(
-                (destination + 0.5) / get!(BLUR_LOCALS).target_size,
-                (get!(BLUR_LOCALS).source_size - 0.5) / get!(BLUR_LOCALS).source_size,
-            );
-            return texture_sample_level(BLUR_TEXTURE, BLUR_SAMPLER, source_coordinates, 0.0);
+        let uniforms = get!(BLUR_LOCALS);
+        if uniforms.downsample_mode == DownsampleMode::HalfResolution {
+            let factor = max(uniforms.downsample_factor, 2u32);
+            let taps = factor / 2u32;
+            let corner = floor(input.position.xy()) * (factor as f32);
+            let last = (uniforms.source_size - 0.5) / uniforms.source_size;
+            let mut sum = vec4f(0.0, 0.0, 0.0, 0.0);
+            let mut row = 0u32;
+            while row < taps {
+                let mut column = 0u32;
+                while column < taps {
+                    let texel =
+                        corner + vec2f(2.0 * (column as f32) + 1.0, 2.0 * (row as f32) + 1.0);
+                    sum = sum + sample_blur_texture(min(texel / uniforms.source_size, last));
+                    column += 1u32;
+                }
+                row += 1u32;
+            }
+            return sum / ((taps * taps) as f32);
         }
         texture_sample_level(BLUR_TEXTURE, BLUR_SAMPLER, input.texture_coordinates, 0.0)
     }
 
+    /// The source at `texture_coordinates`, or, for a tinted pass, its
+    /// coverage there in the tint, moved: transparent where that falls
+    /// outside the source.
     pub fn sample_blur_texture(texture_coordinates: Vec2f) -> Vec4f {
-        texture_sample_level(BLUR_TEXTURE, BLUR_SAMPLER, texture_coordinates, 0.0)
+        let uniforms = get!(BLUR_LOCALS);
+        if uniforms.tinted == 0u32 {
+            return texture_sample_level(BLUR_TEXTURE, BLUR_SAMPLER, texture_coordinates, 0.0);
+        }
+        let moved = texture_coordinates - uniforms.tint_offset;
+        if moved.x < 0.0 || moved.y < 0.0 || moved.x > 1.0 || moved.y > 1.0 {
+            return transparent();
+        }
+        uniforms.tint * texture_sample_level(BLUR_TEXTURE, BLUR_SAMPLER, moved, 0.0).w
     }
 
+    /// A separable Gaussian along `direction`, its weights unnormalized
+    /// (`exp(-d² / 2σ²)` at `d` texels), as the sum normalizes them: each is
+    /// the last times a factor that shrinks by `exp(-1 / σ²)` a texel, for
+    /// no `exp` a tap. Where taps are a texel apart, each two neighbouring
+    /// taps on a side are read as one bilinear sample between them, weighted
+    /// by both: half the reads.
     pub fn gaussian_blur(texture_coordinates: Vec2f) -> Vec4f {
         let uniforms = get!(BLUR_LOCALS);
-        let center_weight = gaussian(0.0, uniforms.standard_deviation);
-        let mut weighted_color = sample_blur_texture(texture_coordinates) * center_weight;
-        let mut weight_sum = center_weight;
+        let variance = uniforms.standard_deviation * uniforms.standard_deviation;
+        let mut weighted_color = sample_blur_texture(texture_coordinates);
+        let mut weight_sum = 1.0;
         let mut sample_index = 1u32;
+
+        if uniforms.sample_step == 1.0 {
+            // The weight at the texel, and the factor to the next one's.
+            let shrink = exp(-1.0 / variance);
+            let mut factor = exp(-0.5 / variance);
+            let mut weight = 1.0;
+            while sample_index <= uniforms.sample_count {
+                weight *= factor;
+                factor *= shrink;
+                let near_weight = weight;
+                weight *= factor;
+                factor *= shrink;
+                let far_weight = select(0.0, weight, sample_index < uniforms.sample_count);
+                let pair_weight = near_weight + far_weight;
+                let distance = sample_index as f32 + far_weight / pair_weight;
+                let coordinate_offset = uniforms.direction * distance;
+                let symmetric_pair = sample_blur_texture(texture_coordinates - coordinate_offset)
+                    + sample_blur_texture(texture_coordinates + coordinate_offset);
+                weighted_color = weighted_color + symmetric_pair * pair_weight;
+                weight_sum += 2.0 * pair_weight;
+                sample_index += 2u32;
+            }
+            return weighted_color / max(weight_sum, MIN_NORMALIZED_WEIGHT);
+        }
 
         while sample_index <= uniforms.sample_count {
             let distance = sample_index as f32 * uniforms.sample_step;
-            let weight = gaussian(distance, uniforms.standard_deviation);
+            let weight = exp(-(distance * distance) / (2.0 * variance));
             let coordinate_offset = uniforms.direction * distance;
             let symmetric_pair = sample_blur_texture(texture_coordinates - coordinate_offset)
                 + sample_blur_texture(texture_coordinates + coordinate_offset);

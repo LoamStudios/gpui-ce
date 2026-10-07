@@ -81,10 +81,10 @@ fn link_module(
     programs: &[Program],
 ) -> Result<Vec<metal::RenderPipelineState>, String> {
     let msl = link_msl(shaders[0], programs).map_err(|error| error.to_string())?;
-    // Programs are written once for the CPU and every GPU: compiled
-    // precisely, they compute what the CPU does.
+    // Programs are written once for the CPU and every GPU: `link_msl` has
+    // them compute precisely, as the CPU does, while the rest of the module
+    // is compiled with fast math, as the standard shaders are.
     let options = metal::CompileOptions::new();
-    options.set_fast_math_enabled(false);
     let library = device
         .new_library_with_source(&msl, &options)
         .map_err(|error| format!("{}: {error}", shaders[0].label))?;

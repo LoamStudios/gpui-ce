@@ -6,7 +6,7 @@ pub use crate::shaders::{
     },
 };
 use gpui::{Bounds, Corners, ScaledPixels};
-use wgsl_rs::std::vec2f;
+use wgsl_rs::std::{vec2f, vec4f};
 
 pub const DOWNSAMPLE_FACTOR: u32 = 2;
 
@@ -19,22 +19,99 @@ pub const GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS: f32 = 3.0;
 pub const MAX_GAUSSIAN_SAMPLES_PER_SIDE: u32 = 32;
 
 /// Group filters blur at full resolution below this standard deviation, in
-/// device pixels, and at half resolution from it, where the difference
-/// does not show.
+/// device pixels, and at a lower one from it, where the difference does not
+/// show.
 pub const FULL_RESOLUTION_MAX_DEVIATION: f32 = 4.0;
 
-/// The kernel that blurs a group's picture with standard deviation
-/// `std_deviation`, in device pixels, and whether it runs at full
-/// resolution: `None` for no blur. At half resolution, a kernel's deviation
-/// of `std_deviation / 2` texels is `std_deviation` pixels.
-pub fn group_blur_kernel(std_deviation: f32) -> Option<(BlurKernel, bool)> {
-    let full_resolution = std_deviation < FULL_RESOLUTION_MAX_DEVIATION;
-    let radius = if full_resolution {
-        2. * std_deviation
-    } else {
-        std_deviation
-    };
-    Some((BlurKernel::for_radius(radius)?, full_resolution))
+/// Past half resolution, a group's blur runs at the lowest resolution at
+/// which its kernel's standard deviation is still this many texels: enough
+/// for the bilinear upsampling of the result to stay within a level of the
+/// Gaussian.
+pub const MIN_DOWNSAMPLED_DEVIATION: f32 = 3.0;
+
+/// The most a group's blur is downsampled, along each axis. Group targets
+/// are whole multiples of it.
+pub const MAX_GROUP_DOWNSAMPLE_FACTOR: u32 = 16;
+
+/// How a group filter blurs a picture: its kernel, in the texels of the
+/// resolution it runs at, and how many of the picture's pixels make one of
+/// those texels along each axis.
+#[derive(Clone, Copy)]
+pub struct GroupBlur {
+    pub kernel: BlurKernel,
+    /// 1 at full resolution, else 2, 4, 8 or 16.
+    pub factor: u32,
+}
+
+/// What a blur's first pass reads in place of its source's colours: its
+/// coverage in `color`, moved by `offset` device pixels. A drop shadow.
+#[derive(Clone, Copy)]
+pub struct BlurTint {
+    pub color: [f32; 4],
+    pub offset: [f32; 2],
+}
+
+/// The passes of a group's blur, over a source of a given size: a box
+/// downsample unless it runs at full resolution, then the two separable
+/// passes, each into a texture of `size`.
+pub struct GroupBlurPasses {
+    pub size: [u32; 2],
+    pub downsample: Option<BlurUniforms>,
+    pub horizontal: BlurUniforms,
+    pub vertical: BlurUniforms,
+}
+
+impl GroupBlur {
+    /// The blur of standard deviation `std_deviation`, in device pixels:
+    /// `None` for no blur. Downsampled by a factor `f`, a kernel of
+    /// `std_deviation / f` texels is `std_deviation` pixels.
+    pub fn new(std_deviation: f32) -> Option<Self> {
+        let factor = if std_deviation < FULL_RESOLUTION_MAX_DEVIATION {
+            1
+        } else {
+            let mut factor = DOWNSAMPLE_FACTOR;
+            while factor < MAX_GROUP_DOWNSAMPLE_FACTOR
+                && std_deviation / (2 * factor) as f32 >= MIN_DOWNSAMPLED_DEVIATION
+            {
+                factor *= 2;
+            }
+            factor
+        };
+        Some(Self {
+            kernel: BlurKernel::for_radius(2. * std_deviation / factor as f32)?,
+            factor,
+        })
+    }
+
+    /// The passes that blur a source of `source_size` pixels, reading it
+    /// through `tint` if given.
+    pub fn passes(&self, source_size: [u32; 2], tint: Option<BlurTint>) -> GroupBlurPasses {
+        let size = source_size.map(|length| length.div_ceil(self.factor).max(1));
+        let source = source_size.map(|length| length.max(1) as f32);
+        let blurred = size.map(|length| length as f32);
+        let tinted = |uniforms: BlurUniforms| match tint {
+            Some(tint) => uniforms.tinted(tint, source),
+            None => uniforms,
+        };
+        let horizontal = BlurUniforms::gaussian(BlurAxis::Horizontal, blurred, self.kernel);
+        let vertical = BlurUniforms::gaussian(BlurAxis::Vertical, blurred, self.kernel);
+        if self.factor == 1 {
+            return GroupBlurPasses {
+                size,
+                downsample: None,
+                horizontal: tinted(horizontal),
+                vertical,
+            };
+        }
+        let mut downsample = BlurUniforms::downsample(source, blurred);
+        downsample.downsample_factor = self.factor;
+        GroupBlurPasses {
+            size,
+            downsample: Some(tinted(downsample)),
+            horizontal,
+            vertical,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -90,11 +167,29 @@ impl BlurUniforms {
     }
 
     pub fn downsample(source_size: [f32; 2], target_size: [f32; 2]) -> Self {
-        with_texture_sizes(
-            empty_uniforms(DownsampleMode::HalfResolution),
-            source_size,
-            target_size,
-        )
+        Self {
+            downsample_factor: DOWNSAMPLE_FACTOR,
+            ..with_texture_sizes(
+                empty_uniforms(DownsampleMode::HalfResolution),
+                source_size,
+                target_size,
+            )
+        }
+    }
+
+    /// This pass reading its source's coverage in `tint`'s colour, moved,
+    /// from a source of `source_size` pixels.
+    pub fn tinted(self, tint: BlurTint, source_size: [f32; 2]) -> Self {
+        let [red, green, blue, alpha] = tint.color;
+        Self {
+            tint: vec4f(red, green, blue, alpha),
+            tint_offset: vec2f(
+                tint.offset[0] / source_size[0],
+                tint.offset[1] / source_size[1],
+            ),
+            tinted: 1,
+            ..self
+        }
     }
 
     pub fn gaussian(axis: BlurAxis, texture_size: [f32; 2], kernel: BlurKernel) -> Self {
@@ -247,14 +342,39 @@ fn empty_uniforms(downsample_mode: DownsampleMode) -> BlurUniforms {
         source_size: vec2f(1.0, 1.0),
         target_size: vec2f(1.0, 1.0),
         corner_smoothing: 0.0,
-        padding0: 0,
+        downsample_factor: 0,
         source_origin: vec2f(0.0, 0.0),
+        tint: vec4f(0.0, 0.0, 0.0, 0.0),
+        tint_offset: vec2f(0.0, 0.0),
+        tinted: 0,
+        padding1: 0,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::downsampled_dimension;
+
+    #[test]
+    fn group_blurs_downsample_as_far_as_their_deviation_allows() {
+        let factor = |std_deviation| super::GroupBlur::new(std_deviation).unwrap().factor;
+        assert!(super::GroupBlur::new(0.).is_none());
+        assert_eq!(factor(1.5), 1);
+        assert_eq!(factor(4.), 2);
+        assert_eq!(factor(11.9), 2);
+        assert_eq!(factor(12.), 4);
+        assert_eq!(factor(16.), 4);
+        assert_eq!(factor(24.), 8);
+        assert_eq!(factor(1000.), super::MAX_GROUP_DOWNSAMPLE_FACTOR);
+        // The kernel keeps the deviation, in texels of its resolution.
+        let blur = super::GroupBlur::new(16.).unwrap();
+        assert_eq!(blur.kernel.standard_deviation, 4.);
+        // Its taps are a texel apart, to be paired.
+        assert_eq!(blur.kernel.sample_step, 1.);
+        let passes = blur.passes([2048, 1600], None);
+        assert_eq!(passes.size, [512, 400]);
+        assert_eq!(passes.downsample.unwrap().downsample_factor, 4);
+    }
 
     #[test]
     fn downsampled_dimensions_cover_odd_edges() {

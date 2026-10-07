@@ -16,6 +16,10 @@ use wgsl_rs::std::{vec2f, vec4f};
 /// pool of them is reused as groups change size, as they do while animating.
 pub const GROUP_TARGET_QUANTUM: i32 = 64;
 
+// A group's blur downsamples its target by whole texels.
+const _: () =
+    assert!((GROUP_TARGET_QUANTUM as u32).is_multiple_of(crate::blur::MAX_GROUP_DOWNSAMPLE_FACTOR));
+
 /// Where a group whose contents cover `region` of the viewport is rendered:
 /// the region rounded out to whole pixels, clipped to the viewport, and
 /// grown to a whole number of quanta. `None` when none of it is in view.
@@ -147,17 +151,54 @@ impl GroupUniforms {
         matrix: &ColorMatrix,
         offset: Point<ScaledPixels>,
     ) -> Self {
+        Self {
+            filter_offset: vec2f(offset.x.0, offset.y.0),
+            ..Self::filter_pass(target, GroupFilter::None).with_color_matrix(matrix)
+        }
+    }
+
+    /// These uniforms recolouring the picture they read by `matrix`: a
+    /// composite does so as it draws it.
+    pub fn with_color_matrix(self, matrix: &ColorMatrix) -> Self {
         let [red, green, blue, alpha, offsets] =
             matrix.shader_rows().map(|[x, y, z, w]| vec4f(x, y, z, w));
         Self {
+            filter_kind: GroupFilter::ColorMatrix,
             filter_linear: u32::from(matrix.color_space == FilterColorSpace::LinearRgb),
             matrix_red: red,
             matrix_green: green,
             matrix_blue: blue,
             matrix_alpha: alpha,
             matrix_offset: offsets,
-            filter_offset: vec2f(offset.x.0, offset.y.0),
-            ..Self::filter_pass(target, GroupFilter::ColorMatrix)
+            ..self
+        }
+    }
+
+    /// A composite's uniforms merging the group's picture over the one bound
+    /// as the backdrop, which covers `target`, as it draws it. Only a
+    /// composite in normal blend mode can, as other modes read the parent
+    /// there.
+    pub fn with_merge(self, target: Bounds<DevicePixels>) -> Self {
+        let beneath = shader_bounds(target);
+        Self {
+            filter_kind: GroupFilter::Merge,
+            backdrop_origin: beneath.origin,
+            backdrop_size: beneath.size,
+            ..self
+        }
+    }
+
+    /// A composite's uniforms doing what `plan`'s composite does to the
+    /// picture it draws, over a group's `target`.
+    pub fn with_composite_filter(
+        self,
+        composite: &gpui::CompositeFilter,
+        target: Bounds<DevicePixels>,
+    ) -> Self {
+        match composite {
+            gpui::CompositeFilter::None => self,
+            gpui::CompositeFilter::ColorMatrix(matrix) => self.with_color_matrix(matrix),
+            gpui::CompositeFilter::Merge { .. } => self.with_merge(target),
         }
     }
 

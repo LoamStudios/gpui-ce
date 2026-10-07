@@ -2802,9 +2802,9 @@ impl GroupBoundary {
     }
 
     /// The passes the group's filters run on its target before it is
-    /// composited.
+    /// composited, and what the composite does in place of the last.
     pub fn filter_plan(&self) -> crate::FilterPlan {
-        crate::FilterPlan::new(&self.filters)
+        crate::FilterPlan::new(&self.filters).fused_into_composite(self.blend_mode)
     }
 
     /// Whether the group has to be rendered on its own and composited: it
