@@ -11,6 +11,7 @@ use gpui_render::{
     blur::{
         BlurAxis, BlurKernel, BlurUniforms, FilterCompositeClip,
         GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, ScissorRectangle, downsampled_dimension,
+        group_blur_kernel,
     },
     group::{GroupUniforms, group_target_bounds},
     path_types::{PathRasterizationVertex, PathSprite},
@@ -296,6 +297,8 @@ struct DirectXRenderPipelines {
     blur_blend_replace: ID3D11BlendState,
     blur_blend_composite: ID3D11BlendState,
     group_composite: GroupCompositePipeline,
+    /// Runs a pass of a group's filters, other than a blur, into a texture of its own.
+    group_filter: GroupCompositePipeline,
 }
 
 /// The generated `group_composite` pipeline: one draw per isolated group, compositing its
@@ -1921,12 +1924,28 @@ impl DirectXRenderer {
         source: &ColorTarget,
         kernel: BlurKernel,
     ) -> Result<Option<(ColorTarget, ColorTarget, [f32; 2])>> {
+        self.blur_at(source, kernel, false)
+    }
+
+    /// Blurs the whole of `source` into two textures taken from the pool, at full resolution
+    /// or half: the first holds the result, the second is spare. Returns them with the
+    /// result's size, or `None` if the pool has no room.
+    fn blur_at(
+        &mut self,
+        source: &ColorTarget,
+        kernel: BlurKernel,
+        full_resolution: bool,
+    ) -> Result<Option<(ColorTarget, ColorTarget, [f32; 2])>> {
         let full_width = source.size.width.0.max(0) as u32;
         let full_height = source.size.height.0.max(0) as u32;
-        let blur_size = [
-            downsampled_dimension(full_width) as f32,
-            downsampled_dimension(full_height) as f32,
-        ];
+        let blur_size = if full_resolution {
+            [full_width as f32, full_height as f32]
+        } else {
+            [
+                downsampled_dimension(full_width) as f32,
+                downsampled_dimension(full_height) as f32,
+            ]
+        };
         let half_size = size(
             DevicePixels(blur_size[0] as i32),
             DevicePixels(blur_size[1] as i32),
@@ -1949,6 +1968,35 @@ impl DirectXRenderer {
             MinDepth: 0.0,
             MaxDepth: 1.0,
         };
+
+        if full_resolution {
+            // Separable gaussian source -> ping -> pong.
+            self.dx_blur_pass(
+                &self.pipelines.blur_vertex,
+                &self.pipelines.blur_fragment,
+                &self.pipelines.blur_blend_replace,
+                &ping.rtv,
+                &source.srv,
+                BlurUniforms::gaussian(BlurAxis::Horizontal, blur_size, kernel),
+                &half_viewport,
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                3,
+                true,
+            )?;
+            self.dx_blur_pass(
+                &self.pipelines.blur_vertex,
+                &self.pipelines.blur_fragment,
+                &self.pipelines.blur_blend_replace,
+                &pong.rtv,
+                &ping.srv,
+                BlurUniforms::gaussian(BlurAxis::Vertical, blur_size, kernel),
+                &half_viewport,
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                3,
+                true,
+            )?;
+            return Ok(Some((pong, ping, blur_size)));
+        }
 
         // Downsample source -> ping, then separable gaussian ping -> pong -> ping.
         self.dx_blur_pass(
@@ -1995,15 +2043,15 @@ impl DirectXRenderer {
     /// copy of what is beneath it in the parent, and cut to its mask, if it has one. Gives back
     /// the textures it takes; the caller gives back the group's and its mask's.
     fn composite_group(&mut self, boundary: &GroupBoundary, group: &FrameTarget) -> Result<()> {
-        let blurred = match BlurKernel::for_radius(boundary.max_blur_radius()) {
-            Some(kernel) => self.blur(&group.color, kernel)?,
-            None => None,
-        };
-        // The blur covers the same viewport rectangle as the group, at half resolution.
-        let source = blurred
-            .as_ref()
-            .map_or(&group.color.srv, |(blurred, _, _)| &blurred.srv)
-            .clone();
+        let (filtered, spare) = self.filter_group(boundary, group)?;
+        let source = filtered.srv.clone();
+        // The composite draws into the parent, in its viewport.
+        let parent_bounds = self
+            .targets
+            .last()
+            .context("an isolated group has a parent")?
+            .bounds;
+        self.write_globals(parent_bounds)?;
         let backdrop = if boundary.blend_mode != BlendMode::Normal {
             self.copy_backdrop(group.bounds)?
         } else {
@@ -2029,14 +2077,187 @@ impl DirectXRenderer {
             .map_or(&source, |(mask, _, _)| &mask.srv);
         self.draw_group_composite(uniforms, &source, backdrop_srv, mask_srv)?;
 
-        if let Some((blurred, spare, _)) = blurred {
-            self.give_back(blurred);
-            self.give_back(spare);
+        for texture in spare {
+            self.give_back(texture);
         }
         if let Some(backdrop) = backdrop {
             self.give_back(backdrop);
         }
         Ok(())
+    }
+
+    /// Runs `boundary`'s filters on `group`, an isolated group's finished target: each pass of
+    /// its plan reads pictures covering the target and writes one, in a texture from the pool.
+    /// Returns the picture to composite, and the textures to give back once it is.
+    fn filter_group(
+        &mut self,
+        boundary: &GroupBoundary,
+        group: &FrameTarget,
+    ) -> Result<(ColorTarget, Vec<ColorTarget>)> {
+        let plan = boundary.filter_plan();
+        if plan.passes.is_empty() {
+            return Ok((group.color.clone(), Vec::new()));
+        }
+        // The passes draw over the group's target, in its viewport.
+        self.write_globals(group.bounds)?;
+        let last_reads = plan.last_reads();
+        // Each pass's picture, and whether it was taken from the pool for it and not yet
+        // given back.
+        let mut pictures: Vec<(ColorTarget, bool)> = Vec::new();
+        let mut spare = Vec::new();
+        for (index, pass) in plan.passes.iter().enumerate() {
+            let picture = |image: FilterImage| match image {
+                FilterImage::Content => group.color.clone(),
+                FilterImage::Pass(pass) => pictures[pass].0.clone(),
+            };
+            let result = match *pass {
+                FilterPass::Blur {
+                    input,
+                    std_deviation,
+                } => {
+                    let input = picture(input);
+                    let blurred = match group_blur_kernel(std_deviation) {
+                        Some((kernel, full_resolution)) => {
+                            self.blur_at(&input, kernel, full_resolution)?
+                        }
+                        None => None,
+                    };
+                    match blurred {
+                        Some((blurred, unused, _)) => {
+                            self.give_back(unused);
+                            (blurred, true)
+                        }
+                        None => (input, false),
+                    }
+                }
+                FilterPass::ColorMatrix {
+                    input,
+                    ref matrix,
+                    offset,
+                } => {
+                    let input = picture(input);
+                    let uniforms = GroupUniforms::color_matrix(group.bounds, matrix, offset);
+                    self.run_group_filter_pass(group, &input, &input, uniforms, false)?
+                }
+                FilterPass::Merge { top, bottom } => {
+                    let (top, bottom) = (picture(top), picture(bottom));
+                    let uniforms = GroupUniforms::merge(group.bounds);
+                    self.run_group_filter_pass(group, &top, &bottom, uniforms, false)?
+                }
+                FilterPass::Program {
+                    input,
+                    paint,
+                    program,
+                    ref to_viewport,
+                } => {
+                    let input = picture(input);
+                    // Until its program is linked, the pass leaves the picture as it is.
+                    if self.frame_programs.is_some() && self.programs.linked().contains(&program) {
+                        let uniforms = GroupUniforms::program(group.bounds, paint, to_viewport);
+                        self.run_group_filter_pass(group, &input, &input, uniforms, true)?
+                    } else {
+                        (input, false)
+                    }
+                }
+            };
+            pictures.push(result);
+            // Let go of the pictures no later pass reads.
+            for read in FilterPlan::inputs(pass) {
+                if let FilterImage::Pass(read) = read
+                    && last_reads[read] == Some(index)
+                    && Some(read) != plan.output
+                    && pictures[read].1
+                {
+                    pictures[read].1 = false;
+                    spare.push(pictures[read].0.clone());
+                }
+            }
+        }
+        let output = match plan.output {
+            Some(output) => pictures[output].0.clone(),
+            None => group.color.clone(),
+        };
+        spare.extend(
+            pictures
+                .into_iter()
+                .filter_map(|(texture, owned)| owned.then_some(texture)),
+        );
+        Ok((output, spare))
+    }
+
+    /// Runs one pass of a group's filters, other than a blur, into a texture from the pool
+    /// covering the group's target, reading `source` and, for a merge, `beneath`. Returns its
+    /// picture and whether it was taken from the pool: `source` if the pool has no room.
+    fn run_group_filter_pass(
+        &mut self,
+        group: &FrameTarget,
+        source: &ColorTarget,
+        beneath: &ColorTarget,
+        uniforms: GroupUniforms,
+        linked: bool,
+    ) -> Result<(ColorTarget, bool)> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        let Some(output) = resources
+            .target_pool
+            .take(&devices.device, group.bounds.size)
+        else {
+            return Ok((source.clone(), false));
+        };
+        let ctx = &devices.device_context;
+        let pipeline = &self.pipelines.group_filter;
+        let (vertex, fragment) = match (&self.frame_programs, linked) {
+            (Some(programs), true) => (
+                &programs.group_filter.vertex,
+                &programs.group_filter.fragment,
+            ),
+            _ => (&pipeline.vertex, &pipeline.fragment),
+        };
+        update_buffer(ctx, &pipeline.params_buffer, &[uniforms])?;
+        let cbuffers = self.globals.cbuffers();
+        let params = [Some(pipeline.params_buffer.clone())];
+        let scene_tables = self.level.slot.tables.clone();
+        let textures = [source.srv.clone(), beneath.srv.clone()];
+        let unbound: [Option<ID3D11ShaderResourceView>; 2] = [None, None];
+        let viewport = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: output.size.width.0 as f32,
+            Height: output.size.height.0 as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        unsafe {
+            ctx.ClearRenderTargetView(
+                output.rtv.as_ref().context("filter target view missing")?,
+                &[0.0; 4],
+            );
+            ctx.OMSetRenderTargets(Some(slice::from_ref(&output.rtv)), None);
+            ctx.RSSetViewports(Some(slice::from_ref(&viewport)));
+            ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            ctx.VSSetShader(vertex, None);
+            ctx.PSSetShader(fragment, None);
+            ctx.VSSetConstantBuffers(0, Some(&cbuffers));
+            ctx.PSSetConstantBuffers(0, Some(&cbuffers));
+            ctx.VSSetConstantBuffers(DATA_REGISTER, Some(&params));
+            ctx.PSSetConstantBuffers(DATA_REGISTER, Some(&params));
+            // A program reads its parameters from the paint table.
+            ctx.VSSetShaderResources(SCENE_TABLES_REGISTER, Some(&scene_tables));
+            ctx.PSSetShaderResources(SCENE_TABLES_REGISTER, Some(&scene_tables));
+            self.globals.bind_photo_tiles(ctx);
+            ctx.PSSetShaderResources(GROUP_TEXTURE_REGISTER, Some(&textures));
+            ctx.PSSetShaderResources(MASK_TEXTURE_REGISTER, Some(slice::from_ref(&source.srv)));
+            ctx.PSSetSamplers(
+                GROUP_SAMPLER_REGISTER,
+                Some(slice::from_ref(&self.globals.sampler)),
+            );
+            ctx.OMSetBlendState(&pipeline.blend, None, 0xFFFFFFFF);
+            ctx.DrawInstanced(4, 1, 0, 0);
+            // Unbind the pictures, which later passes may draw into.
+            ctx.PSSetShaderResources(GROUP_TEXTURE_REGISTER, Some(&unbound));
+            ctx.PSSetShaderResources(MASK_TEXTURE_REGISTER, Some(&unbound[..1]));
+        }
+        Ok((output, true))
     }
 
     /// Copies what the current target holds under `bounds` into a texture taken from the pool,
@@ -2417,6 +2638,14 @@ impl DirectXRenderPipelines {
             blend: create_premultiplied_blend_state(device)?,
         };
 
+        let group_filter = ShaderModule::GroupFilter.bytecode()?;
+        let group_filter = GroupCompositePipeline {
+            vertex: create_vertex_shader(device, group_filter.vertex)?,
+            fragment: create_fragment_shader(device, group_filter.fragment)?,
+            params_buffer: create_constant_buffer(device, std::mem::size_of::<GroupUniforms>())?,
+            blend: create_premultiplied_blend_state(device)?,
+        };
+
         let surface = ShaderModule::Surface.bytecode()?;
         let surfaces = SurfacePipeline {
             vertex: create_vertex_shader(device, surface.vertex)?,
@@ -2448,6 +2677,7 @@ impl DirectXRenderPipelines {
             blur_blend_replace,
             blur_blend_composite,
             group_composite,
+            group_filter,
         })
     }
 }
@@ -3468,6 +3698,7 @@ pub(crate) mod shader_resources {
         BlurComposite,
         SmoothedBlurComposite,
         GroupComposite,
+        GroupFilter,
     }
 
     impl ShaderModule {
@@ -3491,6 +3722,7 @@ pub(crate) mod shader_resources {
                 Self::BlurComposite => "blur_composite",
                 Self::SmoothedBlurComposite => "smoothed_blur_composite",
                 Self::GroupComposite => "group_composite",
+                Self::GroupFilter => "group_filter",
             };
             NATIVE_SHADERS
                 .iter()

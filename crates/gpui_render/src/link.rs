@@ -380,6 +380,57 @@ mod tests {
         }
     }
 
+    /// A program reading a filter's input links into the group-filter
+    /// shader, where `program_input` reads the group's picture, on Metal and
+    /// Direct3D; the shaders that fill paints leave it out.
+    #[test]
+    fn filter_programs_link_only_where_groups_are_filtered() {
+        let sharpen = shader::paint(|px| {
+            let around = px.input_at(shader::vec2(1.0, 0.0)).rgba()
+                + px.input_at(shader::vec2(-1.0, 0.0)).rgba();
+            Paint::premultiplied(px.input().rgba() * 3.0 - around)
+        })
+        .compile()
+        .unwrap()
+        .program;
+        assert!(sharpen.reads_input());
+        let grain = grain().compile().unwrap().program;
+        assert!(!grain.reads_input());
+        let programs = [sharpen.clone(), grain.clone()];
+        for shader in linkable() {
+            let source = linked_wgsl(shader, &programs).unwrap();
+            let filters = shader.label == "group_filter";
+            assert_eq!(
+                source.contains(sharpen.entry_point()),
+                filters,
+                "{}",
+                shader.label
+            );
+            assert!(source.contains(grain.entry_point()), "{}", shader.label);
+            assert_eq!(
+                source.contains("group_filter_input(fragment.position + offset)"),
+                filters,
+                "{}",
+                shader.label
+            );
+            let msl = link_msl(shader, &programs).unwrap();
+            let hlsl = link_hlsl(shader, &programs).unwrap();
+            if filters {
+                assert!(msl.contains(sharpen.entry_point()));
+                assert!(hlsl.contains(sharpen.entry_point()));
+            }
+        }
+        // The wgpu module runs both, in both dialects.
+        for dialect in [Dialect::Modern, Dialect::Downlevel] {
+            let (source, _, _) = link(&Linkable::base(dialect), &programs).unwrap();
+            assert!(source.contains(&format!(
+                "case {}u: {{ return {}(",
+                sharpen.id(),
+                sharpen.entry_point()
+            )));
+        }
+    }
+
     /// The downlevel module, programs linked in, translates to GLSL ES 3.00
     /// for WebGL2, as wgpu's GL backend does.
     #[test]

@@ -38,6 +38,7 @@ pub(crate) struct LinkedShaders {
     pub(crate) path_rasterization: PipelineVariant,
     pub(crate) meshes: PipelineVariant,
     pub(crate) monochrome_sprites: PipelineVariant,
+    pub(crate) group_filter: PipelineVariant,
 }
 
 // SAFETY: Direct3D 11 devices are free-threaded, and shader objects are
@@ -54,19 +55,20 @@ unsafe impl Send for LinkingDevice {}
 
 /// The shaders that read the paint table, with `programs` linked in.
 ///
-/// Quads and smoothed quads share one module, as do shadows; the five
+/// Quads and smoothed quads share one module, as do shadows; the six
 /// modules are translated and compiled in parallel, as compiling them is
 /// most of the work.
 pub(crate) fn link_shaders(
     device: &LinkingDevice,
     programs: &[Program],
 ) -> Result<LinkedShaders, String> {
-    let modules: [&[&str]; 5] = [
+    let modules: [&[&str]; 6] = [
         &["quads", "smoothed_quads"],
         &["shadows", "smoothed_shadows"],
         &["path_rasterization"],
         &["meshes"],
         &["monochrome_sprites"],
+        &["group_filter"],
     ];
     let mut linked = std::thread::scope(|scope| {
         let threads = modules.map(|labels| {
@@ -95,6 +97,7 @@ pub(crate) fn link_shaders(
         path_rasterization: next(),
         meshes: next(),
         monochrome_sprites: next(),
+        group_filter: next(),
     })
 }
 
