@@ -11,8 +11,8 @@ use gpui::{
 use gpui_render::{
     artifacts::{NATIVE_SHADERS, NativeShader},
     blur::{
-        BlurAxis, BlurKernel, BlurUniforms, GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, ScissorRectangle,
-        downsampled_dimension,
+        BlurAxis, BlurKernel, BlurTint, BlurUniforms, GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS,
+        GroupBlur, ScissorRectangle, downsampled_dimension,
     },
     group::{GroupUniforms, group_target_bounds},
     path_types::{self, PathRasterizationVertex},
@@ -1743,172 +1743,173 @@ impl MetalRenderer {
         kernel: BlurKernel,
         scissor: ScissorRectangle,
     ) -> Option<(metal::Texture, metal::Texture, [f32; 2])> {
-        self.blur_texture(
-            command_buffer,
-            &source.texture,
-            &source.uniforms,
-            kernel,
-            Some(scissor),
-            false,
-        )
-    }
-
-    /// Blurs all of `source`, or what `scissor` covers of its half-resolution copy, into two
-    /// textures taken from the pool, at full resolution or half: the first holds the result,
-    /// the second is spare. Returns them with the result's size, or `None` if the pool has no
-    /// room.
-    fn blur_texture(
-        &mut self,
-        command_buffer: &metal::CommandBufferRef,
-        source: &metal::TextureRef,
-        uniforms: &SceneUniforms,
-        kernel: BlurKernel,
-        scissor: Option<ScissorRectangle>,
-        full_resolution: bool,
-    ) -> Option<(metal::Texture, metal::Texture, [f32; 2])> {
-        let full_width = source.width() as u32;
-        let full_height = source.height() as u32;
-        let (blur_width, blur_height) = if full_resolution {
-            (full_width, full_height)
-        } else {
-            (
-                downsampled_dimension(full_width),
-                downsampled_dimension(full_height),
-            )
-        };
-        let blur_size = [blur_width as f32, blur_height as f32];
+        let full_width = source.texture.width() as u32;
+        let full_height = source.texture.height() as u32;
+        let blur_size = [
+            downsampled_dimension(full_width) as f32,
+            downsampled_dimension(full_height) as f32,
+        ];
         let blur_viewport_size = Size {
             width: DevicePixels(blur_size[0] as i32),
             height: DevicePixels(blur_size[1] as i32),
         };
-        let scissor = scissor.unwrap_or(ScissorRectangle {
-            x: 0,
-            y: 0,
-            width: blur_width,
-            height: blur_height,
-        });
         let ping = self.target_pool.take(&self.device, blur_viewport_size)?;
         let Some(pong) = self.target_pool.take(&self.device, blur_viewport_size) else {
             self.target_pool.give_back(ping);
             return None;
         };
-
-        if full_resolution {
-            // Separable gaussian source -> ping -> pong.
-            self.run_metal_blur_pass(
-                command_buffer,
-                &self.blur_pipeline_state,
+        // Downsample source -> ping, then separable gaussian ping -> pong -> ping.
+        for (pipeline, target, input, uniforms) in [
+            (
+                &self.blur_downsample_pipeline_state,
                 &ping,
-                source,
-                blur_viewport_size,
-                uniforms,
-                BlurUniforms::gaussian(BlurAxis::Horizontal, blur_size, kernel),
-                scissor,
-                metal::MTLPrimitiveType::Triangle,
-                3,
-                false,
-            );
-            self.run_metal_blur_pass(
-                command_buffer,
+                &*source.texture,
+                BlurUniforms::downsample([full_width as f32, full_height as f32], blur_size),
+            ),
+            (
                 &self.blur_pipeline_state,
                 &pong,
+                &*ping,
+                BlurUniforms::gaussian(BlurAxis::Horizontal, blur_size, kernel),
+            ),
+            (
+                &self.blur_pipeline_state,
                 &ping,
-                blur_viewport_size,
-                uniforms,
+                &*pong,
                 BlurUniforms::gaussian(BlurAxis::Vertical, blur_size, kernel),
+            ),
+        ] {
+            self.run_metal_blur_pass(
+                command_buffer,
+                pipeline,
+                target,
+                input,
+                blur_viewport_size,
+                &source.uniforms,
+                uniforms,
                 scissor,
                 metal::MTLPrimitiveType::Triangle,
                 3,
                 false,
             );
-            return Some((pong, ping, blur_size));
         }
-
-        // Downsample source -> ping, then separable gaussian ping -> pong -> ping.
-        self.run_metal_blur_pass(
-            command_buffer,
-            &self.blur_downsample_pipeline_state,
-            &ping,
-            source,
-            blur_viewport_size,
-            uniforms,
-            BlurUniforms::downsample([full_width as f32, full_height as f32], blur_size),
-            scissor,
-            metal::MTLPrimitiveType::Triangle,
-            3,
-            false,
-        );
-        self.run_metal_blur_pass(
-            command_buffer,
-            &self.blur_pipeline_state,
-            &pong,
-            &ping,
-            blur_viewport_size,
-            uniforms,
-            BlurUniforms::gaussian(BlurAxis::Horizontal, blur_size, kernel),
-            scissor,
-            metal::MTLPrimitiveType::Triangle,
-            3,
-            false,
-        );
-        self.run_metal_blur_pass(
-            command_buffer,
-            &self.blur_pipeline_state,
-            &ping,
-            &pong,
-            blur_viewport_size,
-            uniforms,
-            BlurUniforms::gaussian(BlurAxis::Vertical, blur_size, kernel),
-            scissor,
-            metal::MTLPrimitiveType::Triangle,
-            3,
-            false,
-        );
         Some((ping, pong, blur_size))
     }
 
-    /// Runs `boundary`'s filters on `group`, an isolated group's finished target: each pass
-    /// of its plan reads pictures covering the target and writes one, in a texture from the
-    /// pool. Returns the picture to composite, and the textures to give back once it is.
+    /// Blurs all of `source`, a group's picture, as `blur` says, reading it through `tint`
+    /// if given: downsampled first, unless it runs at full resolution, then separably. Returns
+    /// the result, in a texture from the pool, or `None` if the pool has no room.
+    fn group_blur(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        source: &metal::TextureRef,
+        uniforms: &SceneUniforms,
+        blur: GroupBlur,
+        tint: Option<BlurTint>,
+    ) -> Option<metal::Texture> {
+        let passes = blur.passes([source.width() as u32, source.height() as u32], tint);
+        let size = Size {
+            width: DevicePixels(passes.size[0] as i32),
+            height: DevicePixels(passes.size[1] as i32),
+        };
+        let scissor = ScissorRectangle {
+            x: 0,
+            y: 0,
+            width: passes.size[0],
+            height: passes.size[1],
+        };
+        let ping = self.target_pool.take(&self.device, size)?;
+        let Some(pong) = self.target_pool.take(&self.device, size) else {
+            self.target_pool.give_back(ping);
+            return None;
+        };
+        // [downsample source -> pong], horizontal -> ping, vertical -> pong.
+        let mut input: &metal::TextureRef = source;
+        if let Some(downsample) = passes.downsample {
+            self.run_metal_blur_pass(
+                command_buffer,
+                &self.blur_downsample_pipeline_state,
+                &pong,
+                input,
+                size,
+                uniforms,
+                downsample,
+                scissor,
+                metal::MTLPrimitiveType::Triangle,
+                3,
+                false,
+            );
+            input = &pong;
+        }
+        self.run_metal_blur_pass(
+            command_buffer,
+            &self.blur_pipeline_state,
+            &ping,
+            input,
+            size,
+            uniforms,
+            passes.horizontal,
+            scissor,
+            metal::MTLPrimitiveType::Triangle,
+            3,
+            false,
+        );
+        self.run_metal_blur_pass(
+            command_buffer,
+            &self.blur_pipeline_state,
+            &pong,
+            &ping,
+            size,
+            uniforms,
+            passes.vertical,
+            scissor,
+            metal::MTLPrimitiveType::Triangle,
+            3,
+            false,
+        );
+        self.target_pool.give_back(ping);
+        Some(pong)
+    }
+
+    /// Runs `plan`, `boundary`'s filters, on `group`, an isolated group's finished target:
+    /// each pass reads pictures covering the target and writes one, in a texture from the
+    /// pool. Returns the picture to composite, the one its composite merges it over if it
+    /// does, and the textures to give back once it is composited.
     fn filter_group(
         &mut self,
         command_buffer: &metal::CommandBufferRef,
-        boundary: &gpui::GroupBoundary,
+        plan: &gpui::FilterPlan,
         group: &FrameTarget,
-    ) -> (metal::Texture, SmallVec<[metal::Texture; 4]>) {
-        let plan = boundary.filter_plan();
+    ) -> (
+        metal::Texture,
+        Option<metal::Texture>,
+        SmallVec<[metal::Texture; 4]>,
+    ) {
         let last_reads = plan.last_reads();
         // Each pass's picture, and whether it was taken from the pool for it.
         let mut pictures = SmallVec::<[(metal::Texture, bool); 4]>::new();
         let mut spare = SmallVec::<[metal::Texture; 4]>::new();
         let size = group.bounds.size;
+        let picture = |pictures: &[(metal::Texture, bool)], image: gpui::FilterImage| match image {
+            gpui::FilterImage::Content => group.texture.clone(),
+            gpui::FilterImage::Pass(pass) => pictures[pass].0.clone(),
+        };
         for (index, pass) in plan.passes.iter().enumerate() {
-            let picture = |image: gpui::FilterImage| match image {
-                gpui::FilterImage::Content => group.texture.clone(),
-                gpui::FilterImage::Pass(pass) => pictures[pass].0.clone(),
-            };
             let result = match *pass {
                 gpui::FilterPass::Blur {
                     input,
                     std_deviation,
+                    tint,
                 } => {
-                    let input = picture(input);
-                    match gpui_render::blur::group_blur_kernel(std_deviation).and_then(
-                        |(kernel, full_resolution)| {
-                            self.blur_texture(
-                                command_buffer,
-                                &input,
-                                &group.uniforms,
-                                kernel,
-                                None,
-                                full_resolution,
-                            )
-                        },
-                    ) {
-                        Some((blurred, unused, _)) => {
-                            self.target_pool.give_back(unused);
-                            (blurred, true)
-                        }
+                    let input = picture(&pictures, input);
+                    let tint = tint.map(|tint| BlurTint {
+                        color: tint.color,
+                        offset: [tint.offset.x.0, tint.offset.y.0],
+                    });
+                    match GroupBlur::new(std_deviation).and_then(|blur| {
+                        self.group_blur(command_buffer, &input, &group.uniforms, blur, tint)
+                    }) {
+                        Some(blurred) => (blurred, true),
                         None => (input, false),
                     }
                 }
@@ -1917,7 +1918,7 @@ impl MetalRenderer {
                     ref matrix,
                     offset,
                 } => {
-                    let input = picture(input);
+                    let input = picture(&pictures, input);
                     let uniforms = GroupUniforms::color_matrix(group.bounds, matrix, offset);
                     self.run_group_filter_pass(
                         command_buffer,
@@ -1931,7 +1932,7 @@ impl MetalRenderer {
                     .map_or((input, false), |output| (output, true))
                 }
                 gpui::FilterPass::Merge { top, bottom } => {
-                    let (top, bottom) = (picture(top), picture(bottom));
+                    let (top, bottom) = (picture(&pictures, top), picture(&pictures, bottom));
                     let uniforms = GroupUniforms::merge(group.bounds);
                     self.run_group_filter_pass(
                         command_buffer,
@@ -1950,7 +1951,7 @@ impl MetalRenderer {
                     program,
                     ref to_viewport,
                 } => {
-                    let input = picture(input);
+                    let input = picture(&pictures, input);
                     // Until its program is linked, the pass leaves the picture as it is.
                     let linked =
                         self.frame_programs.is_some() && self.programs.linked().contains(&program);
@@ -1972,11 +1973,12 @@ impl MetalRenderer {
                 }
             };
             pictures.push(result);
-            // Let go of the pictures no later pass reads.
+            // Let go of the pictures no later pass reads, nor the composite.
             for read in gpui::FilterPlan::inputs(pass) {
                 if let gpui::FilterImage::Pass(read) = read
                     && last_reads[read] == Some(index)
                     && Some(read) != plan.output
+                    && plan.composite_inputs() != Some(gpui::FilterImage::Pass(read))
                     && pictures[read].1
                 {
                     pictures[read].1 = false;
@@ -1985,22 +1987,19 @@ impl MetalRenderer {
             }
         }
         let output = match plan.output {
-            Some(output) => {
-                let (texture, owned) = pictures[output].clone();
-                if owned {
-                    spare.push(texture.clone());
-                }
-                texture
-            }
+            Some(output) => pictures[output].0.clone(),
             None => group.texture.clone(),
         };
-        // Pictures that were taken and never read again, which the plan does not make.
-        for (texture, owned) in pictures {
-            if owned && !spare.iter().any(|spare| spare.as_ptr() == texture.as_ptr()) {
-                spare.push(texture);
-            }
-        }
-        (output, spare)
+        let beneath = plan
+            .composite_inputs()
+            .map(|image| picture(&pictures, image));
+        // The pictures still held, given back once composited.
+        spare.extend(
+            pictures
+                .into_iter()
+                .filter_map(|(texture, owned)| owned.then_some(texture)),
+        );
+        (output, beneath, spare)
     }
 
     /// Runs one pass of a group's filters, other than a blur, into a texture of `size` from the
@@ -2047,7 +2046,7 @@ impl MetalRenderer {
         Some(output)
     }
 
-    /// Composites `group`, an isolated group's finished target, into `parent`: blurred by its
+    /// Composites `group`, an isolated group's finished target, into `parent`: through its
     /// filters, faded by its opacity, and mixed by its blend mode with a copy of what is beneath
     /// it in `parent`. Gives the group's textures back to the pool.
     fn composite_group(
@@ -2057,7 +2056,8 @@ impl MetalRenderer {
         group: FrameTarget,
         parent: &FrameTarget,
     ) {
-        let (source, mut spare) = self.filter_group(command_buffer, boundary, &group);
+        let plan = boundary.filter_plan();
+        let (source, beneath, mut spare) = self.filter_group(command_buffer, &plan, &group);
         let backdrop = (boundary.blend_mode != BlendMode::Normal)
             .then(|| self.copy_backdrop(command_buffer, parent, group.bounds))
             .flatten();
@@ -2071,7 +2071,8 @@ impl MetalRenderer {
                 .mask
                 .as_ref()
                 .map(|(_, bounds, mode)| (*bounds, *mode)),
-        );
+        )
+        .with_composite_filter(&plan.composite, group.bounds);
         let encoder = parent.encoder(command_buffer, None);
         encoder.set_render_pipeline_state(&self.group_composite_pipeline_state);
         bind_scene_uniforms(encoder, &parent.uniforms);
@@ -2086,9 +2087,16 @@ impl MetalRenderer {
             &uniforms as *const GroupUniforms as *const _,
         );
         encoder.set_fragment_texture(PRIMARY_TEXTURE_SLOT, Some(&source));
+        // The backdrop slot holds the parent's copy for a blend mode, or what a merge puts
+        // the picture over; the shader reads neither otherwise.
         encoder.set_fragment_texture(
             SECONDARY_TEXTURE_SLOT,
-            Some(backdrop.as_deref().unwrap_or(&source)),
+            Some(
+                backdrop
+                    .as_deref()
+                    .or(beneath.as_deref())
+                    .unwrap_or(&source),
+            ),
         );
         encoder.set_fragment_texture(
             MASK_TEXTURE_SLOT,

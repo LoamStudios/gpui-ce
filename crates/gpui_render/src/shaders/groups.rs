@@ -263,13 +263,28 @@ pub mod group {
                 coverage *= dot(mask.xyz(), vec3f(0.2125, 0.7154, 0.0721));
             }
         }
-        let source = texture_sample_level(
+        let mut source = texture_sample_level(
             GROUP_TEXTURE,
             GROUP_SAMPLER,
             (position - locals.source_origin) / locals.source_size,
             0.0,
         );
+        // The last of the group's filters, done as it is drawn: a colour
+        // matrix, or (in normal blend mode, which leaves the backdrop free)
+        // a merge over the picture bound there.
+        if locals.filter_kind == GroupFilter::ColorMatrix {
+            source = group_color_matrix(source);
+        }
         if locals.blend_mode == GroupBlendMode::Normal {
+            if locals.filter_kind == GroupFilter::Merge {
+                let beneath = texture_sample_level(
+                    BACKDROP_TEXTURE,
+                    GROUP_SAMPLER,
+                    (position - locals.backdrop_origin) / locals.backdrop_size,
+                    0.0,
+                );
+                source = source + beneath * (1.0 - source.w);
+            }
             return source * coverage;
         }
         let backdrop = texture_sample_level(

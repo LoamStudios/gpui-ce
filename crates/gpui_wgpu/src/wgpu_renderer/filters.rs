@@ -5,8 +5,8 @@ use gpui::{
 use gpui_render::shaders::interface as shader_interface;
 use gpui_render::{
     blur::{
-        BlurAxis, BlurKernel, FilterCompositeClip, GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS,
-        ScissorRectangle, downsampled_dimension, group_blur_kernel,
+        BlurAxis, BlurKernel, BlurTint, FilterCompositeClip, GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS,
+        GroupBlur, ScissorRectangle, downsampled_dimension,
     },
     group::GroupUniforms,
     shaders::blur::BlurUniforms,
@@ -30,7 +30,7 @@ pub(super) struct FrameUniformRequirements {
     pub(super) target_count: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<BlurUniforms>() == 112);
+const _: () = assert!(std::mem::size_of::<BlurUniforms>() == 144);
 const _: () = assert!(std::mem::size_of::<GroupUniforms>() == 224);
 
 impl WgpuRenderer {
@@ -108,16 +108,13 @@ impl WgpuRenderer {
             source.bounds.size,
             source.globals_offset,
             kernel,
-            Some(scissor),
-            false,
+            scissor,
         )
     }
 
-    /// Blurs all of `source`, a texture of `size`, or what `scissor` covers of its
-    /// half-resolution copy, at full resolution or half, into two textures taken from the
-    /// pool: the first holds the result, the second is spare. Returns them with the result's
-    /// size, or `None` if the pool has no room.
-    #[allow(clippy::too_many_arguments)]
+    /// Blurs what `scissor` covers of the half-resolution copy of `source`, a texture of
+    /// `size`, into two textures taken from the pool: the first holds the result, the second
+    /// is spare. Returns them with the result's size, or `None` if the pool has no room.
     fn blur_view(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -125,60 +122,24 @@ impl WgpuRenderer {
         size: Size<DevicePixels>,
         globals_offset: u32,
         kernel: BlurKernel,
-        scissor: Option<ScissorRectangle>,
-        full_resolution: bool,
+        scissor: ScissorRectangle,
     ) -> Option<(PooledTexture, PooledTexture, [f32; 2])> {
         let full_width = size.width.0.max(0) as u32;
         let full_height = size.height.0.max(0) as u32;
-        let (blur_width, blur_height) = if full_resolution {
-            (full_width, full_height)
-        } else {
-            (
-                downsampled_dimension(full_width),
-                downsampled_dimension(full_height),
-            )
-        };
+        let (blur_width, blur_height) = (
+            downsampled_dimension(full_width),
+            downsampled_dimension(full_height),
+        );
         let blur_size = [blur_width as f32, blur_height as f32];
         let blur_texture_size = Size {
             width: DevicePixels(blur_width as i32),
             height: DevicePixels(blur_height as i32),
         };
-        let scissor = scissor.unwrap_or(ScissorRectangle {
-            x: 0,
-            y: 0,
-            width: blur_width,
-            height: blur_height,
-        });
         let ping = self.take_pooled_texture(blur_texture_size)?;
         let Some(pong) = self.take_pooled_texture(blur_texture_size) else {
             self.give_back_pooled_texture(ping);
             return None;
         };
-
-        if full_resolution {
-            // Separable gaussian source -> ping -> pong.
-            self.run_blur_pass(
-                encoder,
-                "blur_horizontal",
-                &self.resources().pipelines.blur,
-                &ping.view,
-                source,
-                globals_offset,
-                BlurUniforms::gaussian(BlurAxis::Horizontal, blur_size, kernel),
-                scissor,
-            );
-            self.run_blur_pass(
-                encoder,
-                "blur_vertical",
-                &self.resources().pipelines.blur,
-                &pong.view,
-                &ping.view,
-                globals_offset,
-                BlurUniforms::gaussian(BlurAxis::Vertical, blur_size, kernel),
-                scissor,
-            );
-            return Some((pong, ping, blur_size));
-        }
 
         // Downsample source -> ping, then separable gaussian ping -> pong -> ping.
         self.run_blur_pass(
@@ -214,47 +175,124 @@ impl WgpuRenderer {
         Some((ping, pong, blur_size))
     }
 
-    /// Runs `boundary`'s filters on `group`, an isolated group's finished target: each pass
-    /// of its plan reads pictures covering the target and writes one, in a texture from the
-    /// pool. Returns the picture to composite, and the textures to give back once it is.
+    /// Blurs all of `source`, a group's picture of `size`, as `blur` says, reading it
+    /// through `tint` if given: downsampled first, unless it runs at full resolution, then
+    /// separably. Returns the result, in a texture from the pool, or `None` if the pool has
+    /// no room.
+    fn group_blur(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &wgpu::TextureView,
+        size: Size<DevicePixels>,
+        globals_offset: u32,
+        blur: GroupBlur,
+        tint: Option<BlurTint>,
+    ) -> Option<PooledTexture> {
+        let passes = blur.passes(
+            [size.width.0.max(0) as u32, size.height.0.max(0) as u32],
+            tint,
+        );
+        let blurred_size = Size {
+            width: DevicePixels(passes.size[0] as i32),
+            height: DevicePixels(passes.size[1] as i32),
+        };
+        let scissor = ScissorRectangle {
+            x: 0,
+            y: 0,
+            width: passes.size[0],
+            height: passes.size[1],
+        };
+        let ping = self.take_pooled_texture(blurred_size)?;
+        let Some(pong) = self.take_pooled_texture(blurred_size) else {
+            self.give_back_pooled_texture(ping);
+            return None;
+        };
+        // [downsample source -> pong], horizontal -> ping, vertical -> pong.
+        let mut input = source;
+        if let Some(downsample) = passes.downsample {
+            self.run_blur_pass(
+                encoder,
+                "blur_downsample",
+                &self.resources().pipelines.blur_downsample,
+                &pong.view,
+                input,
+                globals_offset,
+                downsample,
+                scissor,
+            );
+            input = &pong.view;
+        }
+        self.run_blur_pass(
+            encoder,
+            "blur_horizontal",
+            &self.resources().pipelines.blur,
+            &ping.view,
+            input,
+            globals_offset,
+            passes.horizontal,
+            scissor,
+        );
+        self.run_blur_pass(
+            encoder,
+            "blur_vertical",
+            &self.resources().pipelines.blur,
+            &pong.view,
+            &ping.view,
+            globals_offset,
+            passes.vertical,
+            scissor,
+        );
+        self.give_back_pooled_texture(ping);
+        Some(pong)
+    }
+
+    /// Runs `plan`, a group's filters, on `group`, an isolated group's finished target:
+    /// each pass reads pictures covering the target and writes one, in a texture from the
+    /// pool. Returns the picture to composite, the one its composite merges it over if it
+    /// does, and the textures to give back once it is composited.
     fn filter_group(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        boundary: &GroupBoundary,
+        plan: &FilterPlan,
         group: &FrameTarget,
-    ) -> (wgpu::TextureView, Vec<PooledTexture>) {
-        let plan = boundary.filter_plan();
+    ) -> (
+        wgpu::TextureView,
+        Option<wgpu::TextureView>,
+        Vec<PooledTexture>,
+    ) {
         let last_reads = plan.last_reads();
         // Each pass's picture, and its texture if it was taken from the pool for it and
         // not yet given back.
         let mut pictures: Vec<(wgpu::TextureView, Option<PooledTexture>)> = Vec::new();
         let mut spare = Vec::new();
+        let picture = |pictures: &[(wgpu::TextureView, Option<PooledTexture>)],
+                       image: FilterImage| match image {
+            FilterImage::Content => group.view.clone(),
+            FilterImage::Pass(pass) => pictures[pass].0.clone(),
+        };
         for (index, pass) in plan.passes.iter().enumerate() {
-            let picture = |image: FilterImage| match image {
-                FilterImage::Content => group.view.clone(),
-                FilterImage::Pass(pass) => pictures[pass].0.clone(),
-            };
             let result = match *pass {
                 FilterPass::Blur {
                     input,
                     std_deviation,
+                    tint,
                 } => {
-                    let input = picture(input);
-                    match group_blur_kernel(std_deviation).and_then(|(kernel, full_resolution)| {
-                        self.blur_view(
+                    let input = picture(&pictures, input);
+                    let tint = tint.map(|tint| BlurTint {
+                        color: tint.color,
+                        offset: [tint.offset.x.0, tint.offset.y.0],
+                    });
+                    match GroupBlur::new(std_deviation).and_then(|blur| {
+                        self.group_blur(
                             encoder,
                             &input,
                             group.bounds.size,
                             group.globals_offset,
-                            kernel,
-                            None,
-                            full_resolution,
+                            blur,
+                            tint,
                         )
                     }) {
-                        Some((blurred, unused, _)) => {
-                            self.give_back_pooled_texture(unused);
-                            (blurred.view.clone(), Some(blurred))
-                        }
+                        Some(blurred) => (blurred.view.clone(), Some(blurred)),
                         None => (input, None),
                     }
                 }
@@ -263,12 +301,12 @@ impl WgpuRenderer {
                     ref matrix,
                     offset,
                 } => {
-                    let input = picture(input);
+                    let input = picture(&pictures, input);
                     let uniforms = GroupUniforms::color_matrix(group.bounds, matrix, offset);
                     self.run_group_filter_pass(encoder, group, &input, &input, uniforms, false)
                 }
                 FilterPass::Merge { top, bottom } => {
-                    let (top, bottom) = (picture(top), picture(bottom));
+                    let (top, bottom) = (picture(&pictures, top), picture(&pictures, bottom));
                     let uniforms = GroupUniforms::merge(group.bounds);
                     self.run_group_filter_pass(encoder, group, &top, &bottom, uniforms, false)
                 }
@@ -278,7 +316,7 @@ impl WgpuRenderer {
                     program,
                     ref to_viewport,
                 } => {
-                    let input = picture(input);
+                    let input = picture(&pictures, input);
                     // Until its program is linked, the pass leaves the picture as it is.
                     let resources = self.resources();
                     let linked = resources.frame_programs.is_some()
@@ -292,11 +330,12 @@ impl WgpuRenderer {
                 }
             };
             pictures.push(result);
-            // Let go of the pictures no later pass reads.
+            // Let go of the pictures no later pass reads, nor the composite.
             for read in FilterPlan::inputs(pass) {
                 if let FilterImage::Pass(read) = read
                     && last_reads[read] == Some(index)
                     && Some(read) != plan.output
+                    && plan.composite_inputs() != Some(FilterImage::Pass(read))
                     && let Some(texture) = pictures[read].1.take()
                 {
                     spare.push(texture);
@@ -307,8 +346,11 @@ impl WgpuRenderer {
             Some(output) => pictures[output].0.clone(),
             None => group.view.clone(),
         };
+        let beneath = plan
+            .composite_inputs()
+            .map(|image| picture(&pictures, image));
         spare.extend(pictures.into_iter().filter_map(|(_, texture)| texture));
-        (output, spare)
+        (output, beneath, spare)
     }
 
     /// Runs one pass of a group's filters, other than a blur, into a texture from the pool
@@ -435,7 +477,7 @@ impl WgpuRenderer {
         self.give_back_pooled_texture(pong);
     }
 
-    /// Composites `group`, an isolated group's finished target, into `parent`: blurred by
+    /// Composites `group`, an isolated group's finished target, into `parent`: through
     /// its filters, faded by its opacity, cut to its mask, and mixed by its blend mode
     /// with a copy of what is beneath it in `parent`. Gives the group's textures, and its
     /// mask's, back to the pool.
@@ -446,7 +488,8 @@ impl WgpuRenderer {
         group: FrameTarget,
         parent: &FrameTarget,
     ) {
-        let (filtered, spare) = self.filter_group(encoder, boundary, &group);
+        let plan = boundary.filter_plan();
+        let (filtered, beneath, spare) = self.filter_group(encoder, &plan, &group);
         let source = &filtered;
 
         let backdrop = if boundary.blend_mode == BlendMode::Normal {
@@ -464,15 +507,22 @@ impl WgpuRenderer {
                 .mask
                 .as_ref()
                 .map(|(_, bounds, mode)| (*bounds, *mode)),
-        );
+        )
+        .with_composite_filter(&plan.composite, group.bounds);
         {
             let resources = self.resources();
             let uniform_offset = resources.group_uniforms.write(&uniforms);
-            // The shader reads the backdrop only for blend modes other than normal, and
-            // the mask only for a masked group; the bindings must be filled either way.
+            // The shader reads the backdrop slot for a blend mode other than normal, which
+            // puts the parent's copy there, or for a merge, which puts what the picture is
+            // merged over there; and the mask only for a masked group. The bindings must be
+            // filled either way.
             let bind_group = resources.group_bind_group(
                 source,
-                backdrop.as_ref().map_or(source, |backdrop| &backdrop.view),
+                backdrop
+                    .as_ref()
+                    .map(|backdrop| &backdrop.view)
+                    .or(beneath.as_ref())
+                    .unwrap_or(source),
                 group
                     .mask
                     .as_ref()

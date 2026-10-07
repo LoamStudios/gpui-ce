@@ -232,6 +232,20 @@ impl ColorMatrix {
         matrix
     }
 
+    /// A drop shadow's matrix: any colour's coverage in `color`,
+    /// premultiplied.
+    pub fn shadow(color: [f32; 4]) -> Self {
+        let straight = color.map(|channel| channel / color[3].max(f32::MIN_POSITIVE));
+        #[rustfmt::skip]
+        let values = [
+            0., 0., 0., 0., straight[0],
+            0., 0., 0., 0., straight[1],
+            0., 0., 0., 0., straight[2],
+            0., 0., 0., color[3], 0.,
+        ];
+        Self::new(values)
+    }
+
     /// The matrix that applies `self`, then `next`, when both work in the
     /// same space: their product, with no clamping between them.
     pub fn then(&self, next: &Self) -> Self {
@@ -713,6 +727,10 @@ pub enum FilterPass {
         input: FilterImage,
         /// Its standard deviation, in device pixels.
         std_deviation: f32,
+        /// For a drop shadow, what it blurs is `input`'s coverage in this
+        /// colour, moved: the shadow is cast as it is blurred, not in a
+        /// pass of its own.
+        tint: Option<ShadowTint>,
     },
     /// `top` composited over `bottom`.
     Merge {
@@ -734,14 +752,42 @@ pub enum FilterPass {
     },
 }
 
-/// The passes a group's filters run, in order, and the picture that is
-/// composited: [`FilterImage::Content`] when there are none.
+/// A drop shadow's colour and offset, as a [`FilterPass::Blur`] casts it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShadowTint {
+    /// Its colour, premultiplied and sRGB-encoded.
+    pub color: [f32; 4],
+    /// How far it is moved, in device pixels.
+    pub offset: Point<ScaledPixels>,
+}
+
+/// What a group's composite does to the picture it draws, in place of the
+/// plan's last pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum CompositeFilter {
+    /// Nothing: the picture is drawn as it is.
+    #[default]
+    None,
+    /// The picture is recoloured by this matrix as it is drawn.
+    ColorMatrix(ColorMatrix),
+    /// The picture is merged over this one as it is drawn.
+    Merge {
+        /// What is beneath it.
+        bottom: FilterImage,
+    },
+}
+
+/// The passes a group's filters run, in order, the picture that is
+/// composited (the group's own when `output` is `None`), and what the
+/// composite does to it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FilterPlan {
     /// The passes, in order.
     pub passes: SmallVec<[FilterPass; 4]>,
     /// What is composited.
     pub output: Option<usize>,
+    /// What the composite does to it.
+    pub composite: CompositeFilter,
 }
 
 impl FilterPlan {
@@ -749,9 +795,9 @@ impl FilterPlan {
     ///
     /// Adjacent colour matrices in the same space are folded into one pass
     /// when the first keeps every colour in range, so nothing it would have
-    /// clamped is lost. A drop shadow is three passes: its colour, scaled by
-    /// the picture's coverage and moved (a colour matrix); its blur; and the
-    /// picture merged over it.
+    /// clamped is lost. A drop shadow is two passes: its blur, of the
+    /// picture's coverage in its colour, moved (or, unblurred, a colour
+    /// matrix that makes that); and the picture merged over it.
     pub fn new(filters: &[ScaledFilter]) -> Self {
         let mut plan = Self::default();
         for filter in filters {
@@ -786,6 +832,7 @@ impl FilterPlan {
                         plan.push(FilterPass::Blur {
                             input,
                             std_deviation: std_deviation.0,
+                            tint: None,
                         });
                     }
                 }
@@ -797,39 +844,19 @@ impl FilterPlan {
                     if color[3] <= 0. {
                         continue;
                     }
-                    let straight = color.map(|channel| channel / color[3]);
-                    let mut shadow = plan.push(FilterPass::ColorMatrix {
-                        input,
-                        matrix: ColorMatrix::new([
-                            0.,
-                            0.,
-                            0.,
-                            0.,
-                            straight[0], //
-                            0.,
-                            0.,
-                            0.,
-                            0.,
-                            straight[1], //
-                            0.,
-                            0.,
-                            0.,
-                            0.,
-                            straight[2], //
-                            0.,
-                            0.,
-                            0.,
-                            color[3],
-                            0., //
-                        ]),
-                        offset,
-                    });
-                    if std_deviation.0 > 0. {
-                        shadow = plan.push(FilterPass::Blur {
-                            input: shadow,
+                    let shadow = if std_deviation.0 > 0. {
+                        plan.push(FilterPass::Blur {
+                            input,
                             std_deviation: std_deviation.0,
-                        });
-                    }
+                            tint: Some(ShadowTint { color, offset }),
+                        })
+                    } else {
+                        plan.push(FilterPass::ColorMatrix {
+                            input,
+                            matrix: ColorMatrix::shadow(color),
+                            offset,
+                        })
+                    };
                     plan.push(FilterPass::Merge {
                         top: input,
                         bottom: shadow,
@@ -851,6 +878,48 @@ impl FilterPlan {
             }
         }
         plan
+    }
+
+    /// This plan with its last pass done by the composite instead, where it
+    /// can be: a colour matrix that does not move the picture, or a merge,
+    /// when the composite's `blend_mode` leaves it free to read a second
+    /// picture. Each spares a pass over the whole target.
+    pub fn fused_into_composite(mut self, blend_mode: crate::BlendMode) -> Self {
+        let Some(last) = self.output else {
+            return self;
+        };
+        if last + 1 != self.passes.len() || self.composite != CompositeFilter::None {
+            return self;
+        }
+        let (composite, output) = match self.passes[last] {
+            FilterPass::ColorMatrix {
+                input,
+                matrix,
+                offset,
+            } if offset.x.0 == 0. && offset.y.0 == 0. => {
+                (CompositeFilter::ColorMatrix(matrix), input)
+            }
+            FilterPass::Merge { top, bottom } if blend_mode == crate::BlendMode::Normal => {
+                (CompositeFilter::Merge { bottom }, top)
+            }
+            _ => return self,
+        };
+        self.passes.pop();
+        self.composite = composite;
+        self.output = match output {
+            FilterImage::Content => None,
+            FilterImage::Pass(pass) => Some(pass),
+        };
+        self
+    }
+
+    /// The pictures the composite reads besides the output: a merge's
+    /// bottom.
+    pub fn composite_inputs(&self) -> Option<FilterImage> {
+        match self.composite {
+            CompositeFilter::Merge { bottom } => Some(bottom),
+            _ => None,
+        }
     }
 
     /// The picture the next pass reads.
@@ -1011,52 +1080,118 @@ mod tests {
     }
 
     #[test]
-    fn a_drop_shadow_is_tinted_blurred_and_merged_beneath() {
+    fn a_drop_shadow_is_cast_as_it_is_blurred_and_merged_beneath() {
         let offset = point(ScaledPixels(4.), ScaledPixels(-2.));
+        let color = [0., 0., 0.5, 0.5];
         let plan = FilterPlan::new(&[
             ScaledFilter::Blur(ScaledPixels(2.)),
             ScaledFilter::DropShadow {
                 offset,
                 std_deviation: ScaledPixels(6.),
-                color: [0., 0., 0.5, 0.5],
+                color,
             },
         ]);
-        assert_eq!(plan.passes.len(), 4);
+        // The shadow's blur reads the blurred picture's coverage, moved
+        // before it is blurred, so its blur is not cut off.
+        assert_eq!(
+            plan.passes.as_slice(),
+            [
+                FilterPass::Blur {
+                    input: FilterImage::Content,
+                    std_deviation: 2.,
+                    tint: None,
+                },
+                FilterPass::Blur {
+                    input: FilterImage::Pass(0),
+                    std_deviation: 6.,
+                    tint: Some(ShadowTint { color, offset }),
+                },
+                FilterPass::Merge {
+                    top: FilterImage::Pass(0),
+                    bottom: FilterImage::Pass(1),
+                },
+            ]
+        );
+        assert_eq!(plan.output, Some(2));
+        assert_eq!(plan.last_reads().as_slice(), [Some(2), Some(2), None]);
+
+        // Unblurred, it is a colour matrix, moved: any opaque colour
+        // becomes the shadow's.
+        let plan = FilterPlan::new(&[ScaledFilter::DropShadow {
+            offset,
+            std_deviation: ScaledPixels(0.),
+            color,
+        }]);
         let FilterPass::ColorMatrix {
             input,
             matrix,
             offset: moved,
-        } = plan.passes[1]
+        } = plan.passes[0]
         else {
-            panic!("{:?}", plan.passes[1]);
+            panic!("{:?}", plan.passes[0]);
         };
-        assert_eq!(input, FilterImage::Pass(0));
-        // Moved before it is blurred, so its blur is not cut off.
+        assert_eq!(input, FilterImage::Content);
         assert_eq!(moved, offset);
-        // Any opaque colour becomes the shadow's.
         assert!(close(
             matrix.apply_premultiplied([0.3, 0.6, 0.9, 1.]),
             [0., 0., 0.5, 0.5]
         ));
+    }
+
+    /// How many passes over the target each kind of chain takes, once its
+    /// last is done by the composite where it can be: a guard against
+    /// passes creeping back.
+    #[test]
+    fn chains_take_the_fewest_passes() {
+        use crate::BlendMode;
+        let shadow = |std_deviation: f32| ScaledFilter::DropShadow {
+            offset: point(ScaledPixels(8.), ScaledPixels(12.)),
+            std_deviation: ScaledPixels(std_deviation),
+            color: [0., 0., 0., 0.5],
+        };
+        let saturate = ScaledFilter::ColorMatrix(ColorMatrix::saturate(1.4));
+        let blur = ScaledFilter::Blur(ScaledPixels(16.));
+        let program = ScaledFilter::Program {
+            paint: 0,
+            program: 1,
+            to_viewport: TransformationMatrix::unit(),
+            extent: ScaledPixels(0.),
+        };
+        let passes = |filters: &[ScaledFilter], blend_mode| {
+            let plan = FilterPlan::new(filters).fused_into_composite(blend_mode);
+            (plan.passes.len(), plan.composite)
+        };
+        // A colour matrix alone is drawn by the composite.
         assert_eq!(
-            plan.passes[2],
-            FilterPass::Blur {
-                input: FilterImage::Pass(1),
-                std_deviation: 6.
-            }
+            passes(&[saturate], BlendMode::Normal),
+            (0, CompositeFilter::ColorMatrix(ColorMatrix::saturate(1.4)))
         );
+        assert_eq!(passes(&[blur], BlendMode::Normal).0, 1);
+        assert_eq!(passes(&[blur, saturate], BlendMode::Normal).0, 1);
+        assert_eq!(passes(&[program], BlendMode::Normal).0, 1);
+        // A shadow is one blur, merged beneath by the composite; unblurred,
+        // one colour matrix.
         assert_eq!(
-            plan.passes[3],
-            FilterPass::Merge {
-                top: FilterImage::Pass(0),
-                bottom: FilterImage::Pass(2),
-            }
+            passes(&[shadow(16.)], BlendMode::Normal),
+            (
+                1,
+                CompositeFilter::Merge {
+                    bottom: FilterImage::Pass(0)
+                }
+            )
         );
-        assert_eq!(plan.output, Some(3));
+        assert_eq!(passes(&[shadow(0.)], BlendMode::Normal).0, 1);
+        // A blend mode reads the parent where the merge would read the
+        // shadow: the merge is a pass of its own.
         assert_eq!(
-            plan.last_reads().as_slice(),
-            [Some(3), Some(2), Some(3), None]
+            passes(&[shadow(16.)], BlendMode::Multiply),
+            (2, CompositeFilter::None)
         );
+        // A matrix after a shadow is the composite's; the merge is not.
+        let plan = FilterPlan::new(&[shadow(4.), saturate]).fused_into_composite(BlendMode::Normal);
+        assert_eq!(plan.passes.len(), 2);
+        assert_eq!(plan.output, Some(1));
+        assert!(matches!(plan.composite, CompositeFilter::ColorMatrix(_)));
     }
 
     #[test]

@@ -286,8 +286,12 @@ pub const RENDER_BUFFER_LAYOUTS: &[gpui::SceneBufferLayout] = &[
         source_size,
         target_size,
         corner_smoothing,
-        padding0,
-        source_origin
+        downsample_factor,
+        source_origin,
+        tint,
+        tint_offset,
+        tinted,
+        padding1
     ),
     render_layout!(
         super::group::GroupUniforms,

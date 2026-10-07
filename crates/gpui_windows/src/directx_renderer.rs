@@ -9,9 +9,8 @@ use gpui_render::{
     InstanceRange,
     artifacts::{Dx11DrawConstants, Dx11DrawConstantsBinding},
     blur::{
-        BlurAxis, BlurKernel, BlurUniforms, FilterCompositeClip,
-        GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, ScissorRectangle, downsampled_dimension,
-        group_blur_kernel,
+        BlurAxis, BlurKernel, BlurTint, BlurUniforms, FilterCompositeClip,
+        GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, GroupBlur, ScissorRectangle, downsampled_dimension,
     },
     group::{GroupUniforms, group_target_bounds},
     path_types::{PathRasterizationVertex, PathSprite},
@@ -1924,79 +1923,15 @@ impl DirectXRenderer {
         source: &ColorTarget,
         kernel: BlurKernel,
     ) -> Result<Option<(ColorTarget, ColorTarget, [f32; 2])>> {
-        self.blur_at(source, kernel, false)
-    }
-
-    /// Blurs the whole of `source` into two textures taken from the pool, at full resolution
-    /// or half: the first holds the result, the second is spare. Returns them with the
-    /// result's size, or `None` if the pool has no room.
-    fn blur_at(
-        &mut self,
-        source: &ColorTarget,
-        kernel: BlurKernel,
-        full_resolution: bool,
-    ) -> Result<Option<(ColorTarget, ColorTarget, [f32; 2])>> {
         let full_width = source.size.width.0.max(0) as u32;
         let full_height = source.size.height.0.max(0) as u32;
-        let blur_size = if full_resolution {
-            [full_width as f32, full_height as f32]
-        } else {
-            [
-                downsampled_dimension(full_width) as f32,
-                downsampled_dimension(full_height) as f32,
-            ]
-        };
-        let half_size = size(
-            DevicePixels(blur_size[0] as i32),
-            DevicePixels(blur_size[1] as i32),
-        );
-        let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_mut().context("resources missing")?;
-        let pool = &mut resources.target_pool;
-        let Some(ping) = pool.take(&devices.device, half_size) else {
+        let blur_size = [
+            downsampled_dimension(full_width) as f32,
+            downsampled_dimension(full_height) as f32,
+        ];
+        let Some((ping, pong, viewport)) = self.take_blur_targets(blur_size)? else {
             return Ok(None);
         };
-        let Some(pong) = pool.take(&devices.device, half_size) else {
-            pool.give_back(ping);
-            return Ok(None);
-        };
-        let half_viewport = D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: blur_size[0],
-            Height: blur_size[1],
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        };
-
-        if full_resolution {
-            // Separable gaussian source -> ping -> pong.
-            self.dx_blur_pass(
-                &self.pipelines.blur_vertex,
-                &self.pipelines.blur_fragment,
-                &self.pipelines.blur_blend_replace,
-                &ping.rtv,
-                &source.srv,
-                BlurUniforms::gaussian(BlurAxis::Horizontal, blur_size, kernel),
-                &half_viewport,
-                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-                3,
-                true,
-            )?;
-            self.dx_blur_pass(
-                &self.pipelines.blur_vertex,
-                &self.pipelines.blur_fragment,
-                &self.pipelines.blur_blend_replace,
-                &pong.rtv,
-                &ping.srv,
-                BlurUniforms::gaussian(BlurAxis::Vertical, blur_size, kernel),
-                &half_viewport,
-                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-                3,
-                true,
-            )?;
-            return Ok(Some((pong, ping, blur_size)));
-        }
 
         // Downsample source -> ping, then separable gaussian ping -> pong -> ping.
         self.dx_blur_pass(
@@ -2006,7 +1941,7 @@ impl DirectXRenderer {
             &ping.rtv,
             &source.srv,
             BlurUniforms::downsample([full_width as f32, full_height as f32], blur_size),
-            &half_viewport,
+            &viewport,
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             3,
             true,
@@ -2018,7 +1953,7 @@ impl DirectXRenderer {
             &pong.rtv,
             &ping.srv,
             BlurUniforms::gaussian(BlurAxis::Horizontal, blur_size, kernel),
-            &half_viewport,
+            &viewport,
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             3,
             true,
@@ -2030,7 +1965,7 @@ impl DirectXRenderer {
             &ping.rtv,
             &pong.srv,
             BlurUniforms::gaussian(BlurAxis::Vertical, blur_size, kernel),
-            &half_viewport,
+            &viewport,
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             3,
             true,
@@ -2038,12 +1973,110 @@ impl DirectXRenderer {
         Ok(Some((ping, pong, blur_size)))
     }
 
+    /// Two textures of `blur_size` from the pool, and the viewport covering them, or `None` if
+    /// the pool has no room.
+    fn take_blur_targets(
+        &mut self,
+        blur_size: [f32; 2],
+    ) -> Result<Option<(ColorTarget, ColorTarget, D3D11_VIEWPORT)>> {
+        let texture_size = size(
+            DevicePixels(blur_size[0] as i32),
+            DevicePixels(blur_size[1] as i32),
+        );
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        let pool = &mut resources.target_pool;
+        let Some(ping) = pool.take(&devices.device, texture_size) else {
+            return Ok(None);
+        };
+        let Some(pong) = pool.take(&devices.device, texture_size) else {
+            pool.give_back(ping);
+            return Ok(None);
+        };
+        let viewport = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: blur_size[0],
+            Height: blur_size[1],
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        Ok(Some((ping, pong, viewport)))
+    }
+
+    /// Blurs all of `source`, a group's picture, as `blur` says, reading it through `tint` if
+    /// given: downsampled first, unless it runs at full resolution, then separably. Returns the
+    /// result, in a texture from the pool, or `None` if the pool has no room.
+    fn group_blur(
+        &mut self,
+        source: &ColorTarget,
+        blur: GroupBlur,
+        tint: Option<BlurTint>,
+    ) -> Result<Option<ColorTarget>> {
+        let passes = blur.passes(
+            [
+                source.size.width.0.max(0) as u32,
+                source.size.height.0.max(0) as u32,
+            ],
+            tint,
+        );
+        let Some((ping, pong, viewport)) =
+            self.take_blur_targets(passes.size.map(|length| length as f32))?
+        else {
+            return Ok(None);
+        };
+        // [downsample source -> pong], horizontal -> ping, vertical -> pong.
+        let mut input = &source.srv;
+        if let Some(downsample) = passes.downsample {
+            self.dx_blur_pass(
+                &self.pipelines.blur_downsample_vertex,
+                &self.pipelines.blur_downsample_fragment,
+                &self.pipelines.blur_blend_replace,
+                &pong.rtv,
+                input,
+                downsample,
+                &viewport,
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                3,
+                true,
+            )?;
+            input = &pong.srv;
+        }
+        self.dx_blur_pass(
+            &self.pipelines.blur_vertex,
+            &self.pipelines.blur_fragment,
+            &self.pipelines.blur_blend_replace,
+            &ping.rtv,
+            input,
+            passes.horizontal,
+            &viewport,
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+            3,
+            true,
+        )?;
+        self.dx_blur_pass(
+            &self.pipelines.blur_vertex,
+            &self.pipelines.blur_fragment,
+            &self.pipelines.blur_blend_replace,
+            &pong.rtv,
+            &ping.srv,
+            passes.vertical,
+            &viewport,
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+            3,
+            true,
+        )?;
+        self.give_back(ping);
+        Ok(Some(pong))
+    }
+
     /// Composites `group`, an isolated group's finished target, into the current target, its
-    /// parent: blurred by its filters, faded by its opacity, and mixed by its blend mode with a
+    /// parent: through its filters, faded by its opacity, and mixed by its blend mode with a
     /// copy of what is beneath it in the parent, and cut to its mask, if it has one. Gives back
     /// the textures it takes; the caller gives back the group's and its mask's.
     fn composite_group(&mut self, boundary: &GroupBoundary, group: &FrameTarget) -> Result<()> {
-        let (filtered, spare) = self.filter_group(boundary, group)?;
+        let plan = boundary.filter_plan();
+        let (filtered, beneath, spare) = self.filter_group(&plan, group)?;
         let source = filtered.srv.clone();
         // The composite draws into the parent, in its viewport.
         let parent_bounds = self
@@ -2067,10 +2100,16 @@ impl DirectXRenderer {
                 .mask
                 .as_ref()
                 .map(|(_, bounds, mode)| (*bounds, *mode)),
-        );
-        // Normal blending never reads the backdrop, nor an unmasked group its mask; bind the
+        )
+        .with_composite_filter(&plan.composite, group.bounds);
+        // The backdrop slot holds the parent's copy for a blend mode other than normal, or
+        // what a merge puts the picture over; an unmasked group never reads its mask. Bind the
         // source in their place.
-        let backdrop_srv = backdrop.as_ref().map_or(&source, |backdrop| &backdrop.srv);
+        let backdrop_srv = backdrop
+            .as_ref()
+            .map(|backdrop| &backdrop.srv)
+            .or(beneath.as_ref().map(|beneath| &beneath.srv))
+            .unwrap_or(&source);
         let mask_srv = group
             .mask
             .as_ref()
@@ -2086,17 +2125,17 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    /// Runs `boundary`'s filters on `group`, an isolated group's finished target: each pass of
-    /// its plan reads pictures covering the target and writes one, in a texture from the pool.
-    /// Returns the picture to composite, and the textures to give back once it is.
+    /// Runs `plan`, a group's filters, on `group`, an isolated group's finished target: each
+    /// pass reads pictures covering the target and writes one, in a texture from the pool.
+    /// Returns the picture to composite, the one its composite merges it over if it does, and
+    /// the textures to give back once it is composited.
     fn filter_group(
         &mut self,
-        boundary: &GroupBoundary,
+        plan: &FilterPlan,
         group: &FrameTarget,
-    ) -> Result<(ColorTarget, Vec<ColorTarget>)> {
-        let plan = boundary.filter_plan();
+    ) -> Result<(ColorTarget, Option<ColorTarget>, Vec<ColorTarget>)> {
         if plan.passes.is_empty() {
-            return Ok((group.color.clone(), Vec::new()));
+            return Ok((group.color.clone(), None, Vec::new()));
         }
         // The passes draw over the group's target, in its viewport.
         self.write_globals(group.bounds)?;
@@ -2105,28 +2144,28 @@ impl DirectXRenderer {
         // given back.
         let mut pictures: Vec<(ColorTarget, bool)> = Vec::new();
         let mut spare = Vec::new();
+        let picture = |pictures: &[(ColorTarget, bool)], image: FilterImage| match image {
+            FilterImage::Content => group.color.clone(),
+            FilterImage::Pass(pass) => pictures[pass].0.clone(),
+        };
         for (index, pass) in plan.passes.iter().enumerate() {
-            let picture = |image: FilterImage| match image {
-                FilterImage::Content => group.color.clone(),
-                FilterImage::Pass(pass) => pictures[pass].0.clone(),
-            };
             let result = match *pass {
                 FilterPass::Blur {
                     input,
                     std_deviation,
+                    tint,
                 } => {
-                    let input = picture(input);
-                    let blurred = match group_blur_kernel(std_deviation) {
-                        Some((kernel, full_resolution)) => {
-                            self.blur_at(&input, kernel, full_resolution)?
-                        }
+                    let input = picture(&pictures, input);
+                    let tint = tint.map(|tint| BlurTint {
+                        color: tint.color,
+                        offset: [tint.offset.x.0, tint.offset.y.0],
+                    });
+                    let blurred = match GroupBlur::new(std_deviation) {
+                        Some(blur) => self.group_blur(&input, blur, tint)?,
                         None => None,
                     };
                     match blurred {
-                        Some((blurred, unused, _)) => {
-                            self.give_back(unused);
-                            (blurred, true)
-                        }
+                        Some(blurred) => (blurred, true),
                         None => (input, false),
                     }
                 }
@@ -2135,12 +2174,12 @@ impl DirectXRenderer {
                     ref matrix,
                     offset,
                 } => {
-                    let input = picture(input);
+                    let input = picture(&pictures, input);
                     let uniforms = GroupUniforms::color_matrix(group.bounds, matrix, offset);
                     self.run_group_filter_pass(group, &input, &input, uniforms, false)?
                 }
                 FilterPass::Merge { top, bottom } => {
-                    let (top, bottom) = (picture(top), picture(bottom));
+                    let (top, bottom) = (picture(&pictures, top), picture(&pictures, bottom));
                     let uniforms = GroupUniforms::merge(group.bounds);
                     self.run_group_filter_pass(group, &top, &bottom, uniforms, false)?
                 }
@@ -2150,7 +2189,7 @@ impl DirectXRenderer {
                     program,
                     ref to_viewport,
                 } => {
-                    let input = picture(input);
+                    let input = picture(&pictures, input);
                     // Until its program is linked, the pass leaves the picture as it is.
                     if self.frame_programs.is_some() && self.programs.linked().contains(&program) {
                         let uniforms = GroupUniforms::program(group.bounds, paint, to_viewport);
@@ -2161,11 +2200,12 @@ impl DirectXRenderer {
                 }
             };
             pictures.push(result);
-            // Let go of the pictures no later pass reads.
+            // Let go of the pictures no later pass reads, nor the composite.
             for read in FilterPlan::inputs(pass) {
                 if let FilterImage::Pass(read) = read
                     && last_reads[read] == Some(index)
                     && Some(read) != plan.output
+                    && plan.composite_inputs() != Some(FilterImage::Pass(read))
                     && pictures[read].1
                 {
                     pictures[read].1 = false;
@@ -2177,12 +2217,15 @@ impl DirectXRenderer {
             Some(output) => pictures[output].0.clone(),
             None => group.color.clone(),
         };
+        let beneath = plan
+            .composite_inputs()
+            .map(|image| picture(&pictures, image));
         spare.extend(
             pictures
                 .into_iter()
                 .filter_map(|(texture, owned)| owned.then_some(texture)),
         );
-        Ok((output, spare))
+        Ok((output, beneath, spare))
     }
 
     /// Runs one pass of a group's filters, other than a blur, into a texture from the pool
