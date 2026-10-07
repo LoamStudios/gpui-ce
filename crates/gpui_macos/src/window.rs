@@ -822,6 +822,9 @@ struct MacWindowState {
     renderer: renderer::Renderer,
     /// Forces an uncached scene after GPU recovery or a transient presentation failure.
     force_render_pending: bool,
+    /// Set when the renderer drew a frame it should draw again soon: one
+    /// whose shader programs were still being linked.
+    present_pending: bool,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
@@ -866,7 +869,7 @@ impl MacWindowState {
     fn next_frame_request(&mut self) -> RequestFrameOptions {
         RequestFrameOptions {
             force_render: mem::take(&mut self.force_render_pending),
-            ..Default::default()
+            require_presentation: mem::take(&mut self.present_pending),
         }
     }
 
@@ -1262,6 +1265,7 @@ impl MacWindow {
                 frame_source: None,
                 renderer,
                 force_render_pending: false,
+                present_pending: false,
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -2154,7 +2158,9 @@ impl PlatformWindow for MacWindow {
             this.force_render_pending = true;
         }
         #[cfg(not(feature = "wgpu"))]
-        this.renderer.draw(scene);
+        if this.renderer.draw(scene) {
+            this.present_pending = true;
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

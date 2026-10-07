@@ -44,7 +44,7 @@ use std::{cell::Cell, mem, ptr, sync::Arc};
 
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
-const PATH_SAMPLE_COUNT: u32 = 4;
+pub(crate) const PATH_SAMPLE_COUNT: u32 = 4;
 
 // Buffer slots declared by the generated MSL: group 0 (globals, font rasterization, and the
 // scene's transform, clip and paint tables), then the group 1 data binding, then Naga's runtime-array
@@ -253,7 +253,7 @@ impl FrameTarget {
     }
 }
 
-fn native_shader(label: &str) -> &'static NativeShader {
+pub(crate) fn native_shader(label: &str) -> &'static NativeShader {
     NATIVE_SHADERS
         .iter()
         .find(|shader| shader.label == label)
@@ -431,6 +431,13 @@ pub struct MetalRenderer {
     group_composite_pipeline_state: metal::RenderPipelineState,
     sampler: metal::SamplerState,
     photo_tiles: crate::metal_photos::PhotoTiles,
+    /// The shader programs linked into the pipelines that read paints.
+    programs: crate::metal_programs::LinkedPrograms,
+    /// The pipelines the frame being drawn draws paints with, when its
+    /// scene runs programs: `None` for the standard ones.
+    frame_programs: Option<Arc<crate::metal_programs::ProgramPipelines>>,
+    /// Whether the last frame drew programs still being linked.
+    programs_pending: bool,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
@@ -662,6 +669,7 @@ impl MetalRenderer {
 
         let command_queue = device.new_command_queue();
         let photo_tiles = crate::metal_photos::PhotoTiles::new(&device, is_unified_memory);
+        let programs = crate::metal_programs::LinkedPrograms::new(device.clone());
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
@@ -692,6 +700,9 @@ impl MetalRenderer {
             group_composite_pipeline_state,
             sampler,
             photo_tiles,
+            programs,
+            frame_programs: None,
+            programs_pending: false,
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
@@ -812,14 +823,17 @@ impl MetalRenderer {
         // nothing to do
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    /// Draws `scene` into the layer and presents it. Returns whether it
+    /// should be presented again soon: it runs shader programs still being
+    /// linked, which it drew with their fallback colours.
+    pub fn draw(&mut self, scene: &Scene) -> bool {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
                 log::error!(
                     "draw() called on headless renderer - use render_scene_to_image() instead"
                 );
-                return;
+                return false;
             }
         };
         let viewport_size = layer.drawable_size();
@@ -834,7 +848,7 @@ impl MetalRenderer {
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
             );
-            return;
+            return false;
         };
 
         let mut instance_buffer = self.acquire_instance_buffer(scene);
@@ -843,7 +857,7 @@ impl MetalRenderer {
                 Ok(command_buffer) => command_buffer,
                 Err(error) => {
                     log::error!("failed to render pre-sized scene: {error}");
-                    return;
+                    return false;
                 }
             };
         self.release_instance_buffer_when_complete(&command_buffer, instance_buffer);
@@ -856,6 +870,19 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
+        self.programs_pending
+    }
+
+    /// Whether frames wait for the shader programs they run to be linked,
+    /// rather than drawing their paints' fallback colours until they are.
+    /// Off by default, or on with `GPUI_LINK_PROGRAMS_SYNCHRONOUSLY` set.
+    pub fn set_link_programs_synchronously(&mut self, synchronous: bool) {
+        self.programs.set_synchronous(synchronous);
+    }
+
+    /// How long linking shader programs into the pipelines last took.
+    pub fn last_program_link_time(&self) -> Option<std::time::Duration> {
+        self.programs.last_link_time()
     }
 
     /// Renders the scene to a texture and returns the pixel data as an RGBA image.
@@ -1058,6 +1085,9 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
         self.prepare_intermediate_textures(scene, viewport_size);
+        let programs = self.programs.prepare(scene);
+        self.frame_programs = programs.pipelines;
+        self.programs_pending = programs.pending;
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         self.photo_tiles.upload(&self.device, scene);
@@ -1806,7 +1836,10 @@ impl MetalRenderer {
         }
 
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
-        command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
+        command_encoder.set_render_pipeline_state(match &self.frame_programs {
+            Some(programs) => &programs.path_rasterization,
+            None => &self.paths_rasterization_pipeline_state,
+        });
         bind_scene_uniforms(command_encoder, scene_uniforms);
 
         align_offset(instance_offset);
@@ -1868,10 +1901,11 @@ impl MetalRenderer {
             return false;
         }
 
-        let pipeline = if smoothed {
-            &self.smoothed_shadows_pipeline_state
-        } else {
-            &self.shadows_pipeline_state
+        let pipeline = match (&self.frame_programs, smoothed) {
+            (Some(programs), true) => &programs.smoothed_shadows,
+            (Some(programs), false) => &programs.shadows,
+            (None, true) => &self.smoothed_shadows_pipeline_state,
+            (None, false) => &self.shadows_pipeline_state,
         };
         command_encoder.set_render_pipeline_state(pipeline);
         bind_scene_uniforms(command_encoder, scene_uniforms);
@@ -1921,10 +1955,11 @@ impl MetalRenderer {
             return false;
         }
 
-        let pipeline = if smoothed {
-            &self.smoothed_quads_pipeline_state
-        } else {
-            &self.quads_pipeline_state
+        let pipeline = match (&self.frame_programs, smoothed) {
+            (Some(programs), true) => &programs.smoothed_quads,
+            (Some(programs), false) => &programs.quads,
+            (None, true) => &self.smoothed_quads_pipeline_state,
+            (None, false) => &self.quads_pipeline_state,
         };
         command_encoder.set_render_pipeline_state(pipeline);
         bind_scene_uniforms(command_encoder, scene_uniforms);
@@ -2294,7 +2329,7 @@ fn new_command_encoder_for_texture<'a>(
     command_encoder
 }
 
-fn build_pipeline_state(
+pub(crate) fn build_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
     shader: &NativeShader,
@@ -2360,7 +2395,7 @@ fn build_path_sprite_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
-fn build_path_rasterization_pipeline_state(
+pub(crate) fn build_path_rasterization_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
     shader: &NativeShader,
@@ -2703,6 +2738,106 @@ mod tests {
             center[0] >= 63 && center[0] <= 65 && center[1] == center[0] && center[2] == center[0],
             "monochrome coverage was altered before blending: {center:?}"
         );
+    }
+
+    /// A quad and a shadow painted with a shader program draw the program,
+    /// in the program's box, once it is linked; a scene with no programs
+    /// keeps the standard pipelines.
+    #[test]
+    fn linked_programs_paint_quads_and_shadows() {
+        use gpui::shader::{self, Pixel};
+
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let mut renderer = MetalRenderer::new_headless(pool);
+        let size32 = size(DevicePixels(32), DevicePixels(32));
+        let bounds = |x: f32| Bounds {
+            origin: gpui::point(ScaledPixels(x), ScaledPixels(0.0)),
+            size: size(ScaledPixels(16.0), ScaledPixels(32.0)),
+        };
+        // Red rising from 0 to 1 across each box, which starts at `x`.
+        let ramp = shader::rgba(Pixel.uv().x(), 0.0, 1.0, 1.0)
+            .compile()
+            .unwrap();
+        let scene_with = |link: &mut Scene| {
+            for x in [0.0, 16.0] {
+                let paint = link.push_program(
+                    &ramp,
+                    [16.0, 32.0],
+                    TransformationMatrix {
+                        rotation_scale: TransformationMatrix::unit().rotation_scale,
+                        translation: [-x, 0.0],
+                    },
+                    [0.0, 1.0, 0.0, 1.0],
+                );
+                let background = gpui::ScenePaintRef {
+                    color: white().into(),
+                    paint,
+                };
+                if x == 0.0 {
+                    link.insert_primitive(Quad {
+                        bounds: bounds(x),
+                        content_mask: ContentMask {
+                            bounds: bounds(x),
+                            ..Default::default()
+                        },
+                        background,
+                        ..Default::default()
+                    });
+                } else {
+                    link.insert_primitive(Shadow {
+                        transform: 0,
+                        clip: 0,
+                        order: 0,
+                        blur_radius: ScaledPixels(0.0),
+                        bounds: bounds(x),
+                        corner_radii: Corners::default(),
+                        content_mask: ContentMask {
+                            bounds: bounds(x),
+                            ..Default::default()
+                        },
+                        color: background,
+                        padding: 0,
+                        element_bounds: bounds(x),
+                        element_corner_radii: Corners::default(),
+                        inset: gpui::ShaderBool::Disabled,
+                        corner_smoothing: 0.0,
+                    });
+                }
+            }
+        };
+        let mut scene = Scene::default();
+        scene_with(&mut scene);
+        scene.finish();
+
+        renderer.set_link_programs_synchronously(true);
+        let image = renderer.render_scene_to_image(&scene, size32).unwrap();
+        let time = renderer.last_program_link_time().expect("linked");
+        println!(
+            "linking a program into the paint pipelines took {:.1} ms",
+            time.as_secs_f64() * 1000.0
+        );
+        for (x, what) in [(0, "quad"), (16, "shadow")] {
+            // At pixel centres 0.5 and 15.5 of 16.
+            assert_pixel_close(&image, x, 16, [8, 0, 255, 255], 2, what);
+            assert_pixel_close(&image, x + 15, 16, [247, 0, 255, 255], 2, what);
+        }
+
+        let mut plain = Scene::default();
+        plain.insert_primitive(Quad {
+            bounds: bounds(0.0),
+            content_mask: ContentMask {
+                bounds: bounds(0.0),
+                ..Default::default()
+            },
+            background: gpui::ScenePaintRef {
+                color: white().into(),
+                paint: 0,
+            },
+            ..Default::default()
+        });
+        plain.finish();
+        renderer.render_scene_to_image(&plain, size32).unwrap();
+        assert!(renderer.frame_programs.is_none());
     }
 
     /// Pixel spot-check helpers for the generated-shader contract tests below.
