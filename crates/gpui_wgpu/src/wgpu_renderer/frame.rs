@@ -75,6 +75,12 @@ impl PreparedTargets {
             return None;
         }
         renderer.resources_mut().upload_photo_tiles(scene);
+        renderer.resources_mut().prepare_programs(scene);
+        if renderer.resources().programs_pending {
+            // Drawn with the fallback colours of programs still linking:
+            // draw again once they are linked.
+            renderer.target.request_redraw();
+        }
         let requirements = {
             let transport = renderer.resources().instances.transport();
             FrameRequirements::for_scene(scene, transport)

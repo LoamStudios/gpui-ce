@@ -99,7 +99,8 @@ pub mod monochrome_sprite {
     #[derive(Clone, Copy, Wgsl)]
     pub struct MonochromeSprite {
         pub order: u32,
-        pub padding: u32,
+        /// The paint-table entry the coverage is filled with: 0 for `color`.
+        pub paint: u32,
         pub bounds: Bounds,
         pub content_mask: ContentMask,
         pub color: Hsla,
@@ -235,14 +236,21 @@ pub mod monochrome_sprite {
             tap += 1u32;
         }
         sample = sample / (input.taps as f32);
+        // Filled with a paint, evaluated where the pixel is, faded by the
+        // colour's alpha.
+        let mut color = input.color;
+        if sprite.paint != 0u32 {
+            color = table_paint_color(sprite.paint, scene_position(input.position.xy()));
+            color.w *= input.color.w;
+        }
         let corrected = apply_contrast_and_gamma_correction(
             sample,
-            input.color.rgb(),
+            color.rgb(),
             get!(FONT_RASTERIZATION).grayscale_enhanced_contrast,
             get!(FONT_RASTERIZATION).gamma_ratios,
         );
         blend_color(
-            input.color,
+            color,
             corrected
                 * ContentMask::alpha(sprite.content_mask, scene_position(input.position.xy()))
                 * clip_coverage(sprite.clip, scene_position(input.position.xy())),

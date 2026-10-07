@@ -8,6 +8,7 @@ use collections::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::WgpuContext;
+use gpui_render::linked::LinkedPrograms;
 use gpui_render::shaders::{
     blur::BlurUniforms,
     common::{FontRasterizationUniforms, GlobalUniforms},
@@ -20,7 +21,10 @@ use super::{
     buffers::{DynamicUniformBuffer, InstanceBufferArena, InstanceTransport, SceneTable},
     filters::FrameUniformRequirements,
     photos::PhotoTiles,
-    pipelines::{PhotoBindings, SceneTableBindings, WgpuBindGroupLayouts, WgpuPipelines},
+    pipelines::{
+        LinkedPaintPipelines, PhotoBindings, SceneTableBindings, WgpuBindGroupLayouts,
+        WgpuPipelines,
+    },
     settings::RenderingParameters,
     surfaces::SurfaceCache,
     target_pool::TexturePool,
@@ -39,6 +43,13 @@ pub(super) struct WgpuResources {
     pub(super) renderer_tier: crate::RendererTier,
     pub(super) surface: Option<wgpu::Surface<'static>>,
     pub(super) pipelines: WgpuPipelines,
+    /// The shader programs linked into the pipelines that read paints.
+    pub(super) programs: LinkedPrograms<LinkedPaintPipelines>,
+    /// The pipelines the frame being drawn draws paints with, when its
+    /// scene runs programs: `None` for the standard ones.
+    pub(super) frame_programs: Option<Arc<LinkedPaintPipelines>>,
+    /// Whether the last frame drew programs still being linked.
+    pub(super) programs_pending: bool,
     pub(super) bind_group_layouts: WgpuBindGroupLayouts,
     pub(super) atlas_sampler: wgpu::Sampler,
     pub(super) surface_sampler: wgpu::Sampler,
@@ -242,6 +253,9 @@ impl WgpuResources {
             queue,
             surface,
             pipelines,
+            programs: LinkedPrograms::new(),
+            frame_programs: None,
+            programs_pending: false,
             bind_group_layouts,
             atlas_sampler,
             surface_sampler,
@@ -267,6 +281,18 @@ impl WgpuResources {
             target_pool: RefCell::new(TexturePool::new()),
         };
         Ok((resources, metadata))
+    }
+
+    /// Picks the pipelines `scene`'s paints draw with, starting to link the
+    /// shader programs it runs that they lack.
+    pub(super) fn prepare_programs(&mut self, scene: &gpui::Scene) {
+        let linker = &self.pipelines.linker;
+        let programs = self.programs.prepare(scene, || {
+            let linker = linker.clone();
+            move |programs: Vec<gpui::shader::Program>| linker.link(&programs)
+        });
+        self.frame_programs = programs.pipelines;
+        self.programs_pending = programs.pending;
     }
 
     pub(super) fn invalidate_intermediate_textures(&mut self) {

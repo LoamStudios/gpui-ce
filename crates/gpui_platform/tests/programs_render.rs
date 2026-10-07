@@ -6,8 +6,7 @@
 //! instead; the first window checks that the fallback is replaced by the
 //! program once it is linked.
 //!
-//! With `macos-wgpu`, whose renderer links no programs yet, it checks only
-//! that the fallback colour is drawn.
+//! It runs on Metal, and with `macos-wgpu` on wgpu.
 //!
 //! Runs only with `GPUI_RUN_RENDERING_TESTS` set, in offscreen windows;
 //! `GPUI_RENDERING_TEST_OUTPUT=<path.png>` saves the image.
@@ -146,6 +145,37 @@ impl Render for ChunkFixture {
                 .size_0()
                 .transform(kurbo::Affine::translate((f64::from(x), f64::from(y))))
                 .child(self.grid.clone().cached(style)),
+        )
+    }
+}
+
+/// A grey of `level` from a program of its own for each `level`: the grey
+/// multiplied by one `level` times. Its fallback is green.
+#[cfg(target_os = "macos")]
+fn grey(level: u8) -> Paint {
+    let mut value = shader::Pixel.uv().x() * 0.0 + f32::from(level) * 40. / 255.;
+    for _ in 0..level {
+        value = value * 1.0;
+    }
+    shader::rgba(&value, &value, &value, 1.0).fallback(rgb(0x00ff00))
+}
+
+/// A box filled with [`grey`] of the level it is set to.
+#[cfg(target_os = "macos")]
+struct CycleFixture {
+    level: std::rc::Rc<std::cell::Cell<u8>>,
+}
+
+#[cfg(target_os = "macos")]
+impl Render for CycleFixture {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().bg(rgb(0xffffff)).child(
+            div()
+                .absolute()
+                .left(px(PLAIN.0))
+                .top(px(PLAIN.1))
+                .size(px(SIDE))
+                .bg(Fill::program(grey(self.level.get()))),
         )
     }
 }
@@ -325,14 +355,6 @@ fn render() {
         shows_fallback(&first),
         "the first frame should draw the fallback colour while the program links"
     );
-    if cfg!(feature = "macos-wgpu") {
-        // The wgpu renderer links no programs yet: it keeps drawing the
-        // fallback colour.
-        std::thread::sleep(Duration::from_millis(500));
-        assert!(shows_fallback(&capture(&mut cx, window)));
-        std::mem::forget(cx);
-        return;
-    }
     let start = Instant::now();
     let linked = loop {
         let image = capture(&mut cx, window);
@@ -418,6 +440,104 @@ fn render() {
         .collect();
     let failures = compare(&image, &in_chunk, 3);
 
-    std::mem::forget(cx);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    cycle_past_the_cap(&mut cx);
+    std::mem::forget(cx);
+}
+
+/// With room for two linked programs, a box cycling through five programs
+/// draws each one's colour, and, linked in the background, a program
+/// evicted since it was drawn draws its fallback colour, then itself.
+#[cfg(target_os = "macos")]
+fn cycle_past_the_cap(cx: &mut VisualTestAppContext) {
+    // SAFETY: the test is single-threaded, and the renderer reads these
+    // when the next window opens.
+    unsafe { std::env::set_var("GPUI_LINKED_PROGRAMS_CAP", "2") };
+    let open_cycle = |cx: &mut VisualTestAppContext| {
+        let level = std::rc::Rc::new(std::cell::Cell::new(1));
+        let window: AnyWindowHandle = cx
+            .open_offscreen_window_default({
+                let level = level.clone();
+                move |_, cx| cx.new(|_| CycleFixture { level })
+            })
+            .expect("failed to create the offscreen window")
+            .into();
+        cx.run_until_parked();
+        (window, level)
+    };
+    let show = |cx: &mut VisualTestAppContext, window: AnyWindowHandle, level| {
+        cx.update_window(window, |root, window, cx| {
+            root.downcast::<CycleFixture>()
+                .unwrap()
+                .update(cx, |fixture, cx| {
+                    fixture.level.set(level);
+                    cx.notify()
+                });
+            window.draw(cx).clear(cx);
+        })
+        .expect("failed to draw the window");
+    };
+    let centre = |image: &image::RgbaImage| {
+        let (x, y) = device_pixel(image, (PLAIN.0 + SIDE / 2., PLAIN.1 + SIDE / 2.));
+        let pixel = image.get_pixel(x, y).0;
+        [pixel[0], pixel[1], pixel[2]]
+    };
+    let close = |actual: [u8; 3], expected: [u8; 3]| {
+        actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.abs_diff(expected) <= 3)
+    };
+    let grey_of = |level: u8| {
+        let value = (f32::from(level) * 40.).round() as u8;
+        [value; 3]
+    };
+
+    // Each frame waits for its program.
+    let (window, _) = open_cycle(cx);
+    let mut failures = Vec::new();
+    for round in 0..2 {
+        for level in 1..=5 {
+            show(cx, window, level);
+            let actual = centre(&capture(cx, window));
+            if !close(actual, grey_of(level)) {
+                failures.push(format!(
+                    "round {round}, program {level}: expected {:?}, got {actual:?}",
+                    grey_of(level)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    // In the background.
+    unsafe { std::env::remove_var("GPUI_LINK_PROGRAMS_SYNCHRONOUSLY") };
+    let (window, _) = open_cycle(cx);
+    let wait_for = |cx: &mut VisualTestAppContext, level| {
+        let start = Instant::now();
+        loop {
+            if close(centre(&capture(cx, window)), grey_of(level)) {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "program {level} was never linked"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    for level in [1, 2, 3] {
+        show(cx, window, level);
+        wait_for(cx, level);
+    }
+    // The first was evicted.
+    show(cx, window, 1);
+    let actual = centre(&capture(cx, window));
+    assert!(
+        close(actual, [0, 255, 0]),
+        "an evicted program should draw its fallback until it is linked again, got {actual:?}"
+    );
+    wait_for(cx, 1);
+    unsafe { std::env::remove_var("GPUI_LINKED_PROGRAMS_CAP") };
 }

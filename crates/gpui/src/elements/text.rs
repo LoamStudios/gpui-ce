@@ -1061,16 +1061,22 @@ impl TextLayout {
                     cx,
                 )
                 .log_err();
-            document
-                .paint(
-                    bounds.origin,
-                    line_height,
-                    TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                )
-                .log_err();
+            let paint = |window: &mut Window, cx: &mut App| {
+                document
+                    .paint(
+                        bounds.origin,
+                        line_height,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    )
+                    .log_err();
+            };
+            match window.text_fill() {
+                Some(fill) => window.with_text_fill(&fill, bounds, |window| paint(window, cx)),
+                None => paint(window, cx),
+            }
         }
     }
 

@@ -105,7 +105,7 @@ pub const SCENE_BUFFER_LAYOUTS: &[SceneBufferLayout] = &[
         MonochromeSprite,
         "MonochromeSprite",
         order,
-        padding,
+        paint,
         bounds,
         content_mask,
         color,

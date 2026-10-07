@@ -181,6 +181,8 @@ struct InlineParagraph {
     document: Rc<InlineDocument>,
     measurement: Rc<RefCell<Option<InlineParagraphMeasurement>>>,
     paint_origin: Point<Pixels>,
+    /// Its box, which a text fill spans.
+    paint_bounds: Bounds<Pixels>,
 }
 
 impl InlineParagraph {
@@ -411,6 +413,7 @@ impl InlineParagraphCollector<'_> {
             document,
             measurement,
             paint_origin: Point::default(),
+            paint_bounds: Bounds::default(),
         });
     }
 }
@@ -575,11 +578,13 @@ impl InlineDivFrameState {
 
     pub(super) fn record_paragraph_origins(&mut self, window: &mut Window) {
         for paragraph in &mut self.paragraphs {
-            paragraph.paint_origin = window.layout_bounds(paragraph.layout_id).origin;
+            paragraph.paint_bounds = window.layout_bounds(paragraph.layout_id);
+            paragraph.paint_origin = paragraph.paint_bounds.origin;
         }
     }
 
     pub(super) fn paint_paragraphs(&self, window: &mut Window, cx: &mut App) {
+        let fill = window.text_fill();
         for paragraph in &self.paragraphs {
             let Some(measurement) = paragraph.measurement() else {
                 continue;
@@ -590,7 +595,17 @@ impl InlineDivFrameState {
                 .paint_background(paragraph.paint_origin, window, cx)
                 .log_err();
 
-            layout.paint(paragraph.paint_origin, window, cx).log_err();
+            match &fill {
+                // Spanning the paragraph.
+                Some(fill) => {
+                    window.with_text_fill(fill, paragraph.paint_bounds, |window| {
+                        layout.paint(paragraph.paint_origin, window, cx).log_err();
+                    });
+                }
+                None => {
+                    layout.paint(paragraph.paint_origin, window, cx).log_err();
+                }
+            }
         }
     }
 }

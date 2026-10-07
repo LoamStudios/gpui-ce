@@ -1,4 +1,5 @@
 use crate::RendererTier;
+use gpui::shader::Program;
 use gpui_render::{
     artifacts::{
         BASE_DOWNLEVEL_WGSL, BASE_WGSL, BLUR_BINDINGS, DOWNLEVEL_BLUR_BINDINGS,
@@ -8,6 +9,7 @@ use gpui_render::{
         MONOCHROME_INSTANCE_BINDINGS, SUBPIXEL_DUAL_SOURCE_WGSL, SUBPIXEL_INSTANCE_BINDINGS,
         SURFACE_BINDINGS, TEXTURED_INSTANCE_BINDINGS,
     },
+    link,
     shaders::interface as shader,
 };
 use std::num::NonZeroU64;
@@ -93,6 +95,82 @@ pub(super) struct WgpuPipelines {
     pub(super) smoothed_blur_composite: WgpuRenderPipeline,
     /// Composites an isolated group into its parent (premultiplied).
     pub(super) group_composite: WgpuRenderPipeline,
+    /// Builds the pipelines that read the paint table again with shader
+    /// programs linked in.
+    pub(super) linker: PaintLinker,
+}
+
+/// The pipelines that read the paint table, with shader programs linked in.
+pub(super) struct LinkedPaintPipelines {
+    pub(super) quads: WgpuRenderPipeline,
+    pub(super) smoothed_quads: WgpuRenderPipeline,
+    pub(super) shadows: WgpuRenderPipeline,
+    pub(super) smoothed_shadows: WgpuRenderPipeline,
+    pub(super) path_rasterization: WgpuRenderPipeline,
+    pub(super) monochrome_sprites: WgpuRenderPipeline,
+}
+
+/// What building the pipelines that read the paint table takes, to build
+/// them again, on another thread, with shader programs linked into the
+/// module they share.
+#[derive(Clone)]
+pub(super) struct PaintLinker {
+    device: wgpu::Device,
+    instance_layout: wgpu::PipelineLayout,
+    monochrome_layout: wgpu::PipelineLayout,
+    scene_target: wgpu::ColorTargetState,
+    path_rasterization_target: wgpu::ColorTargetState,
+    path_sample_count: u32,
+    dialect: link::Dialect,
+}
+
+impl PaintLinker {
+    /// The paint pipelines with `programs` linked in. Naga validates the
+    /// linked module first, so a program that does not link is reported
+    /// here rather than as a device error.
+    pub(super) fn link(&self, programs: &[Program]) -> Result<LinkedPaintPipelines, String> {
+        let linkable = link::Linkable::base(self.dialect);
+        let (source, _, _) = link::link(&linkable, programs).map_err(|error| error.to_string())?;
+        #[cfg(not(target_family = "wasm"))]
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("gpui_linked_shaders"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        let create = |specification: shader::Pipeline, target: &wgpu::ColorTargetState, samples| {
+            create_render_pipeline(
+                &self.device,
+                specification,
+                match specification.data_layout {
+                    shader::DataLayout::MonochromeSprites => &self.monochrome_layout,
+                    _ => &self.instance_layout,
+                },
+                target,
+                samples,
+                &module,
+            )
+        };
+        let pipelines = LinkedPaintPipelines {
+            quads: create(shader::QUADS, &self.scene_target, 1),
+            smoothed_quads: create(shader::SMOOTHED_QUADS, &self.scene_target, 1),
+            shadows: create(shader::SHADOWS, &self.scene_target, 1),
+            smoothed_shadows: create(shader::SMOOTHED_SHADOWS, &self.scene_target, 1),
+            path_rasterization: create(
+                shader::PATH_RASTERIZATION,
+                &self.path_rasterization_target,
+                self.path_sample_count,
+            ),
+            monochrome_sprites: create(shader::MONOCHROME_SPRITES, &self.scene_target, 1),
+        };
+        // Without threads to block, wasm relies on Naga's validation above.
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(error) = pollster::block_on(scope.pop()) {
+            return Err(format!("linked paint pipelines: {error}"));
+        }
+        Ok(pipelines)
+    }
 }
 
 pub(super) struct WgpuRenderPipeline {
@@ -532,7 +610,21 @@ impl WgpuPipelines {
                 )
             };
 
+        let linker = PaintLinker {
+            device: device.clone(),
+            instance_layout: instance_layout.clone(),
+            monochrome_layout: monochrome_layout.clone(),
+            scene_target: scene_target.clone(),
+            path_rasterization_target: path_rasterization_target.clone(),
+            path_sample_count,
+            dialect: match tier {
+                RendererTier::Modern => link::Dialect::Modern,
+                RendererTier::WebGl2 => link::Dialect::Downlevel,
+            },
+        };
+
         Self {
+            linker,
             quads: create(shader::QUADS, &scene_target, 1, &shader_module),
             smoothed_quads: create(shader::SMOOTHED_QUADS, &scene_target, 1, &shader_module),
             shadows: create(shader::SHADOWS, &scene_target, 1, &shader_module),

@@ -2746,6 +2746,7 @@ name = "gpui_ce_render"
 version = "0.1.0"
 dependencies = [
  "gpui-ce",
+ "log",
  "naga 24.0.0",
  "naga 29.0.4",
  "wgsl-rs",

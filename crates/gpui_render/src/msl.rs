@@ -4,6 +4,11 @@
 
 use crate::shaders::interface;
 
+/// The Metal sampler slot of a pipeline's own sampler.
+pub const MSL_SAMPLER_SLOT: u8 = 0;
+/// The Metal sampler slot of group 0's sampler, which filters photo paints.
+pub const MSL_SCENE_SAMPLER_SLOT: u8 = 1;
+
 /// MSL for every entry point of `module`, which `info` validated, binding
 /// its resources at GPUI's native slots. `label` names it in errors.
 pub fn write_msl(
@@ -34,8 +39,17 @@ pub fn write_msl(
                     texture: Some(binding.binding.saturating_sub(1) as u8),
                     ..Default::default()
                 },
+                // A pipeline's own sampler takes slot 0, and group 0's, which
+                // filters photo paints, slot 1, so a pipeline with a texture
+                // of its own can also draw photos.
                 naga::TypeInner::Sampler { .. } => naga::back::msl::BindTarget {
-                    sampler: Some(naga::back::msl::BindSamplerTarget::Resource(0)),
+                    sampler: Some(naga::back::msl::BindSamplerTarget::Resource(
+                        if binding.group == interface::GLOBAL_BIND_GROUP {
+                            MSL_SCENE_SAMPLER_SLOT
+                        } else {
+                            MSL_SAMPLER_SLOT
+                        },
+                    )),
                     ..Default::default()
                 },
                 ref ty => return Err(format!("unsupported MSL resource type {ty:?} in {label}")),

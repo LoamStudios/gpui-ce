@@ -729,6 +729,17 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Fills the text of this element with `fill`, in place of its colour:
+    /// a colour, a gradient or a shader paint, spanning each text element
+    /// (or inline paragraph) in its own logical pixels. See
+    /// [`TextStyle::fill`].
+    ///
+    /// This value cascades to its child elements.
+    fn text_fill(mut self, fill: impl Into<Fill>) -> Self {
+        self.text_style().fill = Some(fill.into());
+        self
+    }
+
     /// Sets the font weight of this element
     ///
     /// This value cascades to its child elements.

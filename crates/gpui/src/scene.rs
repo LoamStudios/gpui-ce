@@ -341,6 +341,9 @@ impl Scene {
             let index = self.adopt_paint(path.color.paint_index(), prev_scene, adopted, placement);
             path.color.set_paint_index(index);
         }
+        if let Primitive::MonochromeSprite(sprite) = primitive {
+            sprite.paint = self.adopt_paint(sprite.paint, prev_scene, adopted, placement);
+        }
         for paint_ref in primitive.paint_refs_mut() {
             paint_ref.paint = self.adopt_paint(paint_ref.paint, prev_scene, adopted, placement);
         }
@@ -2948,7 +2951,9 @@ impl Default for TransformationMatrix {
 #[expect(missing_docs)]
 pub struct MonochromeSprite {
     pub order: DrawOrder,
-    pub padding: u32,
+    /// The paint-table entry the sprite's coverage is filled with, faded by
+    /// `color`'s alpha: 0 for `color` itself.
+    pub paint: u32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: SceneHsla,
@@ -3426,7 +3431,7 @@ mod tests {
         rendered.insert_raster(
             Primitive::MonochromeSprite(MonochromeSprite {
                 order: 0,
-                padding: 0,
+                paint: 0,
                 bounds: Bounds::new(point(sp(10.), sp(10.)), Size::new(sp(8.), sp(12.))),
                 content_mask: mask(),
                 color: Default::default(),
@@ -3798,6 +3803,59 @@ mod tests {
         assert_eq!(moved.transformation.translation, [-40., -60.]);
         assert_eq!(moved.geometry, entry.geometry);
         assert_eq!(moved.radii, entry.radii);
+    }
+
+    /// A glyph filled with a paint keeps it, placed where the glyph goes,
+    /// when a recording is replayed somewhere else.
+    #[test]
+    fn replayed_painted_sprites_keep_their_paint() {
+        use crate::shader::{Pixel, rgba};
+
+        let paint = rgba(Pixel.uv().x(), 0.0, 0.0, 1.0).compile().unwrap();
+        let mut recorded = Scene::default();
+        let index = recorded.push_program(
+            &paint,
+            [100., 50.],
+            TransformationMatrix {
+                rotation_scale: TransformationMatrix::UNIT.rotation_scale,
+                translation: [-10., -20.],
+            },
+            [1., 0., 0., 1.],
+        );
+        recorded.insert_primitive(MonochromeSprite {
+            order: 0,
+            paint: index,
+            bounds: Bounds::new(point(sp(10.), sp(20.)), Size::new(sp(8.), sp(12.))),
+            content_mask: mask(),
+            color: crate::white().into(),
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: AtlasTextureKind::Monochrome,
+                },
+                tile_id: TileId(1),
+                padding: 0,
+                bounds: Bounds::default(),
+            },
+            transformation: TransformationMatrix::unit(),
+            transform: 0,
+            clip: 0,
+        });
+        let mut replayed = Scene::default();
+        // Something else in the paint table first, so the entry moves.
+        replayed.push_program(&paint, [1., 1.], TransformationMatrix::UNIT, [0.; 4]);
+        replayed.replay_at(
+            0..recorded.paint_operations.len(),
+            &recorded,
+            point(sp(30.), sp(40.)),
+            &mask(),
+        );
+        let replayed_index = replayed.monochrome_sprites[0].paint;
+        assert_ne!(replayed_index, 0);
+        let moved = ScenePaint::from_words(&replayed.paint_table()[replayed_index as usize..]);
+        assert_eq!(moved.kind, PaintKind::Program);
+        assert_eq!(moved.program_id(), paint.program.id());
+        assert_eq!(moved.transformation.translation, [-40., -60.]);
     }
 
     #[test]

@@ -1095,11 +1095,17 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn draw(&self, scene: &Scene) {
-        self.state
+        let pending = self
+            .state
             .renderer
             .borrow_mut()
             .draw(scene, self.state.background_appearance.get())
             .log_err();
+        if pending == Some(true) {
+            // Drawn with the fallback colours of shader programs still being
+            // linked: draw again, on the next vsync, once they may be ready.
+            self.state.force_render_pending.set(true);
+        }
     }
 
     // Matches the trait's gate as gpui is built: its `test` cfg is never set

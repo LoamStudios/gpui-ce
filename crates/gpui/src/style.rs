@@ -747,6 +747,14 @@ pub struct TextStyle {
 
     /// Case transformation applied at layout time.
     pub text_transform: Option<TextTransform>,
+
+    /// What fills the glyphs, in place of `color`: a colour, a gradient or a
+    /// paint, spanning the box of the text element it fills (or of the
+    /// paragraph, for inline text), in that box's own logical pixels.
+    /// Glyphs filled with a gradient or a paint are antialiased in
+    /// grayscale. Emoji keep their colours, and underlines and
+    /// strikethroughs their own.
+    pub fill: Option<Fill>,
 }
 
 impl Default for TextStyle {
@@ -771,6 +779,7 @@ impl Default for TextStyle {
             line_clamp: None,
             letter_spacing: None,
             text_transform: None,
+            fill: None,
         }
     }
 }

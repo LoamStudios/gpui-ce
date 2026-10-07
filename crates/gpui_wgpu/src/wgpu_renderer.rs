@@ -199,6 +199,35 @@ impl WgpuRenderer {
             self.dual_source_blending,
             resources.renderer_tier,
         );
+        // Programs linked into the old pipelines are linked again.
+        resources.programs.clear();
+        resources.frame_programs = None;
+    }
+
+    /// Whether frames wait for the shader programs they run to be linked,
+    /// rather than drawing their paints' fallback colours until they are.
+    /// Off by default, or on with `GPUI_LINK_PROGRAMS_SYNCHRONOUSLY` set.
+    pub fn set_link_programs_synchronously(&mut self, synchronous: bool) {
+        if let Some(resources) = self.resources.as_mut() {
+            resources.programs.set_synchronous(synchronous);
+        }
+    }
+
+    /// How long linking shader programs into the pipelines last took.
+    pub fn last_program_link_time(&self) -> Option<std::time::Duration> {
+        self.resources
+            .as_ref()
+            .and_then(|resources| resources.programs.last_link_time())
+    }
+
+    /// Links at most `cap` shader programs into the pipelines, evicting the
+    /// least recently used: by default [`gpui_render::linked::DEFAULT_PROGRAM_CAP`],
+    /// or `GPUI_LINKED_PROGRAMS_CAP`.
+    #[doc(hidden)]
+    pub fn set_program_cap(&mut self, cap: usize) {
+        if let Some(resources) = self.resources.as_mut() {
+            resources.programs.set_cap(cap);
+        }
     }
 
     #[allow(dead_code)]

@@ -20,11 +20,12 @@ impl WgpuRenderer {
         instances: &mut InstanceUpload,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> frame::DrawResult {
-        let pipelines = &self.resources().pipelines;
-        let pipeline = if smoothed {
-            &pipelines.smoothed_quads
-        } else {
-            &pipelines.quads
+        let resources = self.resources();
+        let pipeline = match (&resources.frame_programs, smoothed) {
+            (Some(programs), true) => &programs.smoothed_quads,
+            (Some(programs), false) => &programs.quads,
+            (None, true) => &resources.pipelines.smoothed_quads,
+            (None, false) => &resources.pipelines.quads,
         };
         self.draw_instances(quads, pipeline, instances, pass)
     }
@@ -36,11 +37,12 @@ impl WgpuRenderer {
         instances: &mut InstanceUpload,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> frame::DrawResult {
-        let pipelines = &self.resources().pipelines;
-        let pipeline = if smoothed {
-            &pipelines.smoothed_shadows
-        } else {
-            &pipelines.shadows
+        let resources = self.resources();
+        let pipeline = match (&resources.frame_programs, smoothed) {
+            (Some(programs), true) => &programs.smoothed_shadows,
+            (Some(programs), false) => &programs.shadows,
+            (None, true) => &resources.pipelines.smoothed_shadows,
+            (None, false) => &resources.pipelines.shadows,
         };
         self.draw_instances(shadows, pipeline, instances, pass)
     }
@@ -67,14 +69,12 @@ impl WgpuRenderer {
         pass: &mut wgpu::RenderPass<'_>,
     ) -> frame::DrawResult {
         let texture = self.atlas.get_texture_info(texture_id);
-        self.draw_instances_with_texture(
-            sprites,
-            texture_id,
-            &texture,
-            &self.resources().pipelines.monochrome_sprites,
-            instances,
-            pass,
-        )
+        let resources = self.resources();
+        let pipeline = match &resources.frame_programs {
+            Some(programs) => &programs.monochrome_sprites,
+            None => &resources.pipelines.monochrome_sprites,
+        };
+        self.draw_instances_with_texture(sprites, texture_id, &texture, pipeline, instances, pass)
     }
 
     pub(super) fn draw_subpixel_sprites(
@@ -281,7 +281,10 @@ impl WgpuRenderer {
             depth_stencil_attachment: None,
             ..Default::default()
         });
-        pass.set_pipeline(&resources.pipelines.path_rasterization);
+        pass.set_pipeline(match &resources.frame_programs {
+            Some(programs) => &programs.path_rasterization,
+            None => &resources.pipelines.path_rasterization,
+        });
         pass.set_bind_group(
             shader_interface::GLOBAL_BIND_GROUP,
             globals,
