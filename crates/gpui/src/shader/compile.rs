@@ -10,7 +10,7 @@ use std::{
     fmt,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, Ordering},
     },
 };
 
@@ -65,21 +65,26 @@ impl std::error::Error for ShaderError {}
 /// A compiled fragment program, shared by every paint with the same structure.
 ///
 /// Its [source](Program::source) defines
-/// `fn paint_program(fragment: Fragment, base: u32) -> vec4<f32>`, returning
-/// premultiplied color. Renderers link it against the [prelude](super::prelude)
-/// and provide `paint_param(index: u32) -> vec4<f32>` (parameter slots start
-/// at `base`) and, when [`Program::uses_backdrop`], `paint_backdrop(fragment:
-/// Fragment, uv: vec2<f32>) -> vec4<f32>`.
+/// `fn program_<id>(fragment: Fragment, base: u32) -> vec4<f32>`, named by
+/// [`Program::entry_point`], returning premultiplied color, and any functions
+/// it calls, all named after it, so the sources of any number of programs
+/// link into one module. Renderers link it against the
+/// [prelude](super::prelude) and provide `paint_param(index: u32) ->
+/// vec4<f32>`; its parameter slots start at `base`.
 #[derive(Clone)]
 pub struct Program(Arc<ProgramInner>);
 
 struct ProgramInner {
-    id: u64,
+    id: u32,
+    entry_point: String,
     source: String,
     lanes: Box<[Lanes]>,
     slots: usize,
-    uses_backdrop: bool,
 }
+
+/// Program ids are kept in renderers' paint tables as floats, which hold
+/// integers below 2^24 exactly.
+pub(crate) const MAX_PROGRAM_ID: u32 = 1 << 24;
 
 /// Where one parameter lives: `len` lanes of slot `slot`, starting at `lane`.
 #[derive(Clone, Copy, Debug)]
@@ -127,19 +132,20 @@ pub(crate) fn pack(values: &[Val], lanes: &[Lanes], slots: &mut [[f32; 4]]) {
 }
 
 impl Program {
-    /// Identity, stable while the program stays cached.
-    pub fn id(&self) -> u64 {
+    /// Identity, unique in the process and below 2^24: a program compiled
+    /// again after leaving the cache gets a new one.
+    pub fn id(&self) -> u32 {
         self.0.id
+    }
+
+    /// The name of the function its source defines: `program_<id>`.
+    pub fn entry_point(&self) -> &str {
+        &self.0.entry_point
     }
 
     /// WGSL source; see [`Program`].
     pub fn source(&self) -> &str {
         &self.0.source
-    }
-
-    /// Whether the program samples the scene behind the painted box.
-    pub fn uses_backdrop(&self) -> bool {
-        self.0.uses_backdrop
     }
 
     /// Number of `vec4<f32>` parameter slots each use of the program reads.
@@ -153,7 +159,6 @@ impl fmt::Debug for Program {
         f.debug_struct("Program")
             .field("id", &self.0.id)
             .field("slots", &self.0.slots)
-            .field("uses_backdrop", &self.0.uses_backdrop)
             .finish_non_exhaustive()
     }
 }
@@ -288,7 +293,7 @@ impl Evaluator {
                     Op::Unary(_, eval) | Op::Binary(_, eval) | Op::Call(_, eval) => eval(&args),
                     Op::Construct => eval_construct(node.ty, &args),
                     Op::Select => eval_select(&args),
-                    Op::Backdrop | Op::Invalid(_) => return None,
+                    Op::Invalid(_) => return None,
                     Op::Apply | Op::Loop { .. } | Op::LoopState(_) | Op::LoopIndex(_) => {
                         unreachable!()
                     }
@@ -320,7 +325,6 @@ enum OpCode {
     Construct,
     Select,
     Apply,
-    Backdrop,
     LoopState(u8),
     LoopIndex(u8),
     Loop { count: u32, level: u8 },
@@ -397,7 +401,6 @@ impl Canonical {
                     Op::Construct => OpCode::Construct,
                     Op::Select => OpCode::Select,
                     Op::Apply => OpCode::Apply,
-                    Op::Backdrop => OpCode::Backdrop,
                     Op::LoopState(level) => OpCode::LoopState(*level),
                     Op::LoopIndex(level) => OpCode::LoopIndex(*level),
                     Op::Loop { count, level } => OpCode::Loop {
@@ -467,11 +470,12 @@ impl Canonical {
             },
             items: Vec::new(),
             functions: FxHashMap::default(),
-            uses_backdrop: false,
             names: 0,
+            id: next_id(),
         };
         let root = self.codes.len() as u32 - 1;
-        lowering.function("paint_program".into(), root);
+        let entry_point = format!("program_{}", lowering.id);
+        lowering.function(entry_point.clone(), root);
 
         let source = ir::render_items(&lowering.items);
         if source.len() > MAX_SOURCE_BYTES {
@@ -479,15 +483,25 @@ impl Canonical {
         }
         validate(&source)?;
 
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         Ok(Program(Arc::new(ProgramInner {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            id: lowering.id,
+            entry_point,
             source,
             lanes: lanes.into(),
             slots: slots as usize,
-            uses_backdrop: lowering.uses_backdrop,
         })))
     }
+}
+
+/// A new program id: 1 and up, unique in the process.
+fn next_id() -> u32 {
+    static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        id < MAX_PROGRAM_ID,
+        "more than 2^24 shader programs were compiled"
+    );
+    id
 }
 
 struct Lowering<'a> {
@@ -499,9 +513,10 @@ struct Lowering<'a> {
     items: Vec<ir::Item>,
     /// Function emitted for each body evaluated at another fragment.
     functions: FxHashMap<u32, String>,
-    uses_backdrop: bool,
     /// Locals named so far; names are unique across nested blocks.
     names: u32,
+    /// The program's id, which its functions are named after.
+    id: u32,
 }
 
 /// A block being emitted, and the codes already available in it.
@@ -667,7 +682,7 @@ impl Lowering<'_> {
                 let name = match self.functions.get(&code.args[0]) {
                     Some(name) => name.clone(),
                     None => {
-                        let name = format!("paint_program_{}", self.functions.len() + 1);
+                        let name = format!("program_{}_{}", self.id, self.functions.len() + 1);
                         self.functions.insert(code.args[0], name.clone());
                         self.function(name.clone(), code.args[0]);
                         name
@@ -699,10 +714,6 @@ impl Lowering<'_> {
                     },
                     OpCode::Construct => call(vector_constructor(code.ty), args),
                     OpCode::Select => call("select", args),
-                    OpCode::Backdrop => {
-                        self.uses_backdrop = true;
-                        call("paint_backdrop", args)
-                    }
                     // Loop leaves are bound by their loop's body.
                     OpCode::Param
                     | OpCode::Constant(_)
@@ -780,8 +791,9 @@ fn constant(ty: Ty, bits: [u32; 4]) -> ir::Expr {
     Val::from_lanes(ty, bits.map(f32::from_bits)).literal()
 }
 
-/// The prelude's WGSL, assembled once.
-pub(crate) fn prelude_source() -> &'static str {
+/// The [prelude](super::prelude)'s WGSL, assembled once: what a renderer
+/// links programs against.
+pub fn prelude_source() -> &'static str {
     static SOURCE: OnceLock<String> = OnceLock::new();
     SOURCE.get_or_init(|| {
         prelude::WGSL_SOURCE
@@ -794,7 +806,6 @@ pub(crate) fn prelude_source() -> &'static str {
 fn validate(source: &str) -> Result<(), ShaderError> {
     const GLUE: &str = "
 fn paint_param(index: u32) -> vec4<f32> { return vec4<f32>(0.0); }
-fn paint_backdrop(fragment: Fragment, uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(0.0); }
 ";
     // Renderers clip per pixel around paints, as UI shaders do, so derivatives
     // in loops that exit early are accepted.

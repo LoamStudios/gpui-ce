@@ -36,6 +36,7 @@ impl Ty {
     }
 
     /// The WGSL spelling.
+    #[allow(dead_code, reason = "for foreign shader imports, not yet ported")]
     pub(crate) fn wgsl(self) -> &'static str {
         match self {
             Self::F32 => "f32",
@@ -66,6 +67,7 @@ impl Ty {
     }
 
     /// Map a Naga type, recognizing the namespaced `Fragment` by its name.
+    #[allow(dead_code, reason = "for foreign shader imports, not yet ported")]
     pub(crate) fn from_naga(
         module: &naga::Module,
         ty: naga::Handle<naga::Type>,

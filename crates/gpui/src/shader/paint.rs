@@ -9,14 +9,14 @@ use wgsl_rs::std::{Vec2f, Vec4f};
 
 use palette::IntoColor;
 
-use crate::{Background, Hsla, Pixels, Rgba, Size, hsla_to_rgba, rgb_to_hsla, solid_background};
+use crate::{Hsla, hsla_to_rgba};
 
 use super::{
     Expr, Operand, Scalar, Vec2, Vec3, Vec4,
     compile::{CompiledPaint, ShaderError, compile, evaluate},
     expr::{Node, Op},
     library::{fade, over, premultiply, unpremultiply},
-    prelude::{Color, Fragment},
+    prelude::Fragment,
     value::{Val, sealed::Sealed},
 };
 
@@ -40,7 +40,7 @@ use super::{
 pub struct Paint {
     pub(crate) node: Arc<Node>,
     compiled: Arc<OnceLock<Result<CompiledPaint, ShaderError>>>,
-    fallback: Option<Background>,
+    fallback: Option<Hsla>,
 }
 
 impl Paint {
@@ -155,42 +155,23 @@ impl Paint {
         self.at(map(Pixel.uv()))
     }
 
-    /// The background painted in place of this paint by renderers that
-    /// cannot run shaders. By default GPUI evaluates the paint at the center
-    /// of the box on the CPU, when it can.
-    pub fn fallback(mut self, background: impl Into<Background>) -> Self {
-        self.fallback = Some(background.into());
+    /// The colour painted in place of this paint while a renderer is still
+    /// preparing it, and by renderers that cannot run it. Transparent unless
+    /// set: estimating it, say from the paint's colour at the centre of the
+    /// box, would cost the CPU an evaluation each time the paint is drawn.
+    pub fn fallback(mut self, color: impl Into<Hsla>) -> Self {
+        self.fallback = Some(color.into());
         self
     }
 
-    /// The fallback for a box of `size` logical pixels.
-    pub(crate) fn fallback_background(&self, size: Size<Pixels>) -> Background {
-        if let Some(fallback) = self.fallback {
-            return fallback;
-        }
-        let size = Vec2f {
-            x: f32::from(size.width),
-            y: f32::from(size.height),
-        };
-        let center = Fragment {
-            uv: Vec2f { x: 0.5, y: 0.5 },
-            position: size * 0.5,
-            size,
-            origin: Vec2f { x: 0.0, y: 0.0 },
-            scale: 1.0,
-        };
-        let Some(rgba) = self.evaluate(center) else {
-            return crate::transparent_black().into();
-        };
-        let straight = Color::unpremultiply(rgba);
-        solid_background(rgb_to_hsla(Rgba::new(
-            straight.x, straight.y, straight.z, straight.w,
-        )))
+    /// The colour set by [`Paint::fallback`], or transparent.
+    pub fn fallback_color(&self) -> Hsla {
+        self.fallback.unwrap_or_default()
     }
 
     /// Evaluate this paint on the CPU, returning premultiplied RGBA.
-    /// Returns `None` for excessive depth, backdrop reads, or foreign functions
-    /// without a CPU implementation. Derivatives evaluate to zero, so edges
+    /// Returns `None` for excessive depth, or an expression that cannot
+    /// compile. Derivatives evaluate to zero, so edges
     /// antialiased with [`Scalar::coverage`] are hard on the CPU.
     pub fn evaluate(&self, fragment: Fragment) -> Option<Vec4f> {
         match evaluate(&self.node, Some(fragment))? {
@@ -275,19 +256,6 @@ fn color_value([r, g, b, a]: [f32; 4]) -> Paint {
     })
 }
 
-/// Sample the scene already painted behind the box at a normalized
-/// coordinate of the box, for glass and refraction.
-///
-/// Samples see everything painted earlier, including outside the box, and
-/// nothing painted later. Each backdrop draw interrupts the render pass and
-/// updates a target snapshot; combining effects in one paint reduces that work.
-pub fn backdrop(uv: impl Operand<Value = Vec2f>) -> Paint {
-    Paint::premultiplied(Expr::<Vec4f>::make(
-        Op::Backdrop,
-        [Node::fragment(), uv.into_expr().node],
-    ))
-}
-
 /// The fragment a paint is evaluated at. Zero-sized and `Copy`: pass it to
 /// helpers freely.
 #[derive(Clone, Copy, Debug, Default)]
@@ -305,7 +273,9 @@ impl Pixel {
         self.fragment().uv()
     }
 
-    /// Logical-pixel offset from the box's top-left corner.
+    /// Logical-pixel offset from the box's top-left corner, in the
+    /// element's own space: the paint moves, turns and zooms with the
+    /// element.
     pub fn position(self) -> Vec2 {
         self.fragment().position()
     }
@@ -324,11 +294,6 @@ impl Pixel {
     /// Device pixels per logical pixel.
     pub fn scale(self) -> Scalar {
         self.fragment().scale()
-    }
-
-    /// The scene behind the box, sampled at a normalized coordinate.
-    pub fn backdrop(self, uv: impl Operand<Value = Vec2f>) -> Paint {
-        backdrop(uv)
     }
 }
 

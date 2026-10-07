@@ -77,9 +77,6 @@ pub(crate) enum Op {
     Select,
     /// Evaluate `args[0]` at the fragment `args[1]`.
     Apply,
-    /// Sample the scene behind the painted box at `args[1]` (a UV in the
-    /// fragment `args[0]`).
-    Backdrop,
     /// The state of the [`iterate`] loop at a nesting level.
     LoopState(u8),
     /// The iteration index, as `f32`, of the loop at a nesting level.
@@ -116,7 +113,6 @@ impl Node {
             Op::Uniform(_) => (Rate::Uniform, true),
             Op::Constant(_) => (Rate::Constant, true),
             Op::Fragment => (Rate::Fragment, true),
-            Op::Backdrop => (Rate::Fragment, false),
             Op::Invalid(_) => (Rate::Fragment, false),
             Op::Member(_)
             | Op::Unary(..)

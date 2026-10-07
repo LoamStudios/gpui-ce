@@ -1,5 +1,5 @@
 use super::*;
-use crate::{hsla, rgb};
+use crate::rgb;
 
 fn fragment(uv: [f32; 2], size: [f32; 2]) -> Fragment {
     Fragment {
@@ -325,14 +325,34 @@ fn loop_invariants_are_hoisted_and_loops_nest() {
 }
 
 #[test]
-fn backdrop_paints_are_flagged() {
-    let glass = paint(|px| {
-        let bend = (px.uv().y() * 18.0).sin() * 0.01;
-        px.backdrop(px.uv() + vec2(bend, 0.0))
-            .mix(color(rgb(0xffffff)), 0.08)
+fn programs_are_named_after_their_ids() {
+    let mapped = waves(0.0).map_uv(|uv| uv * 0.5).mix(waves(0.0), 0.5);
+    let program = mapped.compile().unwrap().program;
+    let id = program.id();
+    assert!(id > 0 && id < 1 << 24);
+    assert_eq!(program.entry_point(), format!("program_{id}"));
+    let source = program.source();
+    assert!(source.contains(&format!("fn program_{id}(fragment: Fragment, base: u32)")));
+    assert!(source.contains(&format!("fn program_{id}_1(")), "{source}");
+    assert!(!source.contains("paint_program"), "{source}");
+}
+
+#[test]
+fn programs_link_together_with_the_prelude() {
+    // Two programs and a stub parameter reader, in one module, as a renderer
+    // links them.
+    let grain = paint(|px| {
+        let value = noise::value(px.position() * 0.5);
+        rgba(&value, &value, &value, 1.0).opacity(px.uv().x().fwidth() + 0.5)
     });
-    let compiled = glass.compile().unwrap();
-    assert!(compiled.program.uses_backdrop());
-    assert!(glass.evaluate(fragment([0.5, 0.5], [1.0, 1.0])).is_none());
-    assert!(!waves(0.0).compile().unwrap().program.uses_backdrop());
+    let programs = [grain, sphere()].map(|paint| paint.compile().unwrap().program);
+    assert_ne!(programs[0].id(), programs[1].id());
+    let mut module = format!(
+        "diagnostic(off, derivative_uniformity);\n{}\nfn paint_param(index: u32) -> vec4<f32> {{ return vec4<f32>(f32(index)); }}\n",
+        prelude_source()
+    );
+    for program in &programs {
+        module.push_str(program.source());
+    }
+    super::compile::validate_module(&module).unwrap();
 }
