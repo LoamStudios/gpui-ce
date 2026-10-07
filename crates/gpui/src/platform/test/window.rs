@@ -50,6 +50,7 @@ pub(crate) struct TestWindowState {
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
     start_external_drag_result: bool,
+    subpixel_rendering_supported: bool,
 }
 
 #[derive(Clone)]
@@ -115,8 +116,15 @@ impl TestWindow {
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
             start_external_drag_result: false,
+            subpixel_rendering_supported: false,
         })))
     }
+    /// Makes the window report that it can antialias text by subpixel, as an
+    /// opaque window on a platform with LCD text does.
+    pub fn set_subpixel_rendering_supported(&self, supported: bool) {
+        self.0.lock().subpixel_rendering_supported = supported;
+    }
+
     pub fn simulate_scheduled_frame(&self) -> bool {
         let callback = {
             let mut state = self.0.lock();
@@ -330,7 +338,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
-        false
+        self.0.lock().subpixel_rendering_supported
     }
 
     fn set_title(&mut self, title: &str) {
