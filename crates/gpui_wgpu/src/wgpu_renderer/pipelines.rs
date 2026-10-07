@@ -6,8 +6,8 @@ use gpui_render::{
         DOWNLEVEL_GLOBAL_BINDINGS, DOWNLEVEL_GROUP_BINDINGS, DOWNLEVEL_INSTANCE_BINDINGS,
         DOWNLEVEL_RANGE_BINDING, DOWNLEVEL_SURFACE_BINDINGS, DOWNLEVEL_TEXTURED_INSTANCE_BINDINGS,
         GLOBAL_BINDINGS, GROUP_BINDINGS, GeneratedBinding, GeneratedBindingKind, INSTANCE_BINDINGS,
-        MONOCHROME_INSTANCE_BINDINGS, SUBPIXEL_DUAL_SOURCE_WGSL, SUBPIXEL_INSTANCE_BINDINGS,
-        SURFACE_BINDINGS, TEXTURED_INSTANCE_BINDINGS,
+        MESH_BINDINGS, MONOCHROME_INSTANCE_BINDINGS, SUBPIXEL_DUAL_SOURCE_WGSL,
+        SUBPIXEL_INSTANCE_BINDINGS, SURFACE_BINDINGS, TEXTURED_INSTANCE_BINDINGS,
     },
     link,
     shaders::interface as shader,
@@ -73,6 +73,8 @@ pub(super) struct WgpuPipelines {
     pub(super) smoothed_shadows: WgpuRenderPipeline,
     pub(super) path_rasterization: WgpuRenderPipeline,
     pub(super) paths: WgpuRenderPipeline,
+    /// Meshes, on tiers whose vertex stage reads storage buffers.
+    pub(super) meshes: Option<WgpuRenderPipeline>,
     pub(super) underlines: WgpuRenderPipeline,
     pub(super) monochrome_sprites: WgpuRenderPipeline,
     pub(super) subpixel_sprites: Option<WgpuRenderPipeline>,
@@ -107,6 +109,7 @@ pub(super) struct LinkedPaintPipelines {
     pub(super) shadows: WgpuRenderPipeline,
     pub(super) smoothed_shadows: WgpuRenderPipeline,
     pub(super) path_rasterization: WgpuRenderPipeline,
+    pub(super) meshes: Option<WgpuRenderPipeline>,
     pub(super) monochrome_sprites: WgpuRenderPipeline,
 }
 
@@ -118,6 +121,7 @@ pub(super) struct PaintLinker {
     device: wgpu::Device,
     instance_layout: wgpu::PipelineLayout,
     monochrome_layout: wgpu::PipelineLayout,
+    mesh_layout: Option<wgpu::PipelineLayout>,
     scene_target: wgpu::ColorTargetState,
     path_rasterization_target: wgpu::ColorTargetState,
     path_sample_count: u32,
@@ -145,6 +149,10 @@ impl PaintLinker {
                 specification,
                 match specification.data_layout {
                     shader::DataLayout::MonochromeSprites => &self.monochrome_layout,
+                    shader::DataLayout::Meshes => self
+                        .mesh_layout
+                        .as_ref()
+                        .expect("meshes are linked only where they are drawn"),
                     _ => &self.instance_layout,
                 },
                 target,
@@ -162,6 +170,10 @@ impl PaintLinker {
                 &self.path_rasterization_target,
                 self.path_sample_count,
             ),
+            meshes: self
+                .mesh_layout
+                .is_some()
+                .then(|| create(shader::MESHES, &self.scene_target, 1)),
             monochrome_sprites: create(shader::MONOCHROME_SPRITES, &self.scene_target, 1),
         };
         // Without threads to block, wasm relies on Naga's validation above.
@@ -210,6 +222,8 @@ pub(super) struct WgpuBindGroupLayouts {
     pub(super) surfaces: wgpu::BindGroupLayout,
     pub(super) blur: wgpu::BindGroupLayout,
     group: wgpu::BindGroupLayout,
+    /// The frame's mesh instances and a mesh's vertices, on the modern tier.
+    meshes: Option<wgpu::BindGroupLayout>,
 }
 
 impl WgpuBindGroupLayouts {
@@ -298,7 +312,10 @@ impl WgpuBindGroupLayouts {
             group_table,
             Some(shader::DATA_BUFFER_BINDING),
         );
+        let meshes = (tier == RendererTier::Modern)
+            .then(|| generated_bind_group_layout(device, "meshes_layout", MESH_BINDINGS, None));
         Self {
+            meshes,
             globals,
             instances,
             monochrome_sprites,
@@ -370,6 +387,31 @@ impl WgpuBindGroupLayouts {
             layout: &self.instances,
             entries: &entries,
         })
+    }
+
+    /// Creates the group-1 bind group of a mesh: the frame's instances, in
+    /// `instances`, and the mesh's `vertices`. `None` on tiers that draw no
+    /// meshes.
+    pub(super) fn create_mesh(
+        &self,
+        device: &wgpu::Device,
+        instances: wgpu::BufferBinding<'_>,
+        vertices: &wgpu::Buffer,
+    ) -> Option<wgpu::BindGroup> {
+        Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mesh"),
+            layout: self.meshes.as_ref()?,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: shader::DATA_BUFFER_BINDING,
+                    resource: wgpu::BindingResource::Buffer(instances),
+                },
+                wgpu::BindGroupEntry {
+                    binding: shader::MESH_VERTICES_BINDING,
+                    resource: vertices.as_entire_binding(),
+                },
+            ],
+        }))
     }
 
     pub(super) fn create_textured_instances(
@@ -575,6 +617,9 @@ impl WgpuPipelines {
             bind_group_layouts,
             &bind_group_layouts.group,
         );
+        let mesh_layout = bind_group_layouts.meshes.as_ref().map(|layout| {
+            create_pipeline_layout(device, "mesh_pipeline_layout", bind_group_layouts, layout)
+        });
 
         let scene_target = color_target(surface_format, Some(scene_blend_state(alpha_mode)));
         let path_rasterization_target = color_target(
@@ -597,6 +642,9 @@ impl WgpuPipelines {
             shader::DataLayout::Surface => &surface_layout,
             shader::DataLayout::Blur => &blur_layout,
             shader::DataLayout::Group => &group_layout,
+            shader::DataLayout::Meshes => mesh_layout
+                .as_ref()
+                .expect("meshes are drawn only on the modern tier"),
         };
         let create =
             |specification: shader::Pipeline, target: &wgpu::ColorTargetState, samples, module| {
@@ -614,6 +662,7 @@ impl WgpuPipelines {
             device: device.clone(),
             instance_layout: instance_layout.clone(),
             monochrome_layout: monochrome_layout.clone(),
+            mesh_layout: mesh_layout.clone(),
             scene_target: scene_target.clone(),
             path_rasterization_target: path_rasterization_target.clone(),
             path_sample_count,
@@ -636,6 +685,9 @@ impl WgpuPipelines {
                 &shader_module,
             ),
             paths: create(shader::PATHS, &path_target, 1, &shader_module),
+            meshes: mesh_layout
+                .is_some()
+                .then(|| create(shader::MESHES, &scene_target, 1, &shader_module)),
             underlines: create(shader::UNDERLINES, &scene_target, 1, &shader_module),
             monochrome_sprites: create(
                 shader::MONOCHROME_SPRITES,

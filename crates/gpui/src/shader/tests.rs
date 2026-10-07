@@ -8,6 +8,7 @@ fn fragment(uv: [f32; 2], size: [f32; 2]) -> Fragment {
         size: vec2f(size[0], size[1]),
         origin: vec2f(0.0, 0.0),
         scale: 1.0,
+        stroke: vec2f(0.0, 0.0),
     }
 }
 

@@ -194,6 +194,7 @@ fn render() {
                 size: vec2f(WIDTH, HEIGHT),
                 origin: vec2f(0., 0.),
                 scale,
+                stroke: vec2f(0., 0.),
             })
             .expect("the paint runs on the CPU");
         let expected = [rgba.x, rgba.y, rgba.z].map(|channel| (channel * 255.).round() as u8);

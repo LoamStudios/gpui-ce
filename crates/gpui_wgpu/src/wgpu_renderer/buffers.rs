@@ -360,6 +360,9 @@ impl<T: BufferData> DynamicUniformBuffer<T> {
 
 /// One frame's zero-copy scene data arena.
 pub(super) struct InstanceBufferArena {
+    /// How many times its storage has been replaced, so bind groups made
+    /// for it can tell they are stale.
+    generation: u64,
     transport: InstanceTransport,
     storage: InstanceStorage,
     bind_group: wgpu::BindGroup,
@@ -496,6 +499,7 @@ impl InstanceBufferArena {
         };
         let bind_group = instance_bind_group(device, layouts, &storage);
         Self {
+            generation: 0,
             transport,
             storage,
             bind_group,
@@ -578,6 +582,7 @@ impl InstanceBufferArena {
             }
         }
         self.bind_group = instance_bind_group(device, layouts, &self.storage);
+        self.generation += 1;
         *self.textured_bind_groups.get_mut() = TexturedBindGroups::default();
         log::info!("increased instance buffer size to {}", self.capacity);
         true
@@ -633,6 +638,11 @@ impl InstanceBufferArena {
                 InstanceStorage::Buffer(_) => None,
             },
         })
+    }
+
+    /// How many times its storage has been replaced.
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub(super) fn bind_group(&self) -> &wgpu::BindGroup {

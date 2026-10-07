@@ -651,6 +651,12 @@ impl Expr<Fragment> {
         self.member("scale")
     }
 
+    /// Stroke coordinates: along a stroke, in logical pixels, and across
+    /// it, from -1 to 1, where a mesh is painted; zero elsewhere.
+    pub fn stroke(&self) -> Vec2 {
+        self.member("stroke")
+    }
+
     /// Logical-pixel offset from the painted box's center.
     pub fn centered(&self) -> Vec2 {
         self.position() - self.size() * constant(0.5)
@@ -669,6 +675,7 @@ pub(crate) fn eval_member(name: &str, value: Val) -> Val {
         (Val::Fragment(fragment), "size") => Val::Vec2(fragment.size),
         (Val::Fragment(fragment), "origin") => Val::Vec2(fragment.origin),
         (Val::Fragment(fragment), "scale") => Val::F32(fragment.scale),
+        (Val::Fragment(fragment), "stroke") => Val::Vec2(fragment.stroke),
         (_, swizzle) => {
             let (lanes, mut picked) = (value.lanes(), [0.0; 4]);
             for (lane, component) in picked.iter_mut().zip(swizzle.chars()) {

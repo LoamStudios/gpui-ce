@@ -36,6 +36,10 @@ pub mod prelude {
         pub origin: Vec2f,
         /// Device pixels per logical pixel.
         pub scale: f32,
+        /// Stroke coordinates, where a mesh is painted: the distance along
+        /// a stroke, in logical pixels, and across it, from -1 on its left
+        /// to 1 on its right. Zero for everything else.
+        pub stroke: Vec2f,
     }
 
     impl Fragment {
@@ -48,6 +52,7 @@ pub mod prelude {
                 size: fragment.size,
                 origin: fragment.origin,
                 scale: fragment.scale,
+                stroke: fragment.stroke,
             }
         }
 

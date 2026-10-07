@@ -97,10 +97,12 @@ struct StorageArray {
 }
 
 impl StorageArray {
-    /// Group-1 arrays hold a whole frame's instances, of which each draw reads a range; group-0
-    /// arrays are frame tables that every draw reads from index 0.
+    /// The group-1 data array holds a whole frame's instances, of which each draw reads a
+    /// range; group-0 arrays are frame tables, and other group-1 arrays (a mesh's vertices)
+    /// are bound for a draw, and each is read from index 0.
     fn is_instance_range(&self) -> bool {
         self.group == shaders::interface::DATA_BIND_GROUP
+            && self.binding == shaders::interface::DATA_BUFFER_BINDING
     }
 }
 
@@ -163,6 +165,7 @@ fn main() {
     let surface = shader_source("surface interface", &shaders::surface::WGSL_SOURCE);
     let blur = shader_source("blur interface", &shaders::blur::WGSL_SOURCE);
     let group = shader_source("group interface", &shaders::group::WGSL_SOURCE);
+    let mesh = shader_source("mesh interface", &shaders::mesh::WGSL_SOURCE);
     let downlevel_quad = downlevel_dialect("quad interface", &quad);
     let downlevel_polychrome = downlevel_dialect("polychrome sprite interface", &polychrome);
     let downlevel_surface = downlevel_dialect("surface interface", &surface);
@@ -215,6 +218,12 @@ fn main() {
         BindingLayout {
             constant: "GROUP_BINDINGS",
             source: &group,
+            group: shaders::interface::DATA_BIND_GROUP,
+            dialect: ReflectionDialect::Modern,
+        },
+        BindingLayout {
+            constant: "MESH_BINDINGS",
+            source: &mesh,
             group: shaders::interface::DATA_BIND_GROUP,
             dialect: ReflectionDialect::Modern,
         },
@@ -357,10 +366,10 @@ fn parse_storage_array_decl(line: &str) -> Option<StorageArray> {
     let binding = binding.parse().ok()?;
     match group {
         shaders::interface::GLOBAL_BIND_GROUP => {}
-        shaders::interface::DATA_BIND_GROUP => assert_eq!(
-            binding,
-            shaders::interface::DATA_BUFFER_BINDING,
-            "the downlevel transport carries group-1 instances only at the data binding"
+        shaders::interface::DATA_BIND_GROUP => assert!(
+            binding == shaders::interface::DATA_BUFFER_BINDING
+                || binding == shaders::interface::MESH_VERTICES_BINDING,
+            "the downlevel transport carries group-1 arrays only at the data and mesh bindings"
         ),
         _ => panic!("storage array {name} is in unsupported group {group}"),
     }
@@ -917,6 +926,13 @@ fn write_native_shaders(out_dir: &std::path::Path) {
             pipeline: &PATH_RASTERIZATION,
             pipeline_path: "PATH_RASTERIZATION",
             source: &shaders::path_rasterization::WGSL_SOURCE,
+            requires_dual_source_lowering: false,
+            links_programs: true,
+        },
+        NativeShaderModule {
+            pipeline: &MESHES,
+            pipeline_path: "MESHES",
+            source: &shaders::mesh::WGSL_SOURCE,
             requires_dual_source_lowering: false,
             links_programs: true,
         },

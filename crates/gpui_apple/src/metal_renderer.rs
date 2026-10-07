@@ -76,6 +76,10 @@ const DATA_SLOT: u64 = buffer_slot(
     shader_interface::DATA_BIND_GROUP,
     shader_interface::DATA_BUFFER_BINDING,
 );
+const MESH_VERTICES_SLOT: u64 = buffer_slot(
+    shader_interface::DATA_BIND_GROUP,
+    shader_interface::MESH_VERTICES_BINDING,
+);
 const SIZES_SLOT: u64 = shader_interface::MSL_BUFFER_SIZES_SLOT as u64;
 /// Placeholder runtime-array sizes: the generated MSL declares them but never reads them.
 const BUFFER_SIZES: [u8; shader_interface::MSL_BUFFER_SIZES_BYTES as usize] =
@@ -426,6 +430,10 @@ pub struct MetalRenderer {
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     smoothed_polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    meshes_pipeline_state: metal::RenderPipelineState,
+    /// The meshes kept on the GPU, by id: each a buffer of its vertices,
+    /// then its indices.
+    meshes: gpui_render::meshes::MeshCache<MetalMesh>,
     // Blur pipelines: downsample (no blend, also used for the final blit), separable gaussian
     // (no blend), and composite (alpha blend into a rounded rect), from shared shader sources.
     blur_downsample_pipeline_state: metal::RenderPipelineState,
@@ -461,6 +469,9 @@ pub struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+    /// How long the GPU took over the last frame rendered to an image.
+    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+    last_gpu_time: Option<std::time::Duration>,
 }
 
 impl MetalRenderer {
@@ -628,6 +639,13 @@ impl MetalRenderer {
             surfaces_shader,
             MTLPixelFormat::BGRA8Unorm,
         );
+        let (meshes_shader, meshes_library) = pipeline("meshes");
+        let meshes_pipeline_state = build_pipeline_state(
+            &device,
+            &meshes_library,
+            meshes_shader,
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let (blur_downsample_shader, blur_downsample_library) = pipeline("blur_downsample");
         let blur_downsample_pipeline_state = build_blur_pipeline_state(
             &device,
@@ -698,6 +716,8 @@ impl MetalRenderer {
             polychrome_sprites_pipeline_state,
             smoothed_polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            meshes_pipeline_state,
+            meshes: gpui_render::meshes::MeshCache::new(),
             blur_downsample_pipeline_state,
             blur_pipeline_state,
             blur_composite_pipeline_state,
@@ -719,6 +739,8 @@ impl MetalRenderer {
             path_sample_count: PATH_SAMPLE_COUNT,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
+            #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+            last_gpu_time: None,
         }
     }
 
@@ -898,6 +920,20 @@ impl MetalRenderer {
         self.programs.set_cap(cap);
     }
 
+    /// How long the GPU took over the last frame [rendered to an
+    /// image](Self::render_scene_to_image), for benchmarks.
+    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn last_gpu_time(&self) -> Option<std::time::Duration> {
+        self.last_gpu_time
+    }
+
+    /// What drawing meshes has cost: uploads, and the meshes kept.
+    #[doc(hidden)]
+    pub fn mesh_stats(&self) -> gpui_render::meshes::MeshStats {
+        self.meshes.stats()
+    }
+
     /// Renders the scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing
     /// where we want to capture what would be rendered without displaying it.
@@ -989,6 +1025,7 @@ impl MetalRenderer {
         }
         command_buffer.commit();
         command_buffer.wait_until_completed();
+        self.last_gpu_time = Some(gpu_time(&command_buffer));
         self.instance_buffer_pool.lock().release(instance_buffer);
 
         let width = size.width.0 as u32;
@@ -1106,6 +1143,7 @@ impl MetalRenderer {
         });
         self.frame_programs = programs.pipelines;
         self.programs_pending = programs.pending;
+        self.meshes.begin_frame();
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         self.photo_tiles.upload(&self.device, scene);
@@ -1264,6 +1302,15 @@ impl MetalRenderer {
                         false
                     }
                 }
+                RenderCommand::Batch(PrimitiveBatch::Meshes(range)) => self.draw_meshes(
+                    &scene.meshes[range.clone()],
+                    instance_buffer,
+                    &mut instance_offset,
+                    level_uniforms
+                        .as_ref()
+                        .unwrap_or(&targets.last().unwrap().uniforms),
+                    command_encoder,
+                ),
                 RenderCommand::Batch(PrimitiveBatch::Underlines(range)) => self.draw_underlines(
                     &scene.underlines[range.clone()],
                     instance_buffer,
@@ -1454,6 +1501,7 @@ impl MetalRenderer {
         command_encoder.end_encoding();
 
         self.target_pool.end_frame();
+        self.meshes.end_frame();
 
         // Present the offscreen scene by copying it into the drawable/target texture.
         if use_offscreen && self.scene_color_texture.is_some() {
@@ -2069,6 +2117,68 @@ impl MetalRenderer {
         true
     }
 
+    /// Draws `meshes`, each from its vertices and indices kept on the GPU,
+    /// uploaded the first time it is drawn, with its instance from this
+    /// frame's buffer.
+    fn draw_meshes(
+        &mut self,
+        meshes: &[gpui::MeshPrimitive],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        scene_uniforms: &SceneUniforms,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        if meshes.is_empty() {
+            return true;
+        }
+        align_offset(instance_offset);
+        let instances_len = mem::size_of::<gpui::MeshInstance>() * meshes.len();
+        let next_offset = *instance_offset + instances_len;
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+        let instances = unsafe {
+            (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset)
+                as *mut gpui::MeshInstance
+        };
+        for (index, mesh) in meshes.iter().enumerate() {
+            unsafe { instances.add(index).write(mesh.instance) };
+        }
+
+        let pipeline = match &self.frame_programs {
+            Some(programs) => &programs.meshes,
+            None => &self.meshes_pipeline_state,
+        };
+        command_encoder.set_render_pipeline_state(pipeline);
+        bind_scene_uniforms(command_encoder, scene_uniforms);
+        bind_instances(
+            command_encoder,
+            &instance_buffer.metal_buffer,
+            *instance_offset,
+        );
+        let (device, unified) = (&self.device, self.is_unified_memory);
+        for (index, primitive) in meshes.iter().enumerate() {
+            let Some(mesh) = self.meshes.buffers(&primitive.mesh, |mesh| {
+                MetalMesh::upload(device, unified, mesh)
+            }) else {
+                continue;
+            };
+            command_encoder.set_vertex_buffer(MESH_VERTICES_SLOT, Some(&mesh.buffer), 0);
+            command_encoder.draw_indexed_primitives_instanced_base_instance(
+                metal::MTLPrimitiveType::Triangle,
+                mesh.index_count,
+                metal::MTLIndexType::UInt32,
+                &mesh.buffer,
+                mesh.index_offset,
+                1,
+                0,
+                index as u64,
+            );
+        }
+        *instance_offset = next_offset;
+        true
+    }
+
     fn draw_underlines(
         &self,
         underlines: &[Underline],
@@ -2509,6 +2619,9 @@ fn required_instance_buffer_size(scene: &Scene) -> usize {
                 reserve(mem::size_of::<path_types::PathSprite>(), *sprite_count);
             }
             PrimitiveBatch::Underlines(range) => reserve(mem::size_of::<Underline>(), range.len()),
+            PrimitiveBatch::Meshes(range) => {
+                reserve(mem::size_of::<gpui::MeshInstance>(), range.len())
+            }
             PrimitiveBatch::MonochromeSprites { range, .. } => {
                 reserve(mem::size_of::<MonochromeSprite>(), range.len())
             }
@@ -2528,6 +2641,59 @@ fn required_instance_buffer_size(scene: &Scene) -> usize {
         }
     }
     required
+}
+
+/// How long the GPU spent on `command_buffer`, which has completed.
+#[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+fn gpu_time(command_buffer: &metal::CommandBufferRef) -> std::time::Duration {
+    let object = command_buffer.as_ptr() as *const objc2::runtime::AnyObject;
+    // SAFETY: a completed `MTLCommandBuffer` answers both, in seconds.
+    let (start, end): (f64, f64) = unsafe {
+        (
+            objc2::msg_send![&*object, GPUStartTime],
+            objc2::msg_send![&*object, GPUEndTime],
+        )
+    };
+    std::time::Duration::from_secs_f64((end - start).max(0.))
+}
+
+/// A mesh kept on the GPU: its vertices, then its indices, in one buffer.
+#[derive(Clone)]
+struct MetalMesh {
+    buffer: metal::Buffer,
+    index_offset: u64,
+    index_count: u64,
+}
+
+impl MetalMesh {
+    fn upload(device: &metal::DeviceRef, unified_memory: bool, mesh: &gpui::Mesh) -> Option<Self> {
+        let vertices = mesh.vertices();
+        let indices = mesh.indices();
+        let vertex_bytes = mem::size_of_val(vertices);
+        let mut bytes = Vec::with_capacity(mesh.byte_len());
+        // SAFETY: `MeshVertex` is `repr(C)` floats and `u32` indices are plain data.
+        bytes.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(vertices.as_ptr() as *const u8, vertex_bytes)
+        });
+        bytes.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(indices.as_ptr() as *const u8, mem::size_of_val(indices))
+        });
+        if bytes.is_empty() {
+            return None;
+        }
+        let options = if unified_memory {
+            MTLResourceOptions::StorageModeShared
+        } else {
+            MTLResourceOptions::StorageModeManaged
+        };
+        let buffer =
+            device.new_buffer_with_data(bytes.as_ptr() as *const _, bytes.len() as u64, options);
+        Some(Self {
+            buffer,
+            index_offset: vertex_bytes as u64,
+            index_count: indices.len() as u64,
+        })
+    }
 }
 
 /// A scene being drawn: the window's, or a chunk drawn inside it.
@@ -2700,6 +2866,56 @@ mod tests {
         renderer.prepare_intermediate_textures(&filtered_scene, target_size);
         assert!(renderer.path_intermediate_texture.is_none());
         assert!(renderer.scene_color_texture.is_some());
+    }
+
+    /// A mesh drawn frame after frame, wherever it is placed, is uploaded
+    /// once: later frames upload only its instance.
+    #[test]
+    fn redrawing_an_unchanged_mesh_uploads_nothing() {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let mut renderer = MetalRenderer::new_headless(pool);
+        let mesh = Arc::new(gpui::Mesh::from_polygon(
+            &[(1., 1.), (14., 2.), (8., 14.)].map(|(x, y)| gpui::point(gpui::px(x), gpui::px(y))),
+            gpui::peniko::Fill::NonZero,
+        ));
+        let viewport = Bounds {
+            origin: gpui::point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        };
+        let scene_at = |x: f32| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(gpui::MeshPrimitive {
+                instance: gpui::MeshInstance {
+                    scale: 1.0,
+                    origin: gpui::point(ScaledPixels(x), ScaledPixels(0.0)),
+                    bounds: viewport,
+                    content_mask: ContentMask {
+                        bounds: viewport,
+                        ..Default::default()
+                    },
+                    paint: white().into(),
+                    ..Default::default()
+                },
+                mesh: mesh.clone(),
+            });
+            scene.finish();
+            scene
+        };
+        let target = size(DevicePixels(16), DevicePixels(16));
+        let first = renderer
+            .render_scene_to_image(&scene_at(0.0), target)
+            .unwrap();
+        let stats = renderer.mesh_stats();
+        assert_eq!((stats.uploads, stats.resident), (1, 1));
+        assert_eq!(stats.uploaded_bytes, mesh.byte_len() as u64);
+        assert_eq!(first.get_pixel(8, 6).0, [255, 255, 255, 255]);
+        for x in [0.0, 1.0, -1.0, 0.0] {
+            let image = renderer
+                .render_scene_to_image(&scene_at(x), target)
+                .unwrap();
+            assert_eq!(image.get_pixel(8 + x as u32, 6).0, [255, 255, 255, 255]);
+        }
+        assert_eq!(renderer.mesh_stats(), stats);
     }
 
     #[test]

@@ -83,6 +83,9 @@ pub(super) struct WgpuResources {
     /// The `target_globals` generation `globals_bind_group` was made for.
     globals_bind_group_generation: u64,
     pub(super) instances: InstanceBufferArena,
+    /// The meshes kept on the GPU, by id.
+    pub(super) meshes:
+        RefCell<gpui_render::meshes::MeshCache<std::rc::Rc<super::drawing::WgpuMesh>>>,
     pub(super) path_intermediate_texture: Option<wgpu::Texture>,
     pub(super) path_intermediate_view: Option<wgpu::TextureView>,
     pub(super) path_msaa_texture: Option<wgpu::Texture>,
@@ -248,6 +251,7 @@ impl WgpuResources {
         };
         let resources = Self {
             instances: InstanceBufferArena::new(&device, &bind_group_layouts, renderer_tier),
+            meshes: RefCell::default(),
             renderer_tier,
             device,
             queue,

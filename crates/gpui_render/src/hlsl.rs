@@ -22,7 +22,8 @@ pub fn dx11_draw_constants_register(pipeline: &interface::Pipeline) -> Option<u3
         DataLayout::Instances
         | DataLayout::TexturedInstances
         | DataLayout::MonochromeSprites
-        | DataLayout::SubpixelSprites => Some(interface::DX11_DRAW_CONSTANTS_REGISTER),
+        | DataLayout::SubpixelSprites
+        | DataLayout::Meshes => Some(interface::DX11_DRAW_CONSTANTS_REGISTER),
         DataLayout::NativeOnly | DataLayout::Surface | DataLayout::Blur | DataLayout::Group => None,
     }
 }

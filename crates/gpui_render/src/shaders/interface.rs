@@ -44,6 +44,9 @@ pub enum DataLayout {
     Surface,
     Blur,
     Group,
+    /// A frame's mesh instances, and the vertices of the mesh being drawn,
+    /// drawn indexed.
+    Meshes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +106,7 @@ define_pipelines! {
     SMOOTHED_SHADOWS: "smoothed_shadows", vertex_smoothed_shadow, fragment_smoothed_shadow, TriangleStrip, Instances, Rectangle;
     PATH_RASTERIZATION: "path_rasterization", vertex_path_rasterization, fragment_path_rasterization, TriangleList, Instances, Dynamic;
     PATHS: "paths", vertex_path, fragment_path, TriangleStrip, TexturedInstances, Rectangle;
+    MESHES: "meshes", vertex_mesh, fragment_mesh, TriangleList, Meshes, Dynamic;
     UNDERLINES: "underlines", vertex_underline, fragment_underline, TriangleStrip, Instances, Rectangle;
     MONOCHROME_SPRITES: "monochrome_sprites", vertex_monochrome_sprite, fragment_monochrome_sprite, TriangleStrip, MonochromeSprites, Rectangle;
     SUBPIXEL_SPRITES: "subpixel_sprites", vertex_subpixel_sprite, fragment_subpixel_sprite, TriangleStrip, SubpixelSprites, Rectangle;
@@ -134,6 +138,9 @@ pub const PRIMARY_TEXTURE_BINDING: u32 = 1;
 pub const SECONDARY_TEXTURE_BINDING: u32 = 2;
 pub const PRIMARY_SAMPLER_BINDING: u32 = 2;
 pub const SURFACE_SAMPLER_BINDING: u32 = 3;
+/// Group-1 storage array of the vertices of the mesh being drawn, beside the
+/// frame's mesh instances at [`DATA_BUFFER_BINDING`].
+pub const MESH_VERTICES_BINDING: u32 = 1;
 /// Group-0 storage table of the scene's transforms, shared by every pipeline.
 pub const TRANSFORMS_BINDING: u32 = 2;
 /// Group-0 storage table of the scene's clips, shared by every pipeline.
@@ -153,8 +160,9 @@ pub const FULLSCREEN_TRIANGLE_VERTEX_COUNT: u32 = 3;
 /// D3D11 constant-buffer register of the per-draw instance base for instanced pipelines.
 /// Group-0 cbuffers occupy b0 and b1, and the group-1 uniform lands on b7, after group 0.
 pub const DX11_DRAW_CONSTANTS_REGISTER: u32 = 3;
-/// Metal buffer index of the runtime-array sizes Naga's MSL declares, after every buffer slot.
-pub const MSL_BUFFER_SIZES_SLOT: u32 = native_slot(DATA_BIND_GROUP, DATA_BUFFER_BINDING) + 1;
+/// Metal buffer index of the runtime-array sizes Naga's MSL declares, after every buffer slot:
+/// the data buffer, and the mesh vertices beside it.
+pub const MSL_BUFFER_SIZES_SLOT: u32 = native_slot(DATA_BIND_GROUP, MESH_VERTICES_BINDING) + 1;
 /// Bytes a renderer binds at [`MSL_BUFFER_SIZES_SLOT`]. The generated MSL declares one `uint`
 /// per runtime-sized array it can reach, but never reads them: array accesses are unchecked,
 /// which the build asserts along with this bound.
@@ -195,6 +203,8 @@ buffer_data! {
     gpui::SceneTransform => "SceneTransform",
     gpui::SceneClip => "SceneClip",
     gpui::PaintWord => "PaintWord",
+    gpui::MeshInstance => "MeshInstance",
+    gpui::MeshVertex => "MeshVertex",
 }
 
 pub const SCENE_STORAGE_ABI: &[StorageAbi] = &[
@@ -207,6 +217,8 @@ pub const SCENE_STORAGE_ABI: &[StorageAbi] = &[
     storage_abi::<gpui::SceneTransform>(),
     storage_abi::<gpui::SceneClip>(),
     storage_abi::<gpui::PaintWord>(),
+    storage_abi::<gpui::MeshInstance>(),
+    storage_abi::<gpui::MeshVertex>(),
 ];
 
 macro_rules! render_layout {

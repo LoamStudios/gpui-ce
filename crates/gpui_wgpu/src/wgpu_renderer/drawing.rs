@@ -112,6 +112,58 @@ impl WgpuRenderer {
         self.draw_instances_with_texture(sprites, texture_id, &texture, pipeline, instances, pass)
     }
 
+    /// Draws `meshes`, each from its vertices and indices kept on the GPU,
+    /// uploaded the first time it is drawn, with its instance from this
+    /// frame's upload. Tiers without storage buffers in the vertex stage
+    /// draw no meshes.
+    pub(super) fn draw_meshes(
+        &self,
+        meshes: &[gpui::MeshPrimitive],
+        instances: &mut InstanceUpload,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> frame::DrawResult {
+        let Some(slice) =
+            instances.write_iter(meshes.len(), meshes.iter().map(|mesh| mesh.instance))
+        else {
+            return Err(frame::DrawError::CapacityPlanningInvariant);
+        };
+        let resources = self.resources();
+        let pipeline = match &resources.frame_programs {
+            Some(programs) => programs.meshes.as_ref(),
+            None => resources.pipelines.meshes.as_ref(),
+        };
+        let (Some(pipeline), pipelines::InstanceBindingSource::Buffer(arena)) =
+            (pipeline, resources.instances.binding_source())
+        else {
+            return Ok(());
+        };
+        pass.set_pipeline(pipeline);
+        let first = slice.range().start;
+        let generation = resources.instances.generation();
+        let mut cache = resources.meshes.borrow_mut();
+        for (index, primitive) in meshes.iter().enumerate() {
+            let Some(mesh) = cache.buffers(&primitive.mesh, |mesh| {
+                WgpuMesh::upload(&resources.device, mesh).map(std::rc::Rc::new)
+            }) else {
+                continue;
+            };
+            let Some(bind_group) = mesh.bind_group(generation, || {
+                resources.bind_group_layouts.create_mesh(
+                    &resources.device,
+                    arena.clone(),
+                    &mesh.vertices,
+                )
+            }) else {
+                continue;
+            };
+            pass.set_bind_group(shader_interface::DATA_BIND_GROUP, &bind_group, &[]);
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            let instance = first + index as u32;
+            pass.draw_indexed(0..mesh.index_count, 0, instance..instance + 1);
+        }
+        Ok(())
+    }
+
     fn draw_instances<T: BufferData>(
         &self,
         values: &[T],
@@ -302,4 +354,73 @@ fn placed_sprite_bounds(
     sprite: path_types::PathSprite,
 ) -> Bounds<ScaledPixels> {
     frame::transformed_bounds(placement, sprite.bounds)
+}
+
+/// A mesh kept on the GPU: its vertices and indices, and its group-1 bind
+/// group, made for one generation of the instance arena.
+pub(super) struct WgpuMesh {
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    index_count: u32,
+    bind_group: std::cell::RefCell<Option<(u64, wgpu::BindGroup)>>,
+}
+
+impl WgpuMesh {
+    fn upload(device: &wgpu::Device, mesh: &gpui::Mesh) -> Option<Self> {
+        if mesh.indices().is_empty() {
+            return None;
+        }
+        // SAFETY: `MeshVertex` is `repr(C)` floats and indices are `u32`s.
+        let vertices = unsafe {
+            std::slice::from_raw_parts(
+                mesh.vertices().as_ptr() as *const u8,
+                std::mem::size_of_val(mesh.vertices()),
+            )
+        };
+        let indices = unsafe {
+            std::slice::from_raw_parts(
+                mesh.indices().as_ptr() as *const u8,
+                std::mem::size_of_val(mesh.indices()),
+            )
+        };
+        let buffer = |label, bytes: &[u8], usage| {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (bytes.len() as u64).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT),
+                usage,
+                mapped_at_creation: true,
+            });
+            buffer
+                .slice(..)
+                .get_mapped_range_mut()
+                .slice(..bytes.len())
+                .copy_from_slice(bytes);
+            buffer.unmap();
+            buffer
+        };
+        Some(Self {
+            vertices: buffer("mesh_vertices", vertices, wgpu::BufferUsages::STORAGE),
+            indices: buffer("mesh_indices", indices, wgpu::BufferUsages::INDEX),
+            index_count: mesh.indices().len() as u32,
+            bind_group: std::cell::RefCell::new(None),
+        })
+    }
+
+    /// Its bind group for arena `generation`, made by `create` if it has none
+    /// for it.
+    fn bind_group(
+        &self,
+        generation: u64,
+        create: impl FnOnce() -> Option<wgpu::BindGroup>,
+    ) -> Option<wgpu::BindGroup> {
+        let mut bind_group = self.bind_group.borrow_mut();
+        if let Some((made_for, group)) = bind_group.as_ref()
+            && *made_for == generation
+        {
+            return Some(group.clone());
+        }
+        let group = create()?;
+        *bind_group = Some((generation, group.clone()));
+        Some(group)
+    }
 }

@@ -299,6 +299,7 @@ fn expected(paint: &Paint, image: &image::RgbaImage, sample: &Sample) -> [u8; 3]
         size: vec2f(sample.size.0, sample.size.1),
         origin: vec2f(0., 0.),
         scale,
+        stroke: vec2f(0., 0.),
     };
     let rgba = paint.evaluate(fragment).expect("the paint runs on the CPU");
     let alpha = rgba.w.max(1e-6);
