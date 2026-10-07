@@ -49,7 +49,7 @@ use crate::{
     Point, PreparedRasterStyle, Priority, RasterStyleRequest, RasterizedGlyph,
     RasterizedGlyphFormat, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
     Scene, SharedString, Size, SvgRenderer, SystemWindowTab, Task, TextLayoutRequest,
-    ValidatedRasterizedGlyph, Window, WindowControlArea, hash, point, px,
+    TransformationMatrix, ValidatedRasterizedGlyph, Window, WindowControlArea, hash, point, px,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
@@ -2102,6 +2102,11 @@ impl From<TileId> for etagere::AllocId {
 pub struct PlatformInputHandler {
     cx: AsyncWindowContext,
     handler: Box<dyn InputHandler>,
+    /// From the coordinates of the element that registered the handler to the
+    /// window's, in logical pixels. The handler reports bounds, and receives
+    /// points, in its element's coordinates; the platform deals in the
+    /// window's.
+    to_window: TransformationMatrix,
 }
 
 #[expect(missing_docs)]
@@ -2114,7 +2119,43 @@ pub struct PlatformInputHandler {
 )]
 impl PlatformInputHandler {
     pub fn new(cx: AsyncWindowContext, handler: Box<dyn InputHandler>) -> Self {
-        Self { cx, handler }
+        Self {
+            cx,
+            handler,
+            to_window: TransformationMatrix::unit(),
+        }
+    }
+
+    /// A handler registered by an element that `to_window` maps into the
+    /// window, in logical pixels.
+    pub(crate) fn with_transform(mut self, to_window: TransformationMatrix) -> Self {
+        self.to_window = to_window;
+        self
+    }
+
+    /// Moves the handler's element by `placement`, a transform of window
+    /// coordinates in logical pixels: for a handler reused in a recording
+    /// that has moved.
+    pub(crate) fn place(&mut self, placement: TransformationMatrix) {
+        self.to_window = placement.compose(self.to_window);
+    }
+
+    /// The window bounds that contain element `bounds`.
+    fn bounds_to_window(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        if self.to_window == TransformationMatrix::unit() {
+            return bounds;
+        }
+        crate::window::transformed_bounds(&self.to_window, bounds)
+    }
+
+    /// A window point in element coordinates.
+    fn point_to_element(&self, point: Point<Pixels>) -> Point<Pixels> {
+        if self.to_window == TransformationMatrix::unit() {
+            return point;
+        }
+        self.to_window
+            .inverse()
+            .map_or(point, |to_element| to_element.apply(point))
     }
 
     pub fn selected_text_range(&mut self, ignore_disabled_input: bool) -> Option<UTF16Selection> {
@@ -2194,7 +2235,13 @@ impl PlatformInputHandler {
             .ok();
     }
 
+    /// The bounds of `range_utf16` in window coordinates.
     pub fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
+        self.element_bounds_for_range(range_utf16)
+            .map(|bounds| self.bounds_to_window(bounds))
+    }
+
+    fn element_bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
         self.cx
             .update(|window, cx| self.handler.bounds_for_range(range_utf16, window, cx))
             .ok()
@@ -2248,21 +2295,27 @@ impl PlatformInputHandler {
     pub fn selected_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
         let marked_range = self.handler.marked_text_range(window, cx);
         let selection = self.handler.selected_text_range(true, window, cx)?;
-        Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
+        // Lines are found in the element's coordinates, where they run
+        // horizontally, and the result is mapped into the window's.
+        let bounds = Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
             self.handler.bounds_for_range(range, window, cx)
-        })
+        })?;
+        Some(self.bounds_to_window(bounds))
     }
 
     pub fn ime_candidate_bounds(&mut self) -> Option<Bounds<Pixels>> {
         let marked_range = self.marked_text_range();
         let selection = self.selected_text_range(true)?;
-        Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
-            self.bounds_for_range(range)
-        })
+        let bounds = Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
+            self.element_bounds_for_range(range)
+        })?;
+        Some(self.bounds_to_window(bounds))
     }
 
+    /// The character at `point`, in window coordinates.
     #[allow(unused)]
     pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
+        let point = self.point_to_element(point);
         self.cx
             .update(|window, cx| self.handler.character_index_for_point(point, window, cx))
             .ok()
@@ -2285,6 +2338,7 @@ impl PlatformInputHandler {
             .update(|window, cx| self.handler.element_bounds(window, cx))
             .ok()
             .flatten()
+            .map(|bounds| self.bounds_to_window(bounds))
     }
 
     /// See [`InputHandler::text_length_utf16`].

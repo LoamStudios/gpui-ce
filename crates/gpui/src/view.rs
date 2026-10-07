@@ -421,6 +421,11 @@ struct ViewElementCacheKey {
     /// are in window coordinates, and a placement that keeps them aligned
     /// maps them exactly and rasterizes their text again.
     aligned: bool,
+    /// The view's text could be antialiased by subpixel where it was
+    /// recorded ([`Window::may_use_subpixel_text`]). Such a recording is not
+    /// reused where it couldn't: in a composited group, or turned off the
+    /// pixel grid.
+    subpixel_text: bool,
 }
 
 /// Whether `bounds` lies entirely inside `content_mask`, edges included —
@@ -708,6 +713,7 @@ impl<V: View> Element for ViewElement<V> {
                                 unicode_bidi: window.resolved_unicode_bidi(),
                                 to_window: window.element_space().to_window,
                                 aligned: window.element_space().is_aligned(),
+                                subpixel_text: window.may_use_subpixel_text(),
                             };
 
                             if request_layout.element.is_none()
@@ -716,6 +722,8 @@ impl<V: View> Element for ViewElement<V> {
                                 && element_state.cache_key.text_style == cache_key.text_style
                                 && element_state.cache_key.direction == cache_key.direction
                                 && element_state.cache_key.unicode_bidi == cache_key.unicode_bidi
+                                && (!element_state.cache_key.subpixel_text
+                                    || cache_key.subpixel_text)
                                 && !window.dirty_views.contains(&entity_id)
                                 && !window.refreshing
                                 && window.has_subframe(element_state.subframe)
@@ -759,6 +767,9 @@ impl<V: View> Element for ViewElement<V> {
                                 };
                                 element_state.cache_key = ViewElementCacheKey {
                                     records_offset: records_origin - bounds.origin,
+                                    // The records keep the antialiasing they
+                                    // were made with.
+                                    subpixel_text: element_state.cache_key.subpixel_text,
                                     ..cache_key
                                 };
 

@@ -99,3 +99,8 @@ harness = false
 name = "programs_render"
 path = "tests/programs_render.rs"
 harness = false
+
+[[test]]
+name = "text_render"
+path = "tests/text_render.rs"
+harness = false

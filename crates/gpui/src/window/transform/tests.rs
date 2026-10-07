@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
-    AnyWindowHandle, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
-    ParentElement as _, Render, Styled as _, TestAppContext, VisualTestContext, canvas, div, hsla,
-    red,
+    AnyWindowHandle, Entity, FocusHandle, InteractiveElement as _, IntoElement, Modifiers,
+    MouseButton, ParentElement as _, Render, Styled as _, TestAppContext, VisualTestContext,
+    canvas, div, hsla, red,
 };
 use std::{cell::Cell, f32::consts::FRAC_PI_2, f32::consts::FRAC_PI_4, rc::Rc};
 
@@ -516,4 +516,253 @@ fn content_falls_inside_the_groups_that_enclose_it(cx: &mut TestAppContext) {
         );
     })
     .unwrap();
+}
+
+/// A one-line text field whose characters are 10px wide and 20px tall,
+/// left to right from its element's origin, with the caret after the second.
+struct Field {
+    focus: FocusHandle,
+    /// Its element's bounds where it last painted, in its own coordinates.
+    bounds: Rc<Cell<Bounds<Pixels>>>,
+    renders: Rc<Cell<usize>>,
+}
+
+impl crate::EntityInputHandler for Field {
+    fn text_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        _: &mut Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<crate::UTF16Selection> {
+        Some(crate::UTF16Selection {
+            range: 2..2,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        None
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        _: &str,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        _: &str,
+        _: Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(Bounds::new(
+            element_bounds.origin + point(px(10. * range.start as f32), px(0.)),
+            size(px(10. * range.len().max(1) as f32), px(20.)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        let x = point.x - self.bounds.get().origin.x;
+        Some((x / px(10.)).floor().max(0.) as usize)
+    }
+}
+
+impl Render for Field {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        let (field, focus, last_bounds) = (cx.entity(), self.focus.clone(), self.bounds.clone());
+        canvas(
+            |_, _, _| (),
+            move |bounds, _, window, cx| {
+                last_bounds.set(bounds);
+                window.handle_input(&focus, crate::ElementInputHandler::new(bounds, field), cx);
+            },
+        )
+        .size_full()
+    }
+}
+
+/// A 100×20 field at (100, 100), cached, transformed about its center
+/// (150, 110).
+struct FieldStage {
+    field: Entity<Field>,
+    transform: Rc<Cell<kurbo::Affine>>,
+}
+
+impl Render for FieldStage {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let mut style = crate::StyleRefinement::default();
+        style.size.width = Some(px(100.).into());
+        style.size.height = Some(px(20.).into());
+        div().size(px(400.)).relative().child(
+            div()
+                .absolute()
+                .left(px(100.))
+                .top(px(100.))
+                .w(px(100.))
+                .h(px(20.))
+                .transform(self.transform.get())
+                .child(self.field.clone().cached(style)),
+        )
+    }
+}
+
+fn field_stage(
+    cx: &mut TestAppContext,
+    transform: kurbo::Affine,
+) -> (AnyWindowHandle, Rc<Cell<kurbo::Affine>>, Rc<Cell<usize>>) {
+    let transform = Rc::new(Cell::new(transform));
+    let renders = Rc::new(Cell::new(0));
+    let window: AnyWindowHandle = cx
+        .add_window({
+            let (transform, renders) = (transform.clone(), renders.clone());
+            move |window, cx| {
+                let focus = cx.focus_handle();
+                window.focus(&focus, cx);
+                FieldStage {
+                    field: cx.new(|_| Field {
+                        focus,
+                        bounds: Rc::default(),
+                        renders,
+                    }),
+                    transform,
+                }
+            }
+        })
+        .into();
+    (window, transform, renders)
+}
+
+/// Draws the window and returns the input handler it gives the platform.
+fn platform_input_handler(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+) -> PlatformInputHandler {
+    cx.update_window(window, |root, window, cx| {
+        root.downcast::<FieldStage>()
+            .unwrap()
+            .update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+        window
+            .platform_window
+            .take_input_handler()
+            .expect("the focused field registers an input handler")
+    })
+    .unwrap()
+}
+
+/// `transform` about the field's center, from its coordinates to the window's.
+fn field_to_window(transform: kurbo::Affine) -> kurbo::Affine {
+    kurbo::Affine::translate((150., 110.)) * transform * kurbo::Affine::translate((-150., -110.))
+}
+
+/// The window bounds of the field's element `rect` under `transform`.
+fn window_rect(transform: kurbo::Affine, rect: kurbo::Rect) -> Bounds<Pixels> {
+    let rect = field_to_window(transform).transform_rect_bbox(rect);
+    Bounds::from_corners(
+        point(px(rect.x0 as f32), px(rect.y0 as f32)),
+        point(px(rect.x1 as f32), px(rect.y1 as f32)),
+    )
+}
+
+fn close_bounds(actual: Bounds<Pixels>, expected: Bounds<Pixels>) -> bool {
+    close(actual.origin, expected.origin) && close(actual.bottom_right(), expected.bottom_right())
+}
+
+#[crate::test]
+fn an_input_handler_reports_and_hears_window_coordinates_under_a_transform(
+    cx: &mut TestAppContext,
+) {
+    for transform in [
+        kurbo::Affine::rotate(f64::from(FRAC_PI_4)),
+        kurbo::Affine::scale_non_uniform(2., 3.),
+        kurbo::Affine::scale(2.),
+    ] {
+        let (window, _, _) = field_stage(cx, transform);
+        let mut handler = platform_input_handler(cx, window);
+
+        // The third character, (120, 100)-(130, 120) in the field.
+        let expected = window_rect(transform, kurbo::Rect::new(120., 100., 130., 120.));
+        let bounds = handler.bounds_for_range(2..3).unwrap();
+        assert!(
+            close_bounds(bounds, expected),
+            "under {transform:?}, the third character is at {bounds:?}, not {expected:?}"
+        );
+        // The IME is placed at the caret, before the third character.
+        let caret = window_rect(transform, kurbo::Rect::new(120., 100., 130., 120.));
+        let ime = handler.ime_candidate_bounds().unwrap();
+        assert!(
+            close_bounds(ime, caret),
+            "under {transform:?}, the IME is placed at {ime:?}, not {caret:?}"
+        );
+        let element = window_rect(transform, kurbo::Rect::new(100., 100., 200., 120.));
+        assert!(close_bounds(handler.element_bounds().unwrap(), element));
+
+        // The middle of the fourth character, (135, 110) in the field, is
+        // where the window says it is.
+        let middle = field_to_window(transform) * kurbo::Point::new(135., 110.);
+        assert_eq!(
+            handler.character_index_for_point(point(px(middle.x as f32), px(middle.y as f32))),
+            Some(3),
+            "under {transform:?}"
+        );
+    }
+}
+
+#[crate::test]
+fn a_reused_input_handler_follows_its_view_to_a_new_transform(cx: &mut TestAppContext) {
+    let (window, transform, renders) = field_stage(cx, kurbo::Affine::IDENTITY);
+    let handler = platform_input_handler(cx, window);
+    cx.update_window(window, |_, window, _| {
+        window.platform_window.set_input_handler(handler)
+    })
+    .unwrap();
+    assert_eq!(renders.get(), 1);
+
+    let rotation = kurbo::Affine::rotate(f64::from(FRAC_PI_2));
+    transform.set(rotation);
+    let mut handler = platform_input_handler(cx, window);
+    assert_eq!(renders.get(), 1, "the field is reused, not rendered again");
+    let expected = window_rect(rotation, kurbo::Rect::new(120., 100., 130., 120.));
+    let bounds = handler.bounds_for_range(2..3).unwrap();
+    assert!(
+        close_bounds(bounds, expected),
+        "the third character is at {bounds:?}, not {expected:?}"
+    );
 }

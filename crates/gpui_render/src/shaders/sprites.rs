@@ -129,6 +129,44 @@ pub mod monochrome_sprite {
         pub sprite_id: u32,
         #[location(3)]
         pub clip_distances: Vec4f,
+        /// The longer side of the patch of the texture one viewport pixel
+        /// covers, in texture coordinates, divided into `taps` steps.
+        #[location(4)]
+        #[interpolate(flat)]
+        pub footprint_step: Vec2f,
+        #[location(5)]
+        #[interpolate(flat)]
+        pub taps: u32,
+    }
+
+    /// The most texture samples a sprite pixel averages: a sprite shrunk
+    /// along one axis by up to this factor stays smooth.
+    pub const MAX_SPRITE_TAPS: u32 = 8u32;
+
+    /// The longer side of the patch of the texture that one viewport pixel
+    /// covers, in texels, for a sprite of `bounds` drawn from `tile` under
+    /// `transformation`. A sprite shown at its size or larger covers a texel
+    /// or less; one shrunk along an axis, as text under a non-uniform scale
+    /// is, covers several along it.
+    pub fn sprite_footprint(
+        bounds: Bounds,
+        tile: AtlasTile,
+        transformation: TransformationMatrix,
+    ) -> Vec2f {
+        // The images of the sprite's unit axes in the viewport.
+        let x_axis = transpose(transformation.rotation_scale) * vec2f(1.0, 0.0);
+        let y_axis = transpose(transformation.rotation_scale) * vec2f(0.0, 1.0);
+        let det = x_axis.x * y_axis.y - y_axis.x * x_axis.y;
+        if abs(det) < 1e-6 {
+            return vec2f(0.0, 0.0);
+        }
+        // The inverse's columns: how far one viewport pixel across, and one
+        // down, move in the sprite, then in texels.
+        let texels_per_unit = vec2f(tile.bounds.size.x as f32, tile.bounds.size.y as f32)
+            / max(bounds.size, vec2f(1e-6, 1e-6));
+        let across = vec2f(y_axis.y, 0.0 - x_axis.y) / det * texels_per_unit;
+        let down = vec2f(0.0 - y_axis.x, x_axis.x) / det * texels_per_unit;
+        select(down, across, dot(across, across) >= dot(down, down))
     }
 
     #[vertex]
@@ -145,16 +183,33 @@ pub mod monochrome_sprite {
                 sprite.transformation,
             ),
         );
+        let texture_size = texture_dimensions(MONOCHROME_TEXTURE);
+        let footprint = sprite_footprint(
+            sprite.bounds,
+            sprite.tile,
+            compose_transformations(
+                scene_transformation(sprite.transform),
+                sprite.transformation,
+            ),
+        );
+        let taps = min(
+            max(u32(ceil(length(footprint) - 0.01)), 1u32),
+            MAX_SPRITE_TAPS,
+        );
         MonochromeSpriteVarying {
             position: vertex.clip_position,
             tile_position: atlas_texture_coordinates(
                 vertex.unit_position,
                 sprite.tile,
-                texture_dimensions(MONOCHROME_TEXTURE),
+                texture_size,
             ),
             color: hsla_to_rgba(sprite.color),
             sprite_id: instance_id,
             clip_distances: clip_distances(vertex.viewport_position, sprite.content_mask.bounds),
+            footprint_step: footprint
+                / vec2f(texture_size.x as f32, texture_size.y as f32)
+                / (taps as f32),
+            taps,
         }
     }
 
@@ -164,13 +219,22 @@ pub mod monochrome_sprite {
             return transparent();
         }
         let sprite = get!(MONOCHROME_SPRITES)[input.sprite_id as usize];
-        let sample = texture_sample_level(
-            MONOCHROME_TEXTURE,
-            MONOCHROME_SAMPLER,
-            input.tile_position,
-            0.0,
-        )
-        .x;
+        // Averaged over the patch of the texture the pixel covers, so a
+        // sprite shrunk along an axis is filtered rather than aliased.
+        let mut sample = 0.0;
+        let mut tap = 0u32;
+        let first = input.tile_position - input.footprint_step * ((input.taps as f32 - 1.0) * 0.5);
+        while tap < input.taps {
+            sample += texture_sample_level(
+                MONOCHROME_TEXTURE,
+                MONOCHROME_SAMPLER,
+                first + input.footprint_step * (tap as f32),
+                0.0,
+            )
+            .x;
+            tap += 1u32;
+        }
+        sample = sample / (input.taps as f32);
         let corrected = apply_contrast_and_gamma_correction(
             sample,
             input.color.rgb(),

@@ -1759,6 +1759,9 @@ pub struct Window {
     /// Inset transitions use these bounds to resolve `auto` from the child's rendered position.
     style_transition_containing_bounds: Option<Bounds<Pixels>>,
     pub(crate) element_opacity: f32,
+    /// How many composited groups enclose what is being painted: each draws
+    /// into a target of its own; see [`Window::with_compositing`].
+    composited_groups: usize,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     /// While a cached view is recorded, what clips it from outside: it is
     /// recorded unclipped, and this applies only to what is drawn and hit
@@ -2532,6 +2535,7 @@ impl Window {
             element_spaces: Vec::new(),
             transformed_clips: Vec::new(),
             element_opacity: 1.0,
+            composited_groups: 0,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input_active: false,
@@ -4671,11 +4675,22 @@ impl Window {
                 .iter()
                 .cloned(),
         );
+        let handler_placement = if placement.is_zero() {
+            None
+        } else {
+            Some(self.logical_placement(placement))
+        };
         self.next_frame.input_handlers.extend(
             self.rendered_frame.input_handlers
                 [range.start.input_handlers_index..range.end.input_handlers_index]
                 .iter_mut()
-                .map(|handler| handler.take()),
+                .map(|handler| {
+                    let mut handler = handler.take();
+                    if let (Some(handler), Some(placement)) = (&mut handler, handler_placement) {
+                        handler.place(placement);
+                    }
+                    handler
+                }),
         );
         self.next_frame.mouse_listeners.extend(
             self.rendered_frame.mouse_listeners
@@ -4734,6 +4749,20 @@ impl Window {
                 &clip,
                 &mut placed_rasterizer(&self.sprite_atlas, &self.text_system, &cx.svg_renderer),
             );
+        }
+    }
+
+    /// `placement` of a view's records, in logical pixels in the window.
+    pub(crate) fn logical_placement(&self, placement: Placement) -> TransformationMatrix {
+        match placement {
+            Placement::Offset(offset) => {
+                let offset = self.element_offset_in_window(offset);
+                TransformationMatrix {
+                    rotation_scale: TransformationMatrix::UNIT.rotation_scale,
+                    translation: [offset.x.0, offset.y.0],
+                }
+            }
+            Placement::Transform(transformation) => transformation,
         }
     }
 
@@ -5939,6 +5968,7 @@ impl Window {
         };
 
         self.next_frame.scene.insert_primitive(boundary.clone());
+        self.composited_groups += 1;
         if let Some((mode, paint_mask)) = mask {
             // The mask is the group's first child group. It is painted at
             // full strength: the element's opacity already fades what it
@@ -5963,6 +5993,7 @@ impl Window {
             });
         }
         let result = f(self);
+        self.composited_groups -= 1;
         self.next_frame.scene.insert_primitive(GroupBoundary {
             is_start: false,
             ..boundary
@@ -6525,15 +6556,7 @@ impl Window {
     }
 
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
-        if self
-            .platform_window
-            .background_appearance()
-            .is_transparent()
-        {
-            return false;
-        }
-
-        if !self.platform_window.is_subpixel_rendering_supported() {
+        if !self.may_use_subpixel_text() {
             return false;
         }
 
@@ -6545,6 +6568,31 @@ impl Window {
         };
 
         mode == TextRenderingMode::Subpixel
+    }
+
+    /// Whether text painted here can be antialiased by subpixel: only where
+    /// its pixels land on the window's pixel grid, in the window's own
+    /// target. A subpixel mask blends each colour channel into the pixel
+    /// beneath separately, so it needs that pixel: a composited group's
+    /// target is transparent where the text lands, and its one alpha channel
+    /// cannot carry three coverages, so the text would be composited with
+    /// colour fringes. A transform that is not aligned with the window would
+    /// turn the subpixels away from the display's. Text in either is
+    /// antialiased in grayscale, as browsers do.
+    pub(crate) fn subpixel_text_fits(&self) -> bool {
+        self.composited_groups == 0 && self.element_space().is_aligned()
+    }
+
+    /// Whether text painted here may be antialiased by subpixel, if its
+    /// font and size call for it: where it fits ([`Self::subpixel_text_fits`]),
+    /// in an opaque window on a platform that has it.
+    pub(crate) fn may_use_subpixel_text(&self) -> bool {
+        self.subpixel_text_fits()
+            && !self
+                .platform_window
+                .background_appearance()
+                .is_transparent()
+            && self.platform_window.is_subpixel_rendering_supported()
     }
 
     /// Paints an emoji glyph into the scene for the next frame at the current z-index.
@@ -7254,9 +7302,12 @@ impl Window {
 
         if focus_handle.is_focused(self) {
             let cx = self.to_async(cx);
-            self.next_frame
-                .input_handlers
-                .push(Some(PlatformInputHandler::new(cx, Box::new(input_handler))));
+            // The handler works in its element's coordinates, which may be
+            // transformed; the platform asks in the window's.
+            let to_window = self.element_space().to_window;
+            self.next_frame.input_handlers.push(Some(
+                PlatformInputHandler::new(cx, Box::new(input_handler)).with_transform(to_window),
+            ));
         }
     }
 
@@ -10020,6 +10071,206 @@ mod tests {
                 RasterColorEffect::Preblend(crate::Rgba8::new(31, 88, 173, 204)),
                 RasterColorEffect::Preblend(crate::Rgba8::new(122, 86, 31, 204)),
             ]
+        );
+    }
+
+    /// Paints one glyph plainly, and one in each kind of composited group
+    /// and under each kind of transform, each at its own size so each is
+    /// rasterized on its own.
+    struct GroupedGlyphsView;
+
+    /// The sizes the glyphs are painted at, and whether each may be
+    /// antialiased by subpixel.
+    const GROUPED_GLYPHS: [(f32, &str, bool); 7] = [
+        (10., "plain", true),
+        (11., "in a faded group", false),
+        (12., "in a multiplied group", false),
+        (13., "in a masked group", false),
+        (14., "under a rotation", false),
+        (15., "under a non-uniform scale", false),
+        (16., "under a zoom", true),
+    ];
+
+    impl Render for GroupedGlyphsView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            canvas(
+                |_, _, _| (),
+                |bounds, _, window, _| {
+                    let glyph = |window: &mut Window, size: f32| {
+                        window
+                            .paint_glyph(
+                                point(px(20.), px(20.)),
+                                FontId(7),
+                                GlyphId(1),
+                                px(size),
+                                hsla(0., 0., 0., 1.),
+                            )
+                            .unwrap()
+                    };
+                    glyph(window, 10.);
+                    window.with_compositing(bounds, 0.5, BlendMode::Normal, &[], |window| {
+                        glyph(window, 11.)
+                    });
+                    window.with_compositing(bounds, 1., BlendMode::Multiply, &[], |window| {
+                        glyph(window, 12.)
+                    });
+                    window.with_mask(
+                        bounds,
+                        MaskMode::Alpha,
+                        |window| window.paint_quad(fill(bounds, hsla(0., 0., 1., 1.))),
+                        |window| glyph(window, 13.),
+                    );
+                    window.with_transform(kurbo::Affine::rotate(0.3), |window| glyph(window, 14.));
+                    window.with_transform(kurbo::Affine::scale_non_uniform(1., 3.), |window| {
+                        glyph(window, 15.)
+                    });
+                    window.with_transform(kurbo::Affine::scale(2.), |window| glyph(window, 16.));
+                },
+            )
+            .size_full()
+        }
+    }
+
+    /// The render mode of each glyph the window last drew, by font size.
+    fn drawn_modes(window: &Window) -> Vec<(f32, GlyphRenderMode)> {
+        window
+            .rendered_frame
+            .scene
+            .paint_operations
+            .iter()
+            .filter_map(|operation| match operation {
+                crate::scene::PaintOperation::Raster(_, source) => match &**source {
+                    RasterSource::Glyph(glyph) => {
+                        Some((glyph.params.font_size.0, glyph.params.raster_style.mode))
+                    }
+                    RasterSource::Svg(_) => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn text_in_a_composited_group_or_off_the_pixel_grid_is_antialiased_in_grayscale() {
+        let text_system = Arc::new(RasterFormatTextSystem::default());
+        let mut app = TestApp::with_text_system(text_system.clone());
+        let mut test_window = app.open_window(|_, _| GroupedGlyphsView);
+        test_window.update(|_, window, cx| {
+            window
+                .platform_window
+                .as_test()
+                .unwrap()
+                .set_subpixel_rendering_supported(true);
+            window.refresh();
+            cx.notify();
+        });
+        test_window.draw();
+
+        let modes = test_window.update(|_, window, _| drawn_modes(window));
+        for (size, what, subpixel) in GROUPED_GLYPHS {
+            let expected = if subpixel {
+                GlyphRenderMode::Subpixel
+            } else {
+                GlyphRenderMode::Grayscale
+            };
+            assert!(
+                modes.contains(&(size, expected)),
+                "the glyph {what} was drawn as {:?}, not {expected:?}",
+                modes.iter().filter(|(s, _)| *s == size).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// One glyph, painted by a cached view.
+    struct CachedGlyphView {
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for CachedGlyphView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            canvas(
+                |_, _, _| (),
+                |bounds, _, window, _| {
+                    window
+                        .paint_glyph(
+                            bounds.origin + point(px(20.), px(20.)),
+                            FontId(7),
+                            GlyphId(1),
+                            px(10.),
+                            hsla(0., 0., 0., 1.),
+                        )
+                        .unwrap()
+                },
+            )
+            .size_full()
+        }
+    }
+
+    /// The cached glyph view, under a transform.
+    struct TurnedGlyphView {
+        glyph: Entity<CachedGlyphView>,
+        transform: Rc<Cell<kurbo::Affine>>,
+    }
+
+    impl Render for TurnedGlyphView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let mut style = crate::StyleRefinement::default();
+            style.size.width = Some(px(100.).into());
+            style.size.height = Some(px(100.).into());
+            div().size_full().relative().child(
+                div()
+                    .absolute()
+                    .left(px(100.))
+                    .top(px(100.))
+                    .size(px(100.))
+                    .transform(self.transform.get())
+                    .child(self.glyph.clone().cached(style)),
+            )
+        }
+    }
+
+    #[test]
+    fn a_cached_view_with_subpixel_text_is_painted_again_when_turned() {
+        let text_system = Arc::new(RasterFormatTextSystem::default());
+        let mut app = TestApp::with_text_system(text_system.clone());
+        let renders = Rc::new(Cell::new(0));
+        let transform = Rc::new(Cell::new(kurbo::Affine::IDENTITY));
+        let mut test_window = app.open_window({
+            let (renders, transform) = (renders.clone(), transform.clone());
+            move |_, cx| TurnedGlyphView {
+                glyph: cx.new(|_| CachedGlyphView { renders }),
+                transform,
+            }
+        });
+        test_window.update(|_, window, cx| {
+            window
+                .platform_window
+                .as_test()
+                .unwrap()
+                .set_subpixel_rendering_supported(true);
+            window.refresh();
+            cx.notify();
+        });
+        test_window.draw();
+        assert_eq!(
+            test_window.update(|_, window, _| drawn_modes(window)),
+            [(10., GlyphRenderMode::Subpixel)],
+            "upright, the glyph is antialiased by subpixel"
+        );
+        let upright_renders = renders.get();
+
+        transform.set(kurbo::Affine::rotate(0.3));
+        test_window.update(|_, _, cx| cx.notify());
+        test_window.draw();
+        assert_eq!(
+            renders.get(),
+            upright_renders + 1,
+            "the turned view is painted again rather than its subpixel text turned"
+        );
+        assert_eq!(
+            test_window.update(|_, window, _| drawn_modes(window)),
+            [(10., GlyphRenderMode::Grayscale)]
         );
     }
 
