@@ -112,6 +112,11 @@ path = "tests/text_render.rs"
 harness = false
 
 [[test]]
+name = "rotated_text_render"
+path = "tests/rotated_text_render.rs"
+harness = false
+
+[[test]]
 name = "text_paints_render"
 path = "tests/text_paints_render.rs"
 harness = false

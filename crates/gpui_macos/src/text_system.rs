@@ -232,6 +232,7 @@ mod renderer {
             let native = &self.faces[&params.font_id];
 
             if params.raster_style.mode != GlyphRenderMode::Color
+                && params.transform.is_identity()
                 && native.synthesis == FontSynthesis::default()
                 && native.has_default_variations
             {
@@ -288,6 +289,33 @@ mod renderer {
                 0.0
             };
             let padding = (embolden * scale_factor).ceil() + 1.0;
+            if !params.transform.is_identity() {
+                // The scaled ink rectangle, y down, under the glyph's
+                // transform, then moved by its subpixel offset.
+                let ink = Bounds {
+                    origin: point(
+                        (rect.origin.x * scale_factor) as f32,
+                        (-(rect.origin.y + rect.size.height) * scale_factor) as f32,
+                    ),
+                    size: size(
+                        (rect.size.width * scale_factor) as f32,
+                        (rect.size.height * scale_factor) as f32,
+                    ),
+                };
+                let turned = params.transform.transform_bounds(ink);
+                let offset = params.subpixel_offset();
+                let padding = padding as f32;
+                let left = (turned.origin.x + offset.x - padding).floor() as i32;
+                let top = (turned.origin.y + offset.y - padding).floor() as i32;
+                let right =
+                    (turned.origin.x + turned.size.width + offset.x + padding).ceil() as i32;
+                let bottom =
+                    (turned.origin.y + turned.size.height + offset.y + padding).ceil() as i32;
+                return Ok(Bounds {
+                    origin: point(DevicePixels(left), DevicePixels(top)),
+                    size: size(DevicePixels(right - left), DevicePixels(bottom - top)),
+                });
+            }
             let left = (rect.origin.x * scale_factor - padding).floor() as i32;
             let right = ((rect.origin.x + rect.size.width) * scale_factor + padding).ceil() as i32;
             let top = (-(rect.origin.y + rect.size.height) * scale_factor - padding).floor() as i32;
@@ -322,13 +350,15 @@ mod renderer {
             );
 
             let native = &self.faces[&params.font_id];
+            let turned = !params.transform.is_identity();
             let mut bitmap_size = glyph_bounds.size;
 
-            if params.subpixel_variant.x > 0 {
+            // A turned glyph's bounds already hold its subpixel offset.
+            if params.subpixel_variant.x > 0 && !turned {
                 bitmap_size.width += DevicePixels(1);
             }
 
-            if params.subpixel_variant.y > 0 {
+            if params.subpixel_variant.y > 0 && !turned {
                 bitmap_size.height += DevicePixels(1);
             }
 
@@ -358,11 +388,29 @@ mod renderer {
                 },
             );
 
-            context.translate(
-                -glyph_bounds.origin.x.0 as CGFloat,
-                (glyph_bounds.origin.y.0 + glyph_bounds.size.height.0) as CGFloat,
-            );
-            context.scale(scale_factor, scale_factor);
+            if turned {
+                // The glyph's map to device pixels, y down, as a map of
+                // Core Graphics' y-up space, with its subpixel offset, from
+                // the bitmap's bottom left.
+                let [[a, b], [c, d]] = params.transform.scaled(params.scale_factor);
+                let offset = params.subpixel_offset();
+                context.concat_ctm(CGAffineTransform::new(
+                    f64::from(a),
+                    -f64::from(c),
+                    -f64::from(b),
+                    f64::from(d),
+                    f64::from(offset.x - glyph_bounds.origin.x.0 as f32),
+                    f64::from(
+                        (glyph_bounds.origin.y.0 + glyph_bounds.size.height.0) as f32 - offset.y,
+                    ),
+                ));
+            } else {
+                context.translate(
+                    -glyph_bounds.origin.x.0 as CGFloat,
+                    (glyph_bounds.origin.y.0 + glyph_bounds.size.height.0) as CGFloat,
+                );
+                context.scale(scale_factor, scale_factor);
+            }
 
             let skew = native
                 .synthesis
@@ -384,14 +432,18 @@ mod renderer {
                 text_matrix,
             );
 
-            let offset = CGPoint::new(
-                f64::from(params.subpixel_variant.x)
-                    / f64::from(SUBPIXEL_VARIANTS_X)
-                    / scale_factor,
-                f64::from(params.subpixel_variant.y)
-                    / f64::from(SUBPIXEL_VARIANTS_Y)
-                    / scale_factor,
-            );
+            let offset = if turned {
+                CGPoint::new(0., 0.)
+            } else {
+                CGPoint::new(
+                    f64::from(params.subpixel_variant.x)
+                        / f64::from(SUBPIXEL_VARIANTS_X)
+                        / scale_factor,
+                    f64::from(params.subpixel_variant.y)
+                        / f64::from(SUBPIXEL_VARIANTS_Y)
+                        / scale_factor,
+                )
+            };
             let font = font::new_from_descriptor(&native.descriptor, font_size);
             font.draw_glyphs(&[params.glyph_id.0 as u16], &[offset], context);
 
@@ -911,6 +963,7 @@ mod renderer {
                                     color_effect: RasterColorEffect::Dilation(step * 2),
                                     foreground_dependency: gpui::ForegroundDependency::Full,
                                 },
+                                transform: gpui::GlyphTransform::IDENTITY,
                             })
                             .unwrap();
                         glyph.validate().unwrap();
@@ -1048,6 +1101,7 @@ mod renderer {
                         subpixel_variant: point(0, 0),
                         scale_factor: 1.0,
                         raster_style: PreparedRasterStyle::independent(GlyphRenderMode::Grayscale),
+                        transform: gpui::GlyphTransform::IDENTITY,
                     })
                     .unwrap()
             };
@@ -1169,6 +1223,7 @@ mod renderer {
                                 raster_style: PreparedRasterStyle::independent(
                                     GlyphRenderMode::Grayscale,
                                 ),
+                                transform: gpui::GlyphTransform::IDENTITY,
                             })
                             .unwrap_or_else(|error| {
                                 panic!(
@@ -1207,6 +1262,7 @@ mod renderer {
                         color_effect: RasterColorEffect::Dilation(0),
                         foreground_dependency: gpui::ForegroundDependency::Full,
                     },
+                    transform: gpui::GlyphTransform::IDENTITY,
                 })
                 .unwrap();
             let width = raster.size.width.0 as usize;
@@ -1282,6 +1338,7 @@ mod renderer {
                         subpixel_variant: variant,
                         scale_factor: 2.0,
                         raster_style,
+                        transform: gpui::GlyphTransform::IDENTITY,
                     })
                     .unwrap()
             };
@@ -1430,6 +1487,7 @@ mod renderer {
                     subpixel_variant: point(0, 0),
                     scale_factor: 2.0,
                     raster_style: PreparedRasterStyle::independent(GlyphRenderMode::Grayscale),
+                    transform: gpui::GlyphTransform::IDENTITY,
                 })
                 .unwrap();
             assert_eq!(zero_size.size, gpui::Size::default());
@@ -1458,6 +1516,7 @@ mod renderer {
                         requested_mode: GlyphRenderMode::Color,
                         foreground_dependency: gpui::ForegroundDependency::Full,
                     }),
+                    transform: gpui::GlyphTransform::IDENTITY,
                 })
                 .unwrap();
             assert_eq!(emoji.format, RasterizedGlyphFormat::BgraColor);
@@ -1488,6 +1547,7 @@ mod renderer {
                     subpixel_variant: point(2, 0),
                     scale_factor: 2.0,
                     raster_style: transparent_style,
+                    transform: gpui::GlyphTransform::IDENTITY,
                 })
                 .unwrap();
             transparent_emoji.validate().unwrap();
@@ -1537,6 +1597,7 @@ mod renderer {
                         requested_mode: GlyphRenderMode::Color,
                         foreground_dependency: gpui::ForegroundDependency::Full,
                     }),
+                    transform: gpui::GlyphTransform::IDENTITY,
                 })
                 .unwrap();
             assert_eq!(directional.format, RasterizedGlyphFormat::BgraColor);
@@ -1577,6 +1638,7 @@ mod renderer {
                                 requested_mode: GlyphRenderMode::Color,
                                 foreground_dependency: gpui::ForegroundDependency::Full,
                             }),
+                            transform: gpui::GlyphTransform::IDENTITY,
                         })
                         .unwrap();
                     raster.validate().unwrap();

@@ -1561,6 +1561,12 @@ pub(crate) struct GlyphSource {
     pub(crate) origin: Point<ScaledPixels>,
     /// Whether it is a color glyph, which snaps to whole pixels only.
     pub(crate) color: bool,
+    /// For a glyph drawn off the pixel grid, the exact linear map from its
+    /// outline, scaled by its parameters' scale factor, to device pixels:
+    /// it is rasterized under that, quantized, into its parameters'
+    /// transform, its origin is in the viewport, and its sprite has no
+    /// transform-table entry. `None` for a glyph along the grid.
+    pub(crate) transform: Option<[[f32; 2]; 2]>,
 }
 
 /// Where an SVG's sprite came from.
@@ -3492,6 +3498,7 @@ mod tests {
                 color_effect: crate::RasterColorEffect::Independent,
                 foreground_dependency: crate::ForegroundDependency::Full,
             },
+            transform: crate::GlyphTransform::IDENTITY,
         };
         let tile = |id| AtlasTile {
             texture_id: AtlasTextureId {
@@ -3519,6 +3526,7 @@ mod tests {
                 params,
                 origin: point(sp(10.25), sp(20.)),
                 color: false,
+                transform: None,
             }),
         );
 

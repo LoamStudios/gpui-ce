@@ -63,6 +63,12 @@ pub const SUBPIXEL_VARIANTS_X: u8 = 4;
 /// Number of subpixel glyph variants along the Y axis.
 pub const SUBPIXEL_VARIANTS_Y: u8 = 1;
 
+/// Number of subpixel glyph variants along each axis for a glyph drawn
+/// under a [`GlyphTransform`] that turns or skews it: its baseline no longer
+/// runs along a row of pixels, so its origin's fraction matters down as much
+/// as across.
+pub const TRANSFORMED_SUBPIXEL_VARIANTS: u8 = 4;
+
 /// The GPUI text rendering sub system.
 pub struct TextSystem {
     platform_text_system: Arc<dyn PlatformTextSystem>,
@@ -744,6 +750,152 @@ pub struct RenderGlyphParams {
     pub subpixel_variant: Point<u8>,
     pub scale_factor: f32,
     pub raster_style: PreparedRasterStyle,
+    /// The linear map from the glyph, scaled by `scale_factor`, to the
+    /// device pixels it is drawn in: the identity for text drawn along the
+    /// pixel grid.
+    pub transform: GlyphTransform,
+}
+
+impl RenderGlyphParams {
+    /// How far the glyph's origin is past the device pixel its raster is
+    /// placed from, in device pixels, for its subpixel variant.
+    pub fn subpixel_offset(&self) -> Point<f32> {
+        let variants = self.transform.subpixel_variants();
+        Point {
+            x: f32::from(self.subpixel_variant.x) / f32::from(variants.x),
+            y: f32::from(self.subpixel_variant.y) / f32::from(variants.y),
+        }
+    }
+}
+
+/// The linear part of the map from a glyph's outline, scaled to its font
+/// size times its scale factor, to the device pixels it is drawn in, y down:
+/// a glyph under a rotation or skew is rasterized turned, rather than
+/// rasterized upright and resampled on the GPU, so it is as sharp as upright
+/// text.
+///
+/// Its entries are quantized, finer for larger glyphs, so the outline is
+/// never more than [`GlyphTransform::MAX_ERROR`] device pixels from where the
+/// exact map would put it, about what subpixel positioning already allows,
+/// while a glyph turned by an animation is rasterized once per step rather
+/// than once per frame.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GlyphTransform {
+    /// Row-major, `x' = m[0][0] x + m[0][1] y`, in units of
+    /// `1 / GlyphTransform::UNITS`.
+    matrix: [[i32; 2]; 2],
+}
+
+impl GlyphTransform {
+    /// The finest step an entry is quantized to, as its reciprocal.
+    pub const UNITS: i32 = 1 << Self::MAX_STEP_BITS;
+    /// The finest step is 2⁻¹⁴, enough for a glyph two thousand pixels tall.
+    const MAX_STEP_BITS: i32 = 14;
+    /// The coarsest step is 2⁻⁴, for tiny glyphs.
+    const MIN_STEP_BITS: i32 = 4;
+    /// The most, in device pixels, that quantization moves any point of a
+    /// glyph's outline within an em of its origin.
+    pub const MAX_ERROR: f32 = 1. / 8.;
+    /// The identity: a glyph along the pixel grid.
+    pub const IDENTITY: Self = Self {
+        matrix: [[Self::UNITS, 0], [0, Self::UNITS]],
+    };
+
+    /// `matrix` quantized for a glyph whose em is `em` device pixels before
+    /// it, so an outline point within an em of the glyph's origin moves no
+    /// more than [`Self::MAX_ERROR`].
+    ///
+    /// Each entry is rounded to a multiple of a step `q`, off by at most
+    /// `q / 2`, which moves a point `p` by at most `q |p|` (the error
+    /// matrix's norm is at most its Frobenius norm, `q`), so `q` is the
+    /// largest power of two no more than `MAX_ERROR / em`.
+    pub fn quantize(matrix: [[f32; 2]; 2], em: f32) -> Self {
+        let [[a, b], [c, d]] = matrix;
+        let reach = (em / Self::MAX_ERROR).max(1.);
+        let bits = (reach.log2().ceil() as i32).clamp(Self::MIN_STEP_BITS, Self::MAX_STEP_BITS);
+        let units = 1i32 << bits;
+        let coarse = Self::UNITS / units;
+        let entry = |value: f32| {
+            let value = if value.is_finite() { value } else { 0. };
+            let steps = (value * units as f32)
+                .round()
+                .clamp(-(i32::MAX / coarse) as f32, (i32::MAX / coarse) as f32);
+            steps as i32 * coarse
+        };
+        Self {
+            matrix: [[entry(a), entry(b)], [entry(c), entry(d)]],
+        }
+    }
+
+    /// Whether this is the identity.
+    pub fn is_identity(&self) -> bool {
+        *self == Self::IDENTITY
+    }
+
+    /// Whether this keeps the glyph's baseline along a row of pixels: it
+    /// scales or flips, but doesn't turn or skew.
+    pub fn is_axis_aligned(&self) -> bool {
+        self.matrix[0][1] == 0 && self.matrix[1][0] == 0
+    }
+
+    /// How many subpixel variants a glyph under this transform has along
+    /// each axis: a glyph whose baseline runs along a row of pixels is
+    /// placed on whole pixels down, as upright text is, so its horizontal
+    /// edges stay as crisp; a turned one's origin matters down as much as
+    /// across.
+    pub fn subpixel_variants(&self) -> Point<u8> {
+        if self.is_axis_aligned() {
+            Point {
+                x: SUBPIXEL_VARIANTS_X,
+                y: SUBPIXEL_VARIANTS_Y,
+            }
+        } else {
+            Point {
+                x: TRANSFORMED_SUBPIXEL_VARIANTS,
+                y: TRANSFORMED_SUBPIXEL_VARIANTS,
+            }
+        }
+    }
+
+    /// The quantized matrix, row-major, y down.
+    pub fn matrix(&self) -> [[f32; 2]; 2] {
+        self.matrix
+            .map(|row| row.map(|entry| entry as f32 / Self::UNITS as f32))
+    }
+
+    /// The matrix scaled by `scale`: the whole map from the glyph's
+    /// outline, at its font size in logical pixels, to device pixels.
+    pub fn scaled(&self, scale: f32) -> [[f32; 2]; 2] {
+        self.matrix().map(|row| row.map(|entry| entry * scale))
+    }
+
+    /// The device-pixel bounds that contain `bounds`, a rectangle in the
+    /// glyph's scaled coordinates (y down), under this transform.
+    pub fn transform_bounds(&self, bounds: Bounds<f32>) -> Bounds<f32> {
+        let [[a, b], [c, d]] = self.matrix();
+        let corners = [
+            bounds.origin,
+            bounds.top_right(),
+            bounds.bottom_right(),
+            bounds.bottom_left(),
+        ]
+        .map(|corner| Point {
+            x: a * corner.x + b * corner.y,
+            y: c * corner.x + d * corner.y,
+        });
+        let (mut min, mut max) = (corners[0], corners[0]);
+        for corner in &corners[1..] {
+            min = min.min(corner);
+            max = max.max(corner);
+        }
+        Bounds::from_corners(min, max)
+    }
+}
+
+impl Default for GlyphTransform {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
 }
 
 /// The kind of glyph image requested from a rasterizer.
@@ -1004,6 +1156,7 @@ impl Hash for RenderGlyphParams {
         self.subpixel_variant.hash(state);
         self.scale_factor.to_bits().hash(state);
         self.raster_style.hash(state);
+        self.transform.hash(state);
     }
 }
 
@@ -1311,6 +1464,7 @@ mod raster_contract_tests {
             subpixel_variant: point(1, 0),
             scale_factor: 2.0,
             raster_style: style,
+            transform: crate::GlyphTransform::IDENTITY,
         }
     }
 
@@ -1789,5 +1943,114 @@ mod raster_contract_tests {
         fn layout_inline(&self, request: InlineLayoutRequest<'_>) -> InlineLayout {
             PlatformTextSystem::layout_inline(&TestTextSystem, request)
         }
+    }
+}
+
+#[cfg(test)]
+mod glyph_transform_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn turn(degrees: f32) -> [[f32; 2]; 2] {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        [[cos, -sin], [sin, cos]]
+    }
+
+    /// The most quantization moves a point within `em` of the origin: the
+    /// error matrix's largest singular value times `em`.
+    fn largest_movement(matrix: [[f32; 2]; 2], quantized: GlyphTransform, em: f32) -> f32 {
+        let q = quantized.matrix();
+        let [[a, b], [c, d]] = [
+            [q[0][0] - matrix[0][0], q[0][1] - matrix[0][1]],
+            [q[1][0] - matrix[1][0], q[1][1] - matrix[1][1]],
+        ];
+        let sum_of_squares = a * a + b * b + c * c + d * d;
+        let determinant = a * d - b * c;
+        let spread = (sum_of_squares * sum_of_squares - 4. * determinant * determinant)
+            .max(0.)
+            .sqrt();
+        ((sum_of_squares + spread) / 2.).sqrt() * em
+    }
+
+    proptest! {
+        #[test]
+        fn quantization_moves_no_outline_point_more_than_its_bound(
+            a in -3.0f32..3.0,
+            b in -3.0f32..3.0,
+            c in -3.0f32..3.0,
+            d in -3.0f32..3.0,
+            em in 1.0f32..1000.0,
+        ) {
+            let matrix = [[a, b], [c, d]];
+            let quantized = GlyphTransform::quantize(matrix, em);
+            prop_assert!(
+                largest_movement(matrix, quantized, em) <= GlyphTransform::MAX_ERROR * 1.001
+            );
+        }
+
+        #[test]
+        fn quantization_of_a_turn_moves_no_outline_point_more_than_its_bound(
+            degrees in -360.0f32..360.0,
+            em in 4.0f32..1000.0,
+        ) {
+            let quantized = GlyphTransform::quantize(turn(degrees), em);
+            prop_assert!(
+                largest_movement(turn(degrees), quantized, em) <= GlyphTransform::MAX_ERROR * 1.001
+            );
+        }
+    }
+
+    #[test]
+    fn the_identity_and_axis_aligned_maps_quantize_to_themselves() {
+        for em in [4., 32., 300.] {
+            assert!(GlyphTransform::quantize(turn(0.), em).is_identity());
+            let stretched = GlyphTransform::quantize([[1. / 3., 0.], [0., 1.]], em);
+            assert!(stretched.is_axis_aligned() && !stretched.is_identity());
+            assert_eq!(
+                stretched.subpixel_variants(),
+                point(SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y)
+            );
+        }
+        let turned = GlyphTransform::quantize(turn(30.), 32.);
+        assert!(!turned.is_axis_aligned());
+        assert_eq!(
+            turned.subpixel_variants(),
+            point(TRANSFORMED_SUBPIXEL_VARIANTS, TRANSFORMED_SUBPIXEL_VARIANTS)
+        );
+    }
+
+    /// A glyph turned all the way round is rasterized at a bounded number
+    /// of steps, more for larger glyphs, whose outlines reach further.
+    #[test]
+    fn a_full_turn_has_a_bounded_number_of_steps() {
+        let steps = |em: f32| {
+            (0..360_000)
+                .map(|millidegrees| GlyphTransform::quantize(turn(millidegrees as f32 / 1000.), em))
+                .collect::<collections::FxHashSet<_>>()
+                .len()
+        };
+        let (small, body, large) = (steps(12.), steps(32.), steps(200.));
+        // A step of q makes about 8 / q distinct pairs round the unit circle.
+        assert!(small <= 8 * 128, "{small} steps for a 12-pixel em");
+        assert!(body <= 8 * 256, "{body} steps for a 32-pixel em");
+        assert!(large <= 8 * 2048, "{large} steps for a 200-pixel em");
+        assert!(small < body && body < large);
+    }
+
+    #[test]
+    fn subpixel_offsets_follow_the_transform() {
+        let mut params = RenderGlyphParams {
+            font_id: FontId(7),
+            glyph_id: GlyphId(42),
+            font_size: px(16.0),
+            subpixel_variant: point(3, 0),
+            scale_factor: 2.0,
+            raster_style: PreparedRasterStyle::independent(GlyphRenderMode::Grayscale),
+            transform: GlyphTransform::IDENTITY,
+        };
+        assert_eq!(params.subpixel_offset(), point(0.75, 0.));
+        params.transform = GlyphTransform::quantize(turn(45.), 32.);
+        params.subpixel_variant = point(1, 2);
+        assert_eq!(params.subpixel_offset(), point(0.25, 0.5));
     }
 }

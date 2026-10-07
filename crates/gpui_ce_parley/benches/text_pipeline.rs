@@ -69,6 +69,7 @@ fn raster_case() -> (TextSystem, RenderGlyphParams) {
         } else {
             GlyphRenderMode::Grayscale
         }),
+        transform: gpui::GlyphTransform::IDENTITY,
     };
 
     (TextSystem::new(Arc::new(system)), params)

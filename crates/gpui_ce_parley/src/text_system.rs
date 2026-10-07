@@ -4395,6 +4395,7 @@ mod tests {
                     subpixel_variant: Default::default(),
                     scale_factor: 1.0,
                     raster_style: PreparedRasterStyle::independent(mode),
+                    transform: gpui::GlyphTransform::IDENTITY,
                 })
                 .unwrap();
             assert_eq!(raster.bounds.size, raster.size);
@@ -4506,6 +4507,7 @@ mod tests {
                             subpixel_variant: point(0, 0),
                             scale_factor,
                             raster_style,
+                            transform: gpui::GlyphTransform::IDENTITY,
                         })
                         .unwrap();
                     raster.validate().unwrap();
@@ -4623,6 +4625,7 @@ mod tests {
                     subpixel_variant: point(0, 0),
                     scale_factor,
                     raster_style: PreparedRasterStyle::independent(GlyphRenderMode::Grayscale),
+                    transform: gpui::GlyphTransform::IDENTITY,
                 };
                 system.rasterize_glyph(&params).unwrap();
                 assert_eq!(optical_value(fragment.font_id), f32::from(font_size));
@@ -4700,6 +4703,7 @@ mod tests {
             subpixel_variant: point(2, 0),
             scale_factor: 1.5,
             raster_style: PreparedRasterStyle::independent(GlyphRenderMode::Grayscale),
+            transform: gpui::GlyphTransform::IDENTITY,
         };
 
         let raster = system.rasterize_glyph(&params).unwrap();
