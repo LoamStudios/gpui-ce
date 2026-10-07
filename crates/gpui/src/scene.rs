@@ -94,6 +94,8 @@ pub struct Scene {
     /// The paint table's photo paints, whose levels and tiles are chosen when
     /// the frame is prepared.
     photo_paints: Vec<PhotoPaint>,
+    /// The shader programs the paint table's program paints run, each once.
+    programs: Vec<crate::shader::Program>,
     /// The photo tiles the renderer copies into its photo texture array
     /// before it draws.
     pub photo_uploads: Option<std::sync::Arc<crate::PhotoUploads>>,
@@ -136,6 +138,7 @@ impl Scene {
         self.clips.clear();
         self.paint_table.clear();
         self.photo_paints.clear();
+        self.programs.clear();
         self.is_finished = false;
     }
 
@@ -364,16 +367,30 @@ impl Scene {
             // Its tiles are chosen again when this scene is prepared.
             entry.stop_count = 0;
         }
-        let stops: SmallVec<[SceneColorStop; 8]> = (0..entry.stop_count as usize)
-            .map(|stop| {
-                let word = entry.first_stop as usize + stop * SceneColorStop::WORDS;
-                SceneColorStop::from_words(&table[word..])
-            })
-            .collect();
         entry.transformation = entry
             .transformation
             .compose(placement.inverse().unwrap_or(TransformationMatrix::UNIT));
-        let index = self.push_paint(entry, &stops);
+        let index = if entry.kind == PaintKind::Program {
+            // Its parameters, one word each.
+            let first = entry.first_stop as usize;
+            let words = &table[first..first + entry.stop_count as usize];
+            if let Some(program) = prev_scene
+                .programs
+                .iter()
+                .find(|program| program.id() == entry.program_id())
+            {
+                self.add_program(program);
+            }
+            self.push_paint_words(entry, words)
+        } else {
+            let stops: SmallVec<[SceneColorStop; 8]> = (0..entry.stop_count as usize)
+                .map(|stop| {
+                    let word = entry.first_stop as usize + stop * SceneColorStop::WORDS;
+                    SceneColorStop::from_words(&table[word..])
+                })
+                .collect();
+            self.push_paint(entry, &stops)
+        };
         adopted.paints.insert(paint, index);
         if entry.kind == PaintKind::Image
             && let Some(photo_paint) = prev_scene
@@ -736,6 +753,38 @@ impl Scene {
         index
     }
 
+    /// Adds a paint of `paint`, a compiled shader program and its
+    /// parameters, filling a box of `size` logical pixels placed by
+    /// `to_local`, from viewport positions to the box's own logical pixels,
+    /// to the paint table, and returns its index. It draws `fallback`, an
+    /// unpremultiplied sRGB-encoded colour, until the renderer has linked
+    /// the program.
+    pub fn push_program(
+        &mut self,
+        paint: &crate::shader::CompiledPaint,
+        size: [f32; 2],
+        to_local: TransformationMatrix,
+        fallback: [f32; 4],
+    ) -> u32 {
+        self.add_program(&paint.program);
+        let entry = ScenePaint::program(paint.program.id(), size, to_local, fallback);
+        self.push_paint_words(entry, &paint.params)
+    }
+
+    /// Records that the paint table runs `program`.
+    fn add_program(&mut self, program: &crate::shader::Program) {
+        if !self.programs.iter().any(|known| known.id() == program.id()) {
+            self.programs.push(program.clone());
+        }
+    }
+
+    /// The shader programs this scene's paint table runs, each once; a
+    /// renderer links them into its shaders. The chunks it draws have
+    /// their own.
+    pub fn programs(&self) -> &[crate::shader::Program] {
+        &self.programs
+    }
+
     /// The paint table's photo paints.
     pub(crate) fn photo_paints(&self) -> &[PhotoPaint] {
         &self.photo_paints
@@ -799,12 +848,7 @@ impl Scene {
     /// Adds `paint` and its `stops` to the paint table, and returns its
     /// index: the word it starts at.
     fn push_paint(&mut self, mut paint: ScenePaint, stops: &[SceneColorStop]) -> u32 {
-        if self.paint_table.is_empty() {
-            // Index 0 is no paint.
-            self.paint_table
-                .extend_from_slice(&ScenePaint::default().words());
-        }
-        let index = self.paint_table.len();
+        let index = self.start_paint();
         paint.first_stop = (index + ScenePaint::WORDS) as u32;
         paint.stop_count = stops.len() as u32;
         self.paint_table.extend_from_slice(&paint.words());
@@ -812,6 +856,27 @@ impl Scene {
             self.paint_table.extend_from_slice(&stop.words());
         }
         index as u32
+    }
+
+    /// Adds `paint` and `words`, which take the place of its stops, one
+    /// each, to the paint table, and returns its index.
+    fn push_paint_words(&mut self, mut paint: ScenePaint, words: &[PaintWord]) -> u32 {
+        let index = self.start_paint();
+        paint.first_stop = (index + ScenePaint::WORDS) as u32;
+        paint.stop_count = words.len() as u32;
+        self.paint_table.extend_from_slice(&paint.words());
+        self.paint_table.extend_from_slice(words);
+        index as u32
+    }
+
+    /// The index the next paint-table entry starts at.
+    fn start_paint(&mut self) -> usize {
+        if self.paint_table.is_empty() {
+            // Index 0 is no paint.
+            self.paint_table
+                .extend_from_slice(&ScenePaint::default().words());
+        }
+        self.paint_table.len()
     }
 
     /// The paint table, for the renderer to upload as `vec4<f32>`s: entries
@@ -3674,6 +3739,65 @@ mod tests {
             batch_kinds(&mut scene),
             vec!["quad", "start", "quad", "end"]
         );
+    }
+
+    /// A program paint keeps its parameters and program when a recording
+    /// that uses it is replayed somewhere else, and is placed where its
+    /// primitive goes.
+    #[test]
+    fn replayed_program_paints_keep_their_parameters_and_program() {
+        use crate::shader::{Pixel, rgba};
+
+        let paint = rgba(Pixel.uv().x() * 0.25 + 0.5, 0.0, 0.0, 1.0)
+            .compile()
+            .unwrap();
+        assert!(!paint.params.is_empty());
+        let mut recorded = Scene::default();
+        let index = recorded.push_program(
+            &paint,
+            [100., 50.],
+            TransformationMatrix {
+                rotation_scale: TransformationMatrix::UNIT.rotation_scale,
+                translation: [-10., -20.],
+            },
+            [1., 0., 0., 1.],
+        );
+        recorded.push_program(&paint, [10., 10.], TransformationMatrix::UNIT, [0.; 4]);
+        assert_eq!(recorded.programs().len(), 1, "a program is listed once");
+        let entry = ScenePaint::from_words(&recorded.paint_table()[index as usize..]);
+        assert_eq!(entry.kind, PaintKind::Program);
+        assert_eq!(entry.program_id(), paint.program.id());
+        assert_eq!(entry.stop_count as usize, paint.params.len());
+        let words = |scene: &Scene, entry: &ScenePaint| {
+            let first = entry.first_stop as usize;
+            scene.paint_table()[first..first + entry.stop_count as usize].to_vec()
+        };
+        assert_eq!(words(&recorded, &entry), paint.params.to_vec());
+
+        recorded.insert_primitive(Quad {
+            background: ScenePaintRef {
+                color: crate::white().into(),
+                paint: index,
+            },
+            ..quad()
+        });
+        let mut replayed = Scene::default();
+        replayed.replay_at(
+            0..recorded.paint_operations.len(),
+            &recorded,
+            point(sp(30.), sp(40.)),
+            &mask(),
+        );
+        assert_eq!(replayed.programs().len(), 1);
+        assert_eq!(replayed.programs()[0].id(), paint.program.id());
+        let replayed_index = replayed.quads[0].background.paint;
+        let moved = ScenePaint::from_words(&replayed.paint_table()[replayed_index as usize..]);
+        assert_eq!(moved.kind, PaintKind::Program);
+        assert_eq!(words(&replayed, &moved), paint.params.to_vec());
+        // The box's top left moved from (10, 20) to (40, 60).
+        assert_eq!(moved.transformation.translation, [-40., -60.]);
+        assert_eq!(moved.geometry, entry.geometry);
+        assert_eq!(moved.radii, entry.radii);
     }
 
     #[test]

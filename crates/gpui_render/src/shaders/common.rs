@@ -89,6 +89,8 @@ mod source {
         Checkerboard = 4,
         /// A photo, sampled from its resident tiles.
         Image = 5,
+        /// A compiled shader program, linked in by the renderer.
+        Program = 6,
     }
 
     /// How a paint-table gradient continues past its ends.
@@ -413,6 +415,9 @@ mod source {
         if kind == 5u32 {
             return PaintKind::Image;
         }
+        if kind == 6u32 {
+            return PaintKind::Program;
+        }
         PaintKind::Linear
     }
 
@@ -689,6 +694,57 @@ mod source {
         )
     }
 
+    /// The colour of shader program `id` at a fragment of the box it fills
+    /// (its normalized and logical-pixel position in the box, the box's
+    /// size, the device-pixel position of the box's origin, and device
+    /// pixels per logical pixel), with its parameters from word `base` of
+    /// the paint table, as unpremultiplied sRGB-encoded RGBA.
+    ///
+    /// The standard shaders run no programs, so this is `fallback`. A
+    /// renderer that links programs replaces this function, which must stay
+    /// the only one by its name, with one that runs them.
+    pub fn program_color(
+        _id: u32,
+        _uv: Vec2f,
+        _position: Vec2f,
+        _size: Vec2f,
+        _origin: Vec2f,
+        _scale: f32,
+        _base: u32,
+        fallback: Vec4f,
+    ) -> Vec4f {
+        fallback
+    }
+
+    /// The smallest box side a program paint's normalized coordinates are
+    /// measured against, so an empty box divides by no zero.
+    pub const MIN_PROGRAM_BOX_SIZE: f32 = 0.000001;
+
+    /// The colour of program paint `paint` at `point`, in the logical pixels
+    /// of the box it fills, which is at `viewport_position`.
+    ///
+    /// Its geometry is the box's size and the program's id; its parameter
+    /// words take the place of stops; `radii` is its fallback colour.
+    pub fn program_paint_color(paint: ScenePaint, point: Vec2f, viewport_position: Vec2f) -> Vec4f {
+        let size = paint.geometry.xy();
+        // Logical pixels per device pixel is the transformation's scale.
+        let units_per_pixel = sqrt(max(
+            abs(determinant(paint.transformation.rotation_scale)),
+            MIN_PROGRAM_BOX_SIZE,
+        ));
+        let scale = 1.0 / units_per_pixel;
+        program_color(
+            u32(paint.geometry.z),
+            point / max(size, vec2f(MIN_PROGRAM_BOX_SIZE, MIN_PROGRAM_BOX_SIZE)),
+            point,
+            size,
+            viewport_position - point * scale,
+            scale,
+            paint.first_stop,
+            paint.radii,
+        )
+    }
+
     /// The colour of paint-table entry `index` at a viewport position.
     pub fn table_paint_color(index: u32, viewport_position: Vec2f) -> Vec4f {
         let paint = scene_paint(index);
@@ -696,6 +752,9 @@ mod source {
             TransformationMatrix::transform_position(paint.transformation, viewport_position);
         if paint.kind == PaintKind::Image {
             return photo_color(paint, point);
+        }
+        if paint.kind == PaintKind::Program {
+            return program_paint_color(paint, point, viewport_position);
         }
         if paint.kind == PaintKind::Stripes || paint.kind == PaintKind::Checkerboard {
             let mut color =

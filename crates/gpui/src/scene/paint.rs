@@ -26,6 +26,10 @@ pub enum PaintKind {
     /// A photo, placed by the transformation into pixels of its level 0. Its
     /// tile words take the place of stops; see [`ScenePaint::photo`].
     Image = 5,
+    /// A compiled shader program, placed by the transformation into the
+    /// element's own logical pixels. Its parameter words take the place of
+    /// stops; see [`ScenePaint::program`].
+    Program = 6,
 }
 
 /// How a paint-table gradient continues past its ends.
@@ -141,6 +145,7 @@ impl ScenePaint {
                 3 => PaintKind::Stripes,
                 4 => PaintKind::Checkerboard,
                 5 => PaintKind::Image,
+                6 => PaintKind::Program,
                 _ => PaintKind::Linear,
             },
             extend: extend_of(extend),
@@ -319,6 +324,36 @@ impl ScenePaint {
             ],
             ..Self::default()
         }
+    }
+
+    /// The entry for shader program `program_id` filling a box of `size`
+    /// logical pixels, placed by `to_local`, from viewport positions to the
+    /// box's own logical pixels, measured from its top left. Its parameter
+    /// words are added after it, one word each, in place of stops; until
+    /// the renderer has linked the program, it draws `fallback`, an
+    /// unpremultiplied sRGB-encoded colour.
+    pub(crate) fn program(
+        program_id: u32,
+        size: [f32; 2],
+        to_local: TransformationMatrix,
+        fallback: [f32; 4],
+    ) -> Self {
+        assert!(
+            program_id < crate::shader::MAX_PROGRAM_ID,
+            "program ids must be held exactly by a float"
+        );
+        Self {
+            transformation: to_local,
+            kind: PaintKind::Program,
+            geometry: [size[0], size[1], program_id as f32, 0.],
+            radii: fallback,
+            ..Self::default()
+        }
+    }
+
+    /// The program id of a [`PaintKind::Program`] entry.
+    pub fn program_id(&self) -> u32 {
+        self.geometry[2] as u32
     }
 }
 
@@ -514,6 +549,24 @@ mod tests {
         let mut stops = Vec::new();
         let paint = ScenePaint::gradient(gradient, TransformationMatrix::UNIT, &mut stops).unwrap();
         (paint, stops)
+    }
+
+    #[test]
+    fn program_entries_round_trip_through_words() {
+        let to_local = TransformationMatrix {
+            rotation_scale: [[0.5, -0.25], [0.25, 0.5]],
+            translation: [-10., 20.],
+        };
+        let mut entry =
+            ScenePaint::program((1 << 24) - 1, [120., 72.], to_local, [0.2, 0.4, 0.6, 1.]);
+        entry.first_stop = 42;
+        entry.stop_count = 3;
+        let decoded = ScenePaint::from_words(&entry.words());
+        assert_eq!(decoded, entry);
+        assert_eq!(decoded.kind, PaintKind::Program);
+        assert_eq!(decoded.program_id(), (1 << 24) - 1);
+        assert_eq!(decoded.geometry[..2], [120., 72.]);
+        assert_eq!(decoded.radii, [0.2, 0.4, 0.6, 1.]);
     }
 
     #[test]

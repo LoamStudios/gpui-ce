@@ -13,6 +13,7 @@ mod library;
 mod paint;
 mod value;
 
+pub(crate) use compile::MAX_PROGRAM_ID;
 pub use compile::{CompiledPaint, Program, ShaderError, prelude_source};
 pub use expr::{
     Bool, Expr, Scalar, Vec2, Vec3, Vec4, constant, iterate, iterate_until, vec2, vec3, vec4,

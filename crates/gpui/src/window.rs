@@ -6142,6 +6142,48 @@ impl Window {
         }
     }
 
+    /// A background that fills `bounds`, in the current element's
+    /// coordinates, with `paint`, for this frame: fill quads, borders and
+    /// paths with it. The paint is evaluated in the box's own logical
+    /// pixels, from its top left, so it moves, turns and zooms with the
+    /// element. Until the renderer has linked its program, and on renderers
+    /// that cannot, the paint's [fallback](crate::shader::Paint::fallback)
+    /// colour is drawn instead; a paint that does not compile draws only
+    /// that.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn program(&mut self, paint: &crate::shader::Paint, bounds: Bounds<Pixels>) -> Background {
+        self.invalidator.debug_assert_paint();
+        let fallback = paint.fallback_color();
+        let compiled = match paint.compile() {
+            Ok(compiled) => compiled,
+            Err(error) => {
+                log::error!("a shader paint did not compile: {error}");
+                return fallback.into();
+            }
+        };
+        let to_viewport = kurbo::Affine::scale(f64::from(self.scale_factor()))
+            * self.element_to_window()
+            * kurbo::Affine::translate((
+                f64::from(bounds.origin.x.0),
+                f64::from(bounds.origin.y.0),
+            ));
+        let to_local = TransformationMatrix::from(to_viewport.inverse());
+        let rgba = crate::hsla_to_rgba(fallback);
+        let index = self.next_frame.scene.push_program(
+            &compiled,
+            [bounds.size.width.0, bounds.size.height.0],
+            to_local,
+            [
+                rgba.color.red,
+                rgba.color.green,
+                rgba.color.blue,
+                rgba.alpha,
+            ],
+        );
+        Background::paint(index)
+    }
+
     /// What the last frame did with its photos, for benchmarks.
     #[doc(hidden)]
     pub fn photo_stats(&self) -> crate::PhotoStats {

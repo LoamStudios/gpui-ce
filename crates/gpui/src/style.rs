@@ -1298,6 +1298,11 @@ pub enum Fill {
     /// it fills.
     #[schemars(skip)]
     Gradient(Arc<peniko::Gradient>),
+    /// A shader paint, evaluated in the element's own logical pixels from
+    /// its top left. It is not serialized.
+    #[schemars(skip)]
+    #[serde(skip)]
+    Program(crate::shader::Paint),
 }
 
 impl Fill {
@@ -1307,7 +1312,7 @@ impl Fill {
     pub fn color(&self) -> Option<Background> {
         match self {
             Fill::Color(color) => Some(*color),
-            Fill::Gradient(_) => None,
+            Fill::Gradient(_) | Fill::Program(_) => None,
         }
     }
 
@@ -1324,6 +1329,7 @@ impl Fill {
                     f64::from(bounds.origin.y.0),
                 )),
             ),
+            Fill::Program(paint) => window.program(paint, bounds),
         }
     }
 
@@ -1335,6 +1341,7 @@ impl Fill {
                 .stops
                 .iter()
                 .all(|stop| stop.color.components[3] == 0.),
+            Fill::Program(_) => false,
         }
     }
 }
@@ -1344,6 +1351,23 @@ impl Fill {
     /// the element it fills.
     pub fn gradient(gradient: peniko::Gradient) -> Self {
         Self::Gradient(Arc::new(gradient))
+    }
+
+    /// A fill with `paint`, a shader paint evaluated in the logical pixels
+    /// of the element it fills, from its top left; see
+    /// [`Window::program`].
+    ///
+    /// ```ignore
+    /// use gpui::shader::{noise, paint, rgba};
+    ///
+    /// let grain = paint(|px| {
+    ///     let value = noise::value(px.position() * 0.5);
+    ///     rgba(&value, &value, &value, 1.0)
+    /// });
+    /// div().size(px(200.)).bg(Fill::program(grain))
+    /// ```
+    pub fn program(paint: crate::shader::Paint) -> Self {
+        Self::Program(paint)
     }
 }
 

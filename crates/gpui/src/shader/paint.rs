@@ -159,8 +159,8 @@ impl Paint {
     /// preparing it, and by renderers that cannot run it. Transparent unless
     /// set: estimating it, say from the paint's colour at the centre of the
     /// box, would cost the CPU an evaluation each time the paint is drawn.
-    pub fn fallback(mut self, color: impl Into<Hsla>) -> Self {
-        self.fallback = Some(color.into());
+    pub fn fallback(mut self, color: impl IntoColor<Hsla>) -> Self {
+        self.fallback = Some(color.into_color());
         self
     }
 
