@@ -109,3 +109,90 @@ fn check_buffer_sizes_unread(source: &str, label: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The math functions `precise_functions` calls the precise forms of.
+#[allow(
+    dead_code,
+    reason = "the build script shares this module, and links no programs"
+)]
+const PRECISE_FUNCTIONS: &[&str] = &[
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "sinh",
+    "cosh",
+    "tanh",
+    "asinh",
+    "acosh",
+    "atanh",
+    "exp",
+    "exp2",
+    "exp10",
+    "log",
+    "log2",
+    "log10",
+    "pow",
+    "powr",
+    "sqrt",
+    "rsqrt",
+    "fmod",
+    "fract",
+    "length",
+    "normalize",
+    "distance",
+];
+
+/// `msl`, as Naga writes it, with the bodies of the functions named in
+/// `names` (WGSL names: Naga may add a trailing `_`) computing precisely,
+/// whatever the library is compiled with: each opts out of fast math, and
+/// calls the precise form of each math function.
+#[allow(
+    dead_code,
+    reason = "the build script shares this module, and links no programs"
+)]
+pub fn precise_functions(msl: &str, names: &std::collections::HashSet<&str>) -> String {
+    let mut out = String::with_capacity(msl.len() + 4096);
+    // Whether the function being declared is one of them, and whether its
+    // body is being written.
+    let (mut named, mut inside) = (false, false);
+    for line in msl.lines() {
+        if inside {
+            if line == "}" {
+                inside = false;
+                out.push_str(line);
+            } else {
+                let mut line = line.to_string();
+                for function in PRECISE_FUNCTIONS {
+                    line = line.replace(
+                        &format!("metal::{function}("),
+                        &format!("metal::precise::{function}("),
+                    );
+                }
+                out.push_str(&line);
+            }
+            out.push('\n');
+            continue;
+        }
+        // Naga writes a function's declaration from its return type and
+        // name to the line `) {`, and its body to the line `}`.
+        if !line.starts_with([' ', '#', '}']) && line.ends_with('(') {
+            let declared = line[..line.len() - 1].rsplit(' ').next().unwrap_or("");
+            named = names.contains(declared)
+                || declared
+                    .strip_suffix('_')
+                    .is_some_and(|name| names.contains(name));
+        }
+        out.push_str(line);
+        out.push('\n');
+        if named && line == ") {" {
+            out.push_str("#pragma METAL fp math_mode(safe)\n");
+            named = false;
+            inside = true;
+        }
+    }
+    out
+}

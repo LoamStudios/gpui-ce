@@ -274,12 +274,33 @@ pub fn link_hlsl<'a>(
 }
 
 /// Metal Shading Language for `shader` with `programs` linked in.
+///
+/// The programs, and the prelude functions they call, compute what they do
+/// on the CPU: their bodies opt out of fast math, and call the precise forms
+/// of the math functions. The renderer's own code, around them, is compiled
+/// with fast math, as the standard shaders are.
 pub fn link_msl<'a>(
     shader: &NativeShader,
     programs: impl IntoIterator<Item = &'a Program>,
 ) -> Result<String, LinkError> {
-    let (module, info) = link_module(shader, programs)?;
-    crate::msl::write_msl(&module, &info, shader.label).map_err(LinkError)
+    let programs: Vec<&Program> = programs.into_iter().collect();
+    let (module, info) = link_module(shader, programs.iter().copied())?;
+    let msl = crate::msl::write_msl(&module, &info, shader.label).map_err(LinkError)?;
+    let names = std::iter::once(prelude_source())
+        .chain(programs.iter().map(|program| program.source()))
+        .flat_map(wgsl_function_names)
+        .collect::<std::collections::HashSet<_>>();
+    Ok(crate::msl::precise_functions(&msl, &names))
+}
+
+/// The names of the functions `wgsl` defines.
+fn wgsl_function_names(wgsl: &str) -> impl Iterator<Item = &str> {
+    wgsl.split("fn ").skip(1).filter_map(|rest| {
+        let name = &rest[..rest.find('(')?];
+        name.chars()
+            .all(|character| character.is_alphanumeric() || character == '_')
+            .then_some(name)
+    })
 }
 
 #[cfg(test)]
@@ -378,6 +399,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// On Metal, programs and the prelude compute precisely, whatever the
+    /// library is compiled with; the renderer's own functions do not.
+    #[test]
+    fn linked_programs_compute_precisely_on_metal() {
+        let wave = shader::paint(|px| {
+            let value = (px.position().x() * 0.37).sin() * 0.5 + 0.5;
+            shader::rgba(&value, &value, &value, 1.0)
+        })
+        .compile()
+        .unwrap()
+        .program;
+        let shader = linkable().find(|shader| shader.label == "quads").unwrap();
+        let msl = link_msl(shader, [&wave]).unwrap();
+        let body = |name: &str| {
+            let start = msl
+                .lines()
+                .position(|line| !line.starts_with(' ') && line.contains(&format!(" {name}")))
+                .unwrap_or_else(|| panic!("{name} is defined"));
+            msl.lines()
+                .skip(start)
+                .take_while(|line| *line != "}")
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let program = body(wave.entry_point());
+        assert!(
+            program.contains("#pragma METAL fp math_mode(safe)"),
+            "{program}"
+        );
+        assert!(program.contains("metal::precise::sin("), "{program}");
+        assert!(!program.contains("metal::sin("), "{program}");
+        let quad = body("fragment_quad(");
+        assert!(!quad.contains("#pragma"), "{quad}");
+        assert!(!quad.contains("metal::precise::"), "{quad}");
     }
 
     /// A program reading a filter's input links into the group-filter
