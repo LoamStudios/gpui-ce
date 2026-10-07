@@ -156,8 +156,19 @@ pub mod prelude {
 
     impl Noise {
         /// A hash of a 2D point in `[0, 1)`.
+        ///
+        /// Dave Hoskins' sine-free hash: unlike `fract(sin(x) * 43758.5)`,
+        /// it does not amplify the last bit of its input thousands of times,
+        /// so the CPU and GPUs, which round and fuse operations differently,
+        /// agree on it.
         pub fn hash(point: Vec2f) -> f32 {
-            fract(sin(dot(point, vec2f(127.1, 311.7))) * 43758.547)
+            let scrambled = fract(vec3f(point.x, point.y, point.x) * 0.1031);
+            let mixed = scrambled
+                + dot(
+                    scrambled,
+                    vec3f(scrambled.y, scrambled.z, scrambled.x) + 33.33,
+                );
+            fract((mixed.x + mixed.y) * mixed.z)
         }
 
         /// Smoothly interpolated value noise in `[0, 1)`.
