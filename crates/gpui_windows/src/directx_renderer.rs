@@ -107,6 +107,13 @@ pub(crate) struct DirectXRenderer {
     resources: Option<DirectXResources>,
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
+    /// The shader programs linked into the shaders that read paints.
+    programs: gpui_render::linked::LinkedPrograms<crate::directx_programs::LinkedShaders>,
+    /// The shaders the frame being drawn draws paints with, when its scene
+    /// runs programs: `None` for the pipelines' own.
+    frame_programs: Option<Arc<crate::directx_programs::LinkedShaders>>,
+    /// Whether the last frame drew programs still being linked.
+    programs_pending: bool,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
 
@@ -576,6 +583,9 @@ impl DirectXRenderer {
             resources: Some(resources),
             globals,
             pipelines,
+            programs: gpui_render::linked::LinkedPrograms::new(),
+            frame_programs: None,
+            programs_pending: false,
             direct_composition,
             font_info: Self::get_font_info(),
             width: 1,
@@ -783,23 +793,45 @@ impl DirectXRenderer {
         self.resources = Some(resources);
         self.globals = globals;
         self.pipelines = pipelines;
+        // Shaders linked on the lost device are linked again on the new one.
+        self.programs.clear();
+        self.frame_programs = None;
         self.direct_composition = direct_composition;
         self.skip_draws = true;
         Ok(())
     }
 
+    /// Draws `scene` and presents it. Returns whether it should be drawn
+    /// again soon: it runs shader programs still being linked, which it drew
+    /// with their fallback colours.
     pub(crate) fn draw(
         &mut self,
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
-            return Ok(());
+            return Ok(false);
         }
         self.render(scene, background_appearance)?;
-        self.present()
+        self.present()?;
+        Ok(self.programs_pending)
+    }
+
+    /// Picks the shaders `scene`'s paints draw with, starting to link the
+    /// shader programs it runs that they lack.
+    fn prepare_programs(&mut self, scene: &Scene) -> Result<()> {
+        let device = &self.devices.as_ref().context("devices missing")?.device;
+        let programs = self.programs.prepare(scene, || {
+            let device = crate::directx_programs::LinkingDevice(device.clone());
+            move |programs: Vec<gpui::shader::Program>| {
+                crate::directx_programs::link_shaders(&device, &programs)
+            }
+        });
+        self.frame_programs = programs.pipelines;
+        self.programs_pending = programs.pending;
+        Ok(())
     }
 
     /// Encodes a complete frame without presenting it. Window drawing and test readback share
@@ -817,6 +849,7 @@ impl DirectXRenderer {
         })?;
 
         self.upload_scene_buffers(scene)?;
+        self.prepare_programs(scene)?;
 
         // Render the scene into an offscreen texture when backdrop filters or blend modes read
         // what is already painted, then blit it to the swapchain; otherwise render straight to
@@ -1383,21 +1416,41 @@ impl DirectXRenderer {
     }
 
     fn draw_shadows(&mut self, instances: InstanceRange, smoothed: bool) -> Result<()> {
-        self.pipelines.shadow_pipeline.draw_instances_variant(
-            &self.frame_bindings()?,
-            None,
-            instances,
-            smoothed,
-        )
+        let pipeline = &self.pipelines.shadow_pipeline;
+        match &self.frame_programs {
+            Some(linked) => pipeline.draw_instances_linked(
+                &self.frame_bindings()?,
+                None,
+                instances,
+                if smoothed {
+                    &linked.smoothed_shadows
+                } else {
+                    &linked.shadows
+                },
+            ),
+            None => {
+                pipeline.draw_instances_variant(&self.frame_bindings()?, None, instances, smoothed)
+            }
+        }
     }
 
     fn draw_quads(&mut self, instances: InstanceRange, smoothed: bool) -> Result<()> {
-        self.pipelines.quad_pipeline.draw_instances_variant(
-            &self.frame_bindings()?,
-            None,
-            instances,
-            smoothed,
-        )
+        let pipeline = &self.pipelines.quad_pipeline;
+        match &self.frame_programs {
+            Some(linked) => pipeline.draw_instances_linked(
+                &self.frame_bindings()?,
+                None,
+                instances,
+                if smoothed {
+                    &linked.smoothed_quads
+                } else {
+                    &linked.quads
+                },
+            ),
+            None => {
+                pipeline.draw_instances_variant(&self.frame_bindings()?, None, instances, smoothed)
+            }
+        }
     }
 
     fn draw_paths_to_intermediate(
@@ -1467,6 +1520,9 @@ impl DirectXRenderer {
             },
             u32::try_from(rasterization_vertex_count)
                 .context("path rasterization vertex count exceeds the D3D11 draw limit")?,
+            self.frame_programs
+                .as_deref()
+                .map(|linked| &linked.path_rasterization),
         )?;
 
         // Resolve MSAA to non-MSAA intermediate texture
@@ -1547,11 +1603,18 @@ impl DirectXRenderer {
         instances: InstanceRange,
     ) -> Result<()> {
         let texture_view = self.atlas.get_texture_view(texture_id);
-        self.pipelines.mono_sprites.draw_instances(
-            &self.frame_bindings()?,
-            Some(&texture_view),
-            instances,
-        )
+        let pipeline = &self.pipelines.mono_sprites;
+        match &self.frame_programs {
+            Some(linked) => pipeline.draw_instances_linked(
+                &self.frame_bindings()?,
+                Some(&texture_view),
+                instances,
+                &linked.monochrome_sprites,
+            ),
+            None => {
+                pipeline.draw_instances(&self.frame_bindings()?, Some(&texture_view), instances)
+            }
+        }
     }
 
     fn draw_subpixel_sprites(
@@ -2405,10 +2468,10 @@ struct PipelineState<T> {
     _marker: std::marker::PhantomData<T>,
 }
 
-struct PipelineVariant {
-    specification: &'static shader_interface::Pipeline,
-    vertex: ID3D11VertexShader,
-    fragment: ID3D11PixelShader,
+pub(crate) struct PipelineVariant {
+    pub(crate) specification: &'static shader_interface::Pipeline,
+    pub(crate) vertex: ID3D11VertexShader,
+    pub(crate) fragment: ID3D11PixelShader,
 }
 
 impl<T> PipelineState<T> {
@@ -2575,14 +2638,38 @@ impl<T> PipelineState<T> {
         self.draw_with_variant(frame, texture, vertex_count, instances, variant)
     }
 
-    /// Draws `vertex_count` vertex-pulled vertices as a single instance.
-    fn draw_vertices(&self, frame: &FrameBindings<'_>, vertex_count: u32) -> Result<()> {
+    /// Draws `instances` with `linked`, the pipeline's shaders with shader
+    /// programs linked in, in place of its own.
+    fn draw_instances_linked(
+        &self,
+        frame: &FrameBindings<'_>,
+        texture: Option<&[Option<ID3D11ShaderResourceView>]>,
+        instances: InstanceRange,
+        linked: &PipelineVariant,
+    ) -> Result<()> {
+        let vertex_count = linked
+            .specification
+            .vertex_count
+            .fixed()
+            .with_context(|| format!("{} has no fixed vertex count", self.label))?;
+        self.draw_with_variant(frame, texture, vertex_count, instances, Some(linked))
+    }
+
+    /// Draws `vertex_count` vertex-pulled vertices as a single instance, with
+    /// `linked` shaders, with shader programs linked in, in place of the
+    /// pipeline's own if given.
+    fn draw_vertices(
+        &self,
+        frame: &FrameBindings<'_>,
+        vertex_count: u32,
+        linked: Option<&PipelineVariant>,
+    ) -> Result<()> {
         anyhow::ensure!(
             self.specification.vertex_count.fixed().is_none(),
             "{} draws a fixed vertex count per instance",
             self.label
         );
-        self.draw(frame, None, vertex_count, InstanceRange::SINGLE)
+        self.draw_with_variant(frame, None, vertex_count, InstanceRange::SINGLE, linked)
     }
 
     fn draw(

@@ -7,6 +7,7 @@ mod direct_write;
 mod directx_atlas;
 mod directx_devices;
 mod directx_photos;
+mod directx_programs;
 mod directx_renderer;
 mod directx_targets;
 mod dispatcher;

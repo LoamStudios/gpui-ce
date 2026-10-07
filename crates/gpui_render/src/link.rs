@@ -188,6 +188,40 @@ pub fn link_module<'a>(
     Ok((module, info))
 }
 
+/// Shader-model 5.0 HLSL for `shader` with `programs` linked in, for
+/// Direct3D 11 to compile: linked and validated, then translated by the
+/// floor Naga with the build's registers and draw constants (see
+/// [`crate::hlsl`]), as the standard shaders' HLSL is.
+#[cfg(any(windows, test))]
+pub fn link_hlsl<'a>(
+    shader: &NativeShader,
+    programs: impl IntoIterator<Item = &'a Program>,
+) -> Result<String, LinkError> {
+    let linkable = Linkable::native(shader)
+        .ok_or_else(|| LinkError(format!("{} does not read the paint table", shader.label)))?;
+    let source = link_source(&linkable, programs);
+    let module = naga_old::front::wgsl::parse_str(&source).map_err(|error| {
+        LinkError(format!(
+            "{} with programs linked in, for HLSL: {}",
+            shader.label,
+            error.emit_to_string(&source)
+        ))
+    })?;
+    let info = naga_old::valid::Validator::new(
+        naga_old::valid::ValidationFlags::all(),
+        naga_old::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .map_err(|error| {
+        LinkError(format!(
+            "{} with programs linked in, for HLSL: {}",
+            shader.label,
+            error.emit_to_string(&source)
+        ))
+    })?;
+    crate::hlsl::write_hlsl(&module, &info, &source, shader.pipeline).map_err(LinkError)
+}
+
 /// Metal Shading Language for `shader` with `programs` linked in.
 pub fn link_msl<'a>(
     shader: &NativeShader,
@@ -253,6 +287,33 @@ mod tests {
             let msl = link_msl(shader, &programs).unwrap();
             for program in &programs {
                 assert!(msl.contains(program.entry_point()), "{}", shader.label);
+            }
+        }
+    }
+
+    /// Each shader that reads paints, programs linked in, translates to
+    /// shader-model 5.0 HLSL the way the build translates it without: its
+    /// entry points, the programs, and the draw constants as a `cbuffer`.
+    #[test]
+    fn shaders_link_into_hlsl() {
+        let programs = [grain(), rings()].map(|paint| paint.compile().unwrap().program);
+        for shader in linkable() {
+            let stock = link_hlsl(shader, []).unwrap();
+            let hlsl = link_hlsl(shader, &programs).unwrap();
+            for source in [&stock, &hlsl] {
+                assert!(source.contains(shader.vertex_entry), "{}", shader.label);
+                assert!(source.contains(shader.fragment_entry), "{}", shader.label);
+            }
+            for program in &programs {
+                assert!(hlsl.contains(program.entry_point()), "{}", shader.label);
+            }
+            if crate::hlsl::dx11_draw_constants_register(shader.pipeline).is_some() {
+                assert!(
+                    hlsl.contains("cbuffer DrawConstants : register(b")
+                        && !hlsl.contains("ConstantBuffer<NagaConstants>"),
+                    "{}",
+                    shader.label
+                );
             }
         }
     }

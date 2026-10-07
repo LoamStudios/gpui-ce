@@ -18,6 +18,14 @@ log.workspace = true
 naga = { version = "29.0.4", features = ["msl-out", "wgsl-in"] }
 wgsl-rs.workspace = true
 
+# The DirectX renderer links shader programs at run time, through the same
+# floor Naga the build translates the standard shaders' HLSL with.
+[target.'cfg(windows)'.dependencies]
+naga-old = { package = "naga", version = "24.0.0", features = [
+  "hlsl-out",
+  "wgsl-in",
+] }
+
 [target.'cfg(windows)'.build-dependencies]
 windows.workspace = true
 
@@ -37,3 +45,7 @@ wgsl-rs.workspace = true
 
 [dev-dependencies]
 naga = { version = "29.0.4", features = ["glsl-out", "msl-out", "wgsl-in"] }
+naga-old = { package = "naga", version = "24.0.0", features = [
+  "hlsl-out",
+  "wgsl-in",
+] }

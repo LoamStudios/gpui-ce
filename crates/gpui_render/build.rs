@@ -5,6 +5,8 @@
 //! against the Naga versions its consumers require. Dialect gaps close via mechanical
 //! transforms here, never per-backend hand edits.
 
+#[path = "src/hlsl.rs"]
+mod hlsl;
 #[path = "src/msl.rs"]
 mod msl;
 #[path = "src/path_types.rs"]
@@ -105,6 +107,7 @@ impl StorageArray {
 fn main() {
     println!("cargo:rerun-if-changed=src/shaders");
     println!("cargo:rerun-if-changed=src/msl.rs");
+    println!("cargo:rerun-if-changed=src/hlsl.rs");
     println!("cargo:rerun-if-changed=src/path_types.rs");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set"));
@@ -1027,7 +1030,8 @@ fn write_native_shaders(out_dir: &std::path::Path) {
         .validate(&legacy_module)
         .unwrap_or_else(|error| panic!("failed to validate {}: {error}", pipeline.label));
 
-        let hlsl = write_hlsl(&legacy_module, &legacy_info, &wgsl, pipeline);
+        let hlsl = hlsl::write_hlsl(&legacy_module, &legacy_info, &wgsl, pipeline)
+            .unwrap_or_else(|error| panic!("{error}"));
         let current_module = naga::front::wgsl::parse_str(&wgsl).unwrap_or_else(|error| {
             panic!(
                 "failed to parse {} with current Naga: {error}",
@@ -1130,7 +1134,7 @@ fn write_native_shaders(out_dir: &std::path::Path) {
         let gles_300_fragment_path = format!("/{gles_300_fragment_name}");
         let dx11_artifact = write_dx11_bytecode(out_dir, pipeline.label, &hlsl, pipeline)
             .map(|bytecode| {
-                let draw_constants = match dx11_draw_constants_register(pipeline) {
+                let draw_constants = match hlsl::dx11_draw_constants_register(pipeline) {
                     Some(register) => {
                         format!("Some(Dx11DrawConstantsBinding {{ register: {register} }})")
                     }
@@ -1345,103 +1349,4 @@ fn write_glsl(
         "Naga emitted an incomplete GLSL artifact for {label} ({entry_point})"
     );
     output
-}
-
-/// Instanced pipelines read their batch base from the draw-constants cbuffer.
-///
-/// Direct3D 11 never folds `StartInstanceLocation` into `SV_InstanceID`, so a shader that
-/// indexes a whole-frame instance buffer needs the base delivered some other way. Naga's
-/// "special constants" cbuffer is that way: `instance_index` becomes
-/// `first_instance + SV_InstanceID`. Fullscreen and per-draw-uniform pipelines draw one
-/// instance from vertex zero and carry no such cbuffer.
-fn dx11_draw_constants_register(pipeline: &shaders::interface::Pipeline) -> Option<u32> {
-    use shaders::interface::DataLayout;
-    match pipeline.data_layout {
-        DataLayout::Instances
-        | DataLayout::TexturedInstances
-        | DataLayout::MonochromeSprites
-        | DataLayout::SubpixelSprites => Some(shaders::interface::DX11_DRAW_CONSTANTS_REGISTER),
-        DataLayout::NativeOnly | DataLayout::Surface | DataLayout::Blur | DataLayout::Group => None,
-    }
-}
-
-fn write_hlsl(
-    module: &naga_old::Module,
-    info: &naga_old::valid::ModuleInfo,
-    wgsl: &str,
-    pipeline: &shaders::interface::Pipeline,
-) -> String {
-    let label = pipeline.label;
-    let mut binding_map = naga_old::back::hlsl::BindingMap::default();
-    for (_, variable) in module.global_variables.iter() {
-        if let Some(binding) = &variable.binding {
-            binding_map.insert(
-                binding.clone(),
-                naga_old::back::hlsl::BindTarget {
-                    space: 0,
-                    register: shaders::interface::native_slot(binding.group, binding.binding),
-                    ..Default::default()
-                },
-            );
-        }
-    }
-    let draw_constants_register = dx11_draw_constants_register(pipeline);
-    let options = naga_old::back::hlsl::Options {
-        shader_model: naga_old::back::hlsl::ShaderModel::V5_0,
-        binding_map,
-        fake_missing_bindings: false,
-        special_constants_binding: draw_constants_register.map(|register| {
-            naga_old::back::hlsl::BindTarget {
-                space: 0,
-                register,
-                ..Default::default()
-            }
-        }),
-        ..Default::default()
-    };
-    let mut output = String::new();
-    naga_old::back::hlsl::Writer::new(&mut output, &options)
-        .write(module, info, None)
-        .unwrap_or_else(|error| panic!("failed to generate HLSL for {label}: {error}"));
-    match draw_constants_register {
-        Some(register) => lower_draw_constants_to_sm50(output, wgsl, label, register),
-        None => {
-            assert!(
-                !wgsl.contains("instance_index"),
-                "{label} reads instance_index but has no DX11 draw constants"
-            );
-            output
-        }
-    }
-}
-
-/// Naga declares its special constants with `ConstantBuffer<T>`, a shader-model 5.1 form
-/// that `vs_5_0` rejects. Rewrite that one declaration into the classic `cbuffer` block and
-/// prove the base actually reaches every instance lookup.
-fn lower_draw_constants_to_sm50(hlsl: String, wgsl: &str, label: &str, register: u32) -> String {
-    let declaration =
-        format!("ConstantBuffer<NagaConstants> _NagaConstants: register(b{register});");
-    assert_eq!(
-        hlsl.matches(&declaration).count(),
-        1,
-        "{label}: expected exactly one Naga special-constants declaration"
-    );
-    assert_eq!(
-        hlsl.matches(&format!("register(b{register})")).count(),
-        1,
-        "{label}: draw-constants register b{register} collides with another cbuffer"
-    );
-    let lowered = hlsl.replace(
-        &declaration,
-        &format!(
-            "cbuffer DrawConstants : register(b{register}) {{ NagaConstants _NagaConstants; }}"
-        ),
-    );
-    if wgsl.contains("instance_index") {
-        assert!(
-            lowered.contains("_NagaConstants.first_instance + "),
-            "{label}: instance_index must be offset by the draw-constants base"
-        );
-    }
-    lowered
 }
