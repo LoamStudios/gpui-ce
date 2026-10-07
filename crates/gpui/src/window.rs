@@ -4671,11 +4671,22 @@ impl Window {
                 .iter()
                 .cloned(),
         );
+        let handler_placement = if placement.is_zero() {
+            None
+        } else {
+            Some(self.logical_placement(placement))
+        };
         self.next_frame.input_handlers.extend(
             self.rendered_frame.input_handlers
                 [range.start.input_handlers_index..range.end.input_handlers_index]
                 .iter_mut()
-                .map(|handler| handler.take()),
+                .map(|handler| {
+                    let mut handler = handler.take();
+                    if let (Some(handler), Some(placement)) = (&mut handler, handler_placement) {
+                        handler.place(placement);
+                    }
+                    handler
+                }),
         );
         self.next_frame.mouse_listeners.extend(
             self.rendered_frame.mouse_listeners
@@ -4734,6 +4745,20 @@ impl Window {
                 &clip,
                 &mut placed_rasterizer(&self.sprite_atlas, &self.text_system, &cx.svg_renderer),
             );
+        }
+    }
+
+    /// `placement` of a view's records, in logical pixels in the window.
+    pub(crate) fn logical_placement(&self, placement: Placement) -> TransformationMatrix {
+        match placement {
+            Placement::Offset(offset) => {
+                let offset = self.element_offset_in_window(offset);
+                TransformationMatrix {
+                    rotation_scale: TransformationMatrix::UNIT.rotation_scale,
+                    translation: [offset.x.0, offset.y.0],
+                }
+            }
+            Placement::Transform(transformation) => transformation,
         }
     }
 
@@ -7212,9 +7237,12 @@ impl Window {
 
         if focus_handle.is_focused(self) {
             let cx = self.to_async(cx);
-            self.next_frame
-                .input_handlers
-                .push(Some(PlatformInputHandler::new(cx, Box::new(input_handler))));
+            // The handler works in its element's coordinates, which may be
+            // transformed; the platform asks in the window's.
+            let to_window = self.element_space().to_window;
+            self.next_frame.input_handlers.push(Some(
+                PlatformInputHandler::new(cx, Box::new(input_handler)).with_transform(to_window),
+            ));
         }
     }
 
