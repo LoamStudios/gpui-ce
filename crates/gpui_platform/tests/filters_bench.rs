@@ -1,9 +1,11 @@
 //! The GPU cost of a group's filters: a 1000×800 group (a gradient, and a
 //! grid of squares over it) drawn plain, isolated, and through each kind of
-//! filter, frame after frame in an offscreen window, timed by Metal's
-//! command-buffer timestamps. Each frame draws the group [`COPIES`] times,
-//! one over another, so the GPU's clocks are up for the work measured;
-//! costs are reported per copy, over the plain group's.
+//! filter, frame after frame in an offscreen window. Each frame draws the
+//! group [`COPIES`] times, one over another, and its scene is rendered
+//! [`REPEATS`] times back to back, so the GPU's clocks stay up for the work
+//! measured; each render after the first is timed by Metal's command-buffer
+//! timestamps, from the end of the one before to its own. It reports the
+//! frame's median time, and each copy's cost over the plain group's.
 //!
 //! ```sh
 //! GPUI_RUN_BENCHMARKS=1 cargo test --release -p gpui_ce_platform --test filters_bench
@@ -25,6 +27,9 @@ use std::{sync::Arc, time::Duration};
 const FRAMES: usize = 60;
 const COPIES: usize = 8;
 const WARM_UP: usize = 10;
+/// Each frame's scene is rendered this many times, back to back, so that the
+/// GPU does not idle (and slow its clocks) between the renders timed.
+const REPEATS: usize = 4;
 /// Rounds over every case; the first warms the GPU's clocks and is not reported.
 const ROUNDS: usize = 3;
 
@@ -159,13 +164,13 @@ fn run() {
                         });
                         device_size = (size.width.0, size.height.0);
                         renderer
-                            .render_scene_to_image(scene, size)
-                            .expect("the scene renders");
-                        renderer.last_gpu_time().unwrap()
+                            .time_scene_renders(scene, size, REPEATS)
+                            .expect("the scene renders")
                     })
                     .expect("failed to draw the window");
                 if frame >= WARM_UP {
-                    gpu.push(time);
+                    // The first follows an idle GPU; the rest follow each other.
+                    gpu.extend_from_slice(&time[1..]);
                 }
             }
             let time = median(gpu);
@@ -175,14 +180,16 @@ fn run() {
             if what == "plain" {
                 plain = time;
                 println!(
-                    "filters_bench: a 1000×800 group in a {}×{} viewport; GPU medians of {FRAMES} frames, per copy",
-                    device_size.0, device_size.1
+                    "filters_bench: {COPIES} 1000×800 groups in a {}×{} viewport; GPU medians of {FRAMES}×{} renders; cost of each copy over the plain group's",
+                    device_size.0,
+                    device_size.1,
+                    REPEATS - 1
                 );
             }
             println!(
-                "filters_bench: {what:<28} {:>6.2} ms  (+{:.2} ms)",
+                "filters_bench: {what:<28} {:>6.2} ms a frame, +{:.3} ms a copy",
                 time.as_secs_f64() * 1000.,
-                time.saturating_sub(plain).as_secs_f64() * 1000.,
+                time.saturating_sub(plain).as_secs_f64() * 1000. / COPIES as f64,
             );
         }
     }

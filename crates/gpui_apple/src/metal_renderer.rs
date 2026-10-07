@@ -1003,6 +1003,54 @@ impl MetalRenderer {
 
     /// Renders a scene to an image without requiring a window or CAMetalLayer.
     ///
+    /// Renders `scene` into an offscreen target `count` times, the command buffers committed
+    /// back to back so the GPU is never idle between them, and returns each one's GPU time.
+    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+    pub fn time_scene_renders(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        count: usize,
+    ) -> Result<Vec<std::time::Duration>> {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            anyhow::bail!("Invalid size for time_scene_renders: {:?}", size);
+        }
+        let texture_descriptor = metal::TextureDescriptor::new();
+        texture_descriptor.set_width(size.width.0 as u64);
+        texture_descriptor.set_height(size.height.0 as u64);
+        texture_descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        texture_descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        let target_texture = self.device.new_texture(&texture_descriptor);
+        let mut submitted = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut instance_buffer = self.acquire_instance_buffer(scene);
+            let command_buffer = self.draw_primitives_to_texture(
+                scene,
+                &mut instance_buffer,
+                &target_texture,
+                size,
+            )?;
+            command_buffer.commit();
+            submitted.push((command_buffer, instance_buffer));
+        }
+        // Each render after the first is timed from the end of the one before, as the GPU
+        // may start one command buffer while finishing the last.
+        let mut times = Vec::with_capacity(count);
+        let mut last_end = None;
+        for (command_buffer, instance_buffer) in submitted {
+            command_buffer.wait_until_completed();
+            let (start, end) = gpu_start_and_end(&command_buffer);
+            times.push(std::time::Duration::from_secs_f64(
+                (end - last_end.unwrap_or(start)).max(0.),
+            ));
+            last_end = Some(end);
+            self.instance_buffer_pool.lock().release(instance_buffer);
+        }
+        Ok(times)
+    }
+
     /// This is the primary method for headless rendering. It creates an offscreen
     /// texture, renders the scene to it, and returns the pixel data as an RGBA image.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -2879,15 +2927,21 @@ fn required_instance_buffer_size(scene: &Scene) -> usize {
 /// How long the GPU spent on `command_buffer`, which has completed.
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 fn gpu_time(command_buffer: &metal::CommandBufferRef) -> std::time::Duration {
+    let (start, end) = gpu_start_and_end(command_buffer);
+    std::time::Duration::from_secs_f64((end - start).max(0.))
+}
+
+/// When the GPU started and finished `command_buffer`, which has completed, in seconds.
+#[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+fn gpu_start_and_end(command_buffer: &metal::CommandBufferRef) -> (f64, f64) {
     let object = command_buffer.as_ptr() as *const objc2::runtime::AnyObject;
     // SAFETY: a completed `MTLCommandBuffer` answers both, in seconds.
-    let (start, end): (f64, f64) = unsafe {
+    unsafe {
         (
             objc2::msg_send![&*object, GPUStartTime],
             objc2::msg_send![&*object, GPUEndTime],
         )
-    };
-    std::time::Duration::from_secs_f64((end - start).max(0.))
+    }
 }
 
 /// A mesh kept on the GPU: its vertices, then its indices, in one buffer.
