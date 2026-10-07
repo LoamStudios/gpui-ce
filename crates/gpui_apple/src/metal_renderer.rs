@@ -432,7 +432,7 @@ pub struct MetalRenderer {
     sampler: metal::SamplerState,
     photo_tiles: crate::metal_photos::PhotoTiles,
     /// The shader programs linked into the pipelines that read paints.
-    programs: crate::metal_programs::LinkedPrograms,
+    programs: gpui_render::linked::LinkedPrograms<crate::metal_programs::ProgramPipelines>,
     /// The pipelines the frame being drawn draws paints with, when its
     /// scene runs programs: `None` for the standard ones.
     frame_programs: Option<Arc<crate::metal_programs::ProgramPipelines>>,
@@ -669,7 +669,7 @@ impl MetalRenderer {
 
         let command_queue = device.new_command_queue();
         let photo_tiles = crate::metal_photos::PhotoTiles::new(&device, is_unified_memory);
-        let programs = crate::metal_programs::LinkedPrograms::new(device.clone());
+        let programs = gpui_render::linked::LinkedPrograms::new();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
@@ -885,6 +885,14 @@ impl MetalRenderer {
         self.programs.last_link_time()
     }
 
+    /// Links at most `cap` shader programs into the pipelines, evicting the
+    /// least recently used: by default [`gpui_render::linked::DEFAULT_PROGRAM_CAP`],
+    /// or `GPUI_LINKED_PROGRAMS_CAP`.
+    #[doc(hidden)]
+    pub fn set_program_cap(&mut self, cap: usize) {
+        self.programs.set_cap(cap);
+    }
+
     /// Renders the scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing
     /// where we want to capture what would be rendered without displaying it.
@@ -1085,7 +1093,12 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
         self.prepare_intermediate_textures(scene, viewport_size);
-        let programs = self.programs.prepare(scene);
+        let programs = self.programs.prepare(scene, || {
+            let device = self.device.clone();
+            move |programs: Vec<gpui::shader::Program>| {
+                crate::metal_programs::link_pipelines(&device, &programs)
+            }
+        });
         self.frame_programs = programs.pipelines;
         self.programs_pending = programs.pending;
         let command_queue = self.command_queue.clone();
@@ -2838,6 +2851,99 @@ mod tests {
         plain.finish();
         renderer.render_scene_to_image(&plain, size32).unwrap();
         assert!(renderer.frame_programs.is_none());
+    }
+
+    /// A grey of `level` from a program of its own for each `level`: the
+    /// grey multiplied by one `level` times.
+    fn grey_program(level: u8) -> gpui::shader::CompiledPaint {
+        use gpui::shader::{self, Pixel};
+        let mut value = Pixel.uv().x() * 0.0 + f32::from(level) * 40. / 255.;
+        for _ in 0..level {
+            value = value * 1.0;
+        }
+        shader::rgba(&value, &value, &value, 1.0).compile().unwrap()
+    }
+
+    /// A 16×16 scene filled with `paint`, whose fallback is green.
+    fn program_scene(paint: &gpui::shader::CompiledPaint) -> Scene {
+        let bounds = Bounds {
+            origin: gpui::point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        };
+        let mut scene = Scene::default();
+        let paint = scene.push_program(
+            paint,
+            [16.0, 16.0],
+            TransformationMatrix::unit(),
+            [0.0, 1.0, 0.0, 1.0],
+        );
+        scene.insert_primitive(Quad {
+            bounds,
+            content_mask: ContentMask {
+                bounds,
+                ..Default::default()
+            },
+            background: gpui::ScenePaintRef {
+                color: white().into(),
+                paint,
+            },
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    /// With room for two programs, scenes cycling through five each draw
+    /// their own, linking again only when the one they run was evicted; an
+    /// evicted program draws its fallback colour until it is linked again.
+    #[test]
+    fn linked_programs_are_capped_and_evicted() {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let mut renderer = MetalRenderer::new_headless(pool);
+        renderer.set_program_cap(2);
+        renderer.set_link_programs_synchronously(true);
+        let size16 = size(DevicePixels(16), DevicePixels(16));
+        let paints: Vec<_> = (1..=5).map(grey_program).collect();
+        let grey = |level: usize| (level as u32 * 40) as u8;
+        for round in 0..2 {
+            for (index, paint) in paints.iter().enumerate() {
+                let image = renderer
+                    .render_scene_to_image(&program_scene(paint), size16)
+                    .unwrap();
+                let level = grey(index + 1);
+                assert_pixel_close(
+                    &image,
+                    8,
+                    8,
+                    [level, level, level, 255],
+                    2,
+                    &format!("program {index}, round {round}"),
+                );
+            }
+        }
+        assert_eq!(renderer.programs.link_count(), 10);
+        // The same program again links nothing.
+        renderer
+            .render_scene_to_image(&program_scene(&paints[4]), size16)
+            .unwrap();
+        assert_eq!(renderer.programs.link_count(), 10);
+
+        // In the background, the evicted first program draws its fallback,
+        // then itself.
+        renderer.set_link_programs_synchronously(false);
+        let scene = program_scene(&paints[0]);
+        let image = renderer.render_scene_to_image(&scene, size16).unwrap();
+        assert!(renderer.programs_pending);
+        assert_pixel_close(&image, 8, 8, [0, 255, 0, 255], 2, "fallback");
+        let start = std::time::Instant::now();
+        while renderer.programs_pending {
+            assert!(start.elapsed() < std::time::Duration::from_secs(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            renderer.render_scene_to_image(&scene, size16).unwrap();
+        }
+        let image = renderer.render_scene_to_image(&scene, size16).unwrap();
+        let level = grey(1);
+        assert_pixel_close(&image, 8, 8, [level, level, level, 255], 2, "relinked");
     }
 
     /// Pixel spot-check helpers for the generated-shader contract tests below.
