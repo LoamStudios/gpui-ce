@@ -150,6 +150,18 @@ impl InputEvent for TouchEvent {
     }
 }
 
+/// What a pen reports with a pointer event: a stylus on a graphics tablet,
+/// or an Apple Pencil on an iPad used as a display. A mouse reports none.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PenSample {
+    /// How hard the pen presses, from 0 to 1.
+    pub pressure: f32,
+
+    /// How far the pen leans toward the window's right (x) and bottom (y),
+    /// each from -1 to 1; upright is zero on both.
+    pub tilt: Point<f32>,
+}
+
 /// A mouse down event from the platform
 #[derive(Clone, Debug, Default)]
 pub struct MouseDownEvent {
@@ -167,6 +179,9 @@ pub struct MouseDownEvent {
 
     /// Whether this is the first, focusing click.
     pub first_mouse: bool,
+
+    /// What the pen reported, when a pen pressed rather than a mouse.
+    pub pen: Option<PenSample>,
 }
 
 impl Sealed for MouseDownEvent {}
@@ -208,6 +223,9 @@ pub struct MouseUpEvent {
 
     /// The number of times the button has been clicked.
     pub click_count: usize,
+
+    /// What the pen reported, when a pen lifted rather than a mouse.
+    pub pen: Option<PenSample>,
 }
 
 impl Sealed for MouseUpEvent {}
@@ -528,6 +546,9 @@ pub struct MouseMoveEvent {
 
     /// The modifiers that were held down when the mouse was moved.
     pub modifiers: Modifiers,
+
+    /// What the pen reported, when a pen moved rather than a mouse.
+    pub pen: Option<PenSample>,
 }
 
 impl Sealed for MouseMoveEvent {}

@@ -2181,6 +2181,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         position,
                         pressed_button: None,
                         modifiers,
+                        pen: None,
                     }));
                 }
             }
@@ -2250,6 +2251,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         position: state.mouse_location.unwrap(),
                         pressed_button: state.button_pressed,
                         modifiers: state.modifiers,
+                        pen: None,
                     });
                     drop(state);
                     if let Some((window, input)) = kinetic_input {
@@ -2323,6 +2325,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                                 modifiers: state.modifiers,
                                 click_count: state.click.current_count,
                                 first_mouse: state.enter_token.take().is_some(),
+                                pen: None,
                             });
                             drop(state);
                             window.handle_input(input);
@@ -2337,6 +2340,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                                 position: state.mouse_location.unwrap(),
                                 modifiers: state.modifiers,
                                 click_count: state.click.current_count,
+                                pen: None,
                             });
                             drop(state);
                             window.handle_input(input);

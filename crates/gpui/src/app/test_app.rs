@@ -412,6 +412,7 @@ impl<V: 'static + Render> TestAppWindow<V> {
     /// Simulate a mouse move.
     pub fn simulate_mouse_move(&mut self, position: Point<Pixels>) {
         self.simulate_event(MouseMoveEvent {
+            pen: None,
             position,
             modifiers: Default::default(),
             pressed_button: None,
@@ -421,6 +422,7 @@ impl<V: 'static + Render> TestAppWindow<V> {
     /// Simulate a mouse down event.
     pub fn simulate_mouse_down(&mut self, position: Point<Pixels>, button: MouseButton) {
         self.simulate_event(MouseDownEvent {
+            pen: None,
             position,
             button,
             modifiers: Default::default(),
@@ -432,6 +434,7 @@ impl<V: 'static + Render> TestAppWindow<V> {
     /// Simulate a mouse up event.
     pub fn simulate_mouse_up(&mut self, position: Point<Pixels>, button: MouseButton) {
         self.simulate_event(MouseUpEvent {
+            pen: None,
             position,
             button,
             modifiers: Default::default(),

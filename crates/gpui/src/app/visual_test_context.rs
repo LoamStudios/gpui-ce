@@ -266,6 +266,7 @@ impl VisualTestAppContext {
         self.simulate_event(
             window,
             MouseMoveEvent {
+                pen: None,
                 position,
                 modifiers,
                 pressed_button: button.into(),
@@ -284,6 +285,7 @@ impl VisualTestAppContext {
         self.simulate_event(
             window,
             MouseDownEvent {
+                pen: None,
                 position,
                 modifiers,
                 button,
@@ -304,6 +306,7 @@ impl VisualTestAppContext {
         self.simulate_event(
             window,
             MouseUpEvent {
+                pen: None,
                 position,
                 modifiers,
                 button,

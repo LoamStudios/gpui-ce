@@ -1,7 +1,7 @@
 use gpui::{
     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
     MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
-    NavigationDirection, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
+    NavigationDirection, PenSample, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
     ScrollWheelEvent, TouchPhase, point, px,
 };
 
@@ -99,6 +99,20 @@ fn read_modifiers(native_event: &NSEvent) -> Modifiers {
     }
 }
 
+/// What a pen reported with a mouse event, when a pen made it. A graphics
+/// tablet, or an Apple Pencil on an iPad used as a display, sends mouse
+/// events of the tablet-point subtype, carrying its pressure and tilt.
+fn pen_sample(event: &NSEvent) -> Option<PenSample> {
+    if event.subtype() != NSEventSubtype::TabletPoint {
+        return None;
+    }
+    let tilt = event.tilt();
+    Some(PenSample {
+        pressure: event.pressure(),
+        tilt: point(tilt.x as f32, tilt.y as f32),
+    })
+}
+
 pub(crate) unsafe fn platform_input_from_native(
     native_event: *mut NSEvent,
     window_height: Option<Pixels>,
@@ -149,6 +163,7 @@ pub(crate) unsafe fn platform_input_from_native(
                 };
                 window_height.map(|window_height| {
                     PlatformInput::MouseDown(MouseDownEvent {
+                        pen: pen_sample(native_event),
                         button,
                         position: point(
                             px(native_event.locationInWindow().x as f32),
@@ -174,6 +189,7 @@ pub(crate) unsafe fn platform_input_from_native(
 
                 window_height.map(|window_height| {
                     PlatformInput::MouseUp(MouseUpEvent {
+                        pen: pen_sample(native_event),
                         button,
                         position: point(
                             px(native_event.locationInWindow().x as f32),
@@ -218,6 +234,7 @@ pub(crate) unsafe fn platform_input_from_native(
                 match navigation_direction {
                     Some(direction) => window_height.map(|window_height| {
                         PlatformInput::MouseDown(MouseDownEvent {
+                            pen: None,
                             button: MouseButton::Navigate(direction),
                             position: point(
                                 px(native_event.locationInWindow().x as f32),
@@ -293,6 +310,7 @@ pub(crate) unsafe fn platform_input_from_native(
 
                 window_height.map(|window_height| {
                     PlatformInput::MouseMove(MouseMoveEvent {
+                        pen: pen_sample(native_event),
                         pressed_button: Some(pressed_button),
                         position: point(
                             px(native_event.locationInWindow().x as f32),
@@ -304,6 +322,7 @@ pub(crate) unsafe fn platform_input_from_native(
             }
             NSEventType::MouseMoved => window_height.map(|window_height| {
                 PlatformInput::MouseMove(MouseMoveEvent {
+                    pen: pen_sample(native_event),
                     position: point(
                         px(native_event.locationInWindow().x as f32),
                         window_height - px(native_event.locationInWindow().y as f32),

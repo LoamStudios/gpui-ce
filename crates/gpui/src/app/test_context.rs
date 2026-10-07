@@ -831,6 +831,7 @@ impl VisualTestContext {
         modifiers: Modifiers,
     ) {
         self.simulate_event(MouseMoveEvent {
+            pen: None,
             position,
             modifiers,
             pressed_button: button.into(),
@@ -845,6 +846,7 @@ impl VisualTestContext {
         modifiers: Modifiers,
     ) {
         self.simulate_event(MouseDownEvent {
+            pen: None,
             position,
             modifiers,
             button,
@@ -861,6 +863,7 @@ impl VisualTestContext {
         modifiers: Modifiers,
     ) {
         self.simulate_event(MouseUpEvent {
+            pen: None,
             position,
             modifiers,
             button,
@@ -871,6 +874,7 @@ impl VisualTestContext {
     /// Simulate a primary mouse click at the given point
     pub fn simulate_click(&mut self, position: Point<Pixels>, modifiers: Modifiers) {
         self.simulate_event(MouseDownEvent {
+            pen: None,
             position,
             modifiers,
             button: MouseButton::Left,
@@ -878,6 +882,7 @@ impl VisualTestContext {
             first_mouse: false,
         });
         self.simulate_event(MouseUpEvent {
+            pen: None,
             position,
             modifiers,
             button: MouseButton::Left,

@@ -5382,6 +5382,99 @@ mod tests {
         assert_eq!(*hover_transitions.borrow(), [true, false]);
     }
 
+    use crate::{PenSample, radians};
+
+    struct PenRecordingView {
+        samples: Rc<RefCell<Vec<(&'static str, Option<PenSample>)>>>,
+    }
+
+    impl Render for PenRecordingView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let (down, moved, up) = (
+                self.samples.clone(),
+                self.samples.clone(),
+                self.samples.clone(),
+            );
+            // Under a transform, so the pen is seen to survive the mapping of
+            // the event into the element's space.
+            div().size_full().child(
+                div()
+                    .size(px(100.))
+                    .rotate(radians(0.3))
+                    .on_mouse_down(MouseButton::Left, move |event, _, _| {
+                        down.borrow_mut().push(("down", event.pen))
+                    })
+                    .on_mouse_move(move |event, _, _| moved.borrow_mut().push(("move", event.pen)))
+                    .on_mouse_up(MouseButton::Left, move |event, _, _| {
+                        up.borrow_mut().push(("up", event.pen))
+                    }),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn mouse_listeners_receive_what_the_pen_reported(cx: &mut TestAppContext) {
+        let samples = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let samples = samples.clone();
+            move |_, _| PenRecordingView { samples }
+        });
+        let at = point(px(50.), px(50.));
+        let pen = |pressure| {
+            Some(PenSample {
+                pressure,
+                tilt: point(0.25, -0.5),
+            })
+        };
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            for event in [
+                MouseDownEvent {
+                    position: at,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    pen: pen(0.2),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                MouseMoveEvent {
+                    position: at,
+                    pressed_button: Some(MouseButton::Left),
+                    pen: pen(0.7),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                MouseUpEvent {
+                    position: at,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    pen: pen(0.0),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                MouseMoveEvent {
+                    position: at,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+            ] {
+                window.dispatch_event(event, cx);
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            *samples.borrow(),
+            [
+                ("down", pen(0.2)),
+                ("move", pen(0.7)),
+                ("up", pen(0.0)),
+                ("move", None),
+            ]
+        );
+    }
+
     #[gpui::test]
     fn hover_listeners_remain_hovered_during_stationary_mouse_press(cx: &mut TestAppContext) {
         let hover_transitions = Rc::new(RefCell::new(Vec::new()));
@@ -5405,6 +5498,7 @@ mod tests {
         cx.update_window(any_window, |_, window, cx| {
             window.dispatch_event(
                 MouseDownEvent {
+                    pen: None,
                     position: mouse_position,
                     button: MouseButton::Left,
                     modifiers: Default::default(),
@@ -5422,6 +5516,7 @@ mod tests {
         cx.update_window(any_window, |_, window, cx| {
             window.dispatch_event(
                 MouseUpEvent {
+                    pen: None,
                     position: mouse_position,
                     button: MouseButton::Left,
                     modifiers: Default::default(),
@@ -5610,6 +5705,7 @@ mod tests {
             .update_window(any_window, |_, window, cx| {
                 window.dispatch_event(
                     MouseMoveEvent {
+                        pen: None,
                         position: point(px(10.), px(10.)),
                         modifiers: Default::default(),
                         pressed_button: None,
@@ -5729,6 +5825,7 @@ mod tests {
             .update_window(any_window, |_, window, cx| {
                 window.dispatch_event(
                     MouseMoveEvent {
+                        pen: None,
                         position: point(px(75.), px(75.)),
                         modifiers: Default::default(),
                         pressed_button: None,
@@ -5779,6 +5876,7 @@ mod tests {
                 .update_window(any_window, |_, window, cx| {
                     window.dispatch_event(
                         MouseDownEvent {
+                            pen: None,
                             position: point(px(75.), px(75.)),
                             button: MouseButton::Left,
                             modifiers: Default::default(),

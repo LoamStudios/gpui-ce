@@ -7497,6 +7497,7 @@ impl Window {
                         });
                     }
                     PlatformInput::MouseMove(MouseMoveEvent {
+                        pen: None,
                         position,
                         pressed_button: Some(MouseButton::Left),
                         modifiers: Modifiers::default(),
@@ -7505,6 +7506,7 @@ impl Window {
                 FileDropEvent::Pending { position } => {
                     self.mouse_position = position;
                     PlatformInput::MouseMove(MouseMoveEvent {
+                        pen: None,
                         position,
                         pressed_button: Some(MouseButton::Left),
                         modifiers: Modifiers::default(),
@@ -7514,6 +7516,7 @@ impl Window {
                     cx.activate(true);
                     self.mouse_position = position;
                     PlatformInput::MouseUp(MouseUpEvent {
+                        pen: None,
                         button: MouseButton::Left,
                         position,
                         modifiers: Modifiers::default(),
@@ -8844,6 +8847,7 @@ impl Window {
                 if let Some(bounds) = self.a11y.node_bounds.get(&request.target_node).copied() {
                     let center = bounds.center();
                     let mouse_down = PlatformInput::MouseDown(crate::MouseDownEvent {
+                        pen: None,
                         button: MouseButton::Left,
                         position: center,
                         modifiers: Modifiers::default(),
@@ -8851,6 +8855,7 @@ impl Window {
                         first_mouse: false,
                     });
                     let mouse_up = PlatformInput::MouseUp(MouseUpEvent {
+                        pen: None,
                         button: MouseButton::Left,
                         position: center,
                         modifiers: Modifiers::default(),
@@ -9081,6 +9086,7 @@ impl Window {
     #[cfg(any(test, feature = "test-support"))]
     pub fn simulate_mouse_move(&mut self, position: Point<Pixels>, cx: &mut App) {
         let event = PlatformInput::MouseMove(MouseMoveEvent {
+            pen: None,
             position,
             modifiers: self.modifiers,
             pressed_button: None,
@@ -10606,6 +10612,7 @@ mod tests {
                 window.draw(cx).clear(cx);
                 window.dispatch_event(
                     MouseDownEvent {
+                        pen: None,
                         position: point(px(10.), px(10.)),
                         button: MouseButton::Left,
                         modifiers: Default::default(),
@@ -10617,6 +10624,7 @@ mod tests {
                 );
                 window.dispatch_event(
                     MouseMoveEvent {
+                        pen: None,
                         position: point(px(20.), px(20.)),
                         pressed_button: Some(MouseButton::Left),
                         modifiers: Default::default(),
@@ -10645,6 +10653,7 @@ mod tests {
         let update_result = cx.update_window(successful.window, |_, window, cx| {
             window.dispatch_event(
                 MouseMoveEvent {
+                    pen: None,
                     position: outside_position,
                     pressed_button: Some(MouseButton::Left),
                     modifiers: Default::default(),
@@ -10773,6 +10782,7 @@ mod tests {
         let update_result = cx.update_window(cancelled.window, |_, window, cx| {
             window.dispatch_event(
                 MouseMoveEvent {
+                    pen: None,
                     position: outside_position,
                     pressed_button: Some(MouseButton::Left),
                     modifiers: Default::default(),
@@ -10810,6 +10820,7 @@ mod tests {
         let update_result = cx.update_window(removed.window, |_, window, cx| {
             window.dispatch_event(
                 MouseMoveEvent {
+                    pen: None,
                     position: outside_position,
                     pressed_button: Some(MouseButton::Left),
                     modifiers: Default::default(),
@@ -10832,6 +10843,7 @@ mod tests {
             for x_position in [-1., -2.] {
                 window.dispatch_event(
                     MouseMoveEvent {
+                        pen: None,
                         position: point(px(x_position), px(20.)),
                         pressed_button: Some(MouseButton::Left),
                         modifiers: Default::default(),

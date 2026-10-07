@@ -1570,6 +1570,7 @@ mod tests {
         if let Err(error) = cx.update_window(any_window, |_, window, cx| {
             window.dispatch_event(
                 MouseDownEvent {
+                    pen: None,
                     position: mouse_position,
                     button: MouseButton::Left,
                     modifiers: Default::default(),
@@ -1595,6 +1596,7 @@ mod tests {
         if let Err(error) = cx.update_window(any_window, |_, window, cx| {
             window.dispatch_event(
                 MouseUpEvent {
+                    pen: None,
                     position: mouse_position,
                     button: MouseButton::Left,
                     modifiers: Default::default(),

@@ -766,6 +766,7 @@ impl TouchGestureRecognizer {
                     });
                     recognized.push(RecognizedTouchGesture::Tap {
                         down: MouseDownEvent {
+                            pen: None,
                             button: MouseButton::Left,
                             position: event.position,
                             modifiers: Modifiers::default(),
@@ -773,6 +774,7 @@ impl TouchGestureRecognizer {
                             first_mouse: false,
                         },
                         up: MouseUpEvent {
+                            pen: None,
                             button: MouseButton::Left,
                             position: event.position,
                             modifiers: Modifiers::default(),
