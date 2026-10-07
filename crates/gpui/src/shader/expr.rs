@@ -88,6 +88,10 @@ pub(crate) enum Op {
         count: u32,
         level: u8,
     },
+    /// The picture a filter program reads (see
+    /// [`Pixel::input_at`](super::Pixel::input_at)), at the fragment
+    /// `args[0]` moved by `args[1]` logical pixels: premultiplied colour.
+    Input,
     /// An expression that cannot compile, carrying its diagnostic.
     Invalid(Arc<str>),
 }
@@ -112,7 +116,7 @@ impl Node {
         let (own_rate, own_cpu) = match &op {
             Op::Uniform(_) => (Rate::Uniform, true),
             Op::Constant(_) => (Rate::Constant, true),
-            Op::Fragment => (Rate::Fragment, true),
+            Op::Fragment | Op::Input => (Rate::Fragment, true),
             Op::Invalid(_) => (Rate::Fragment, false),
             Op::Member(_)
             | Op::Unary(..)

@@ -363,6 +363,13 @@ impl Scene {
         for paint_ref in primitive.paint_refs_mut() {
             paint_ref.paint = self.adopt_paint(paint_ref.paint, prev_scene, adopted, placement);
         }
+        if let Primitive::GroupBoundary(boundary) = primitive {
+            for filter in boundary.filters.iter_mut() {
+                if let ScaledFilter::Program { paint, .. } = filter {
+                    *paint = self.adopt_paint(*paint, prev_scene, adopted, placement);
+                }
+            }
+        }
     }
 
     /// Entry `paint` of `prev_scene`'s paint table as an entry of this
@@ -651,6 +658,11 @@ impl Scene {
                 *bounds =
                     crate::window::transformed_bounds(placement, bounds.map(|value| px(value.0)))
                         .map(|value| ScaledPixels(value.0));
+                if let Primitive::GroupBoundary(boundary) = primitive {
+                    for filter in boundary.filters.iter_mut() {
+                        *filter = filter.placed(placement);
+                    }
+                }
                 mask(primitive.content_mask_mut());
             }
             _ => {
@@ -1866,11 +1878,10 @@ impl Primitive {
             }
             .intersect(content_mask);
         };
+        let placement_matrix = placement.matrix();
         let filters = |filters: &mut SmallVec<[ScaledFilter; 4]>| {
             for filter in filters.iter_mut() {
-                match filter {
-                    ScaledFilter::Blur(radius) => *radius = length(*radius),
-                }
+                *filter = filter.placed(&placement_matrix);
             }
         };
         match self {
@@ -2082,6 +2093,10 @@ impl Primitive {
             }
             Primitive::GroupBoundary(boundary) => {
                 boundary.bounds = boundary.bounds + geometry_offset;
+                let moved_by = TransformationMatrix::unit().translate(geometry_offset);
+                for filter in boundary.filters.iter_mut() {
+                    *filter = filter.placed(&moved_by);
+                }
                 moved(&mut boundary.content_mask);
             }
             Primitive::Chunk(chunk) => chunk.place(
@@ -2609,7 +2624,7 @@ pub struct BackdropFilter {
 impl BackdropFilter {
     /// Largest gaussian blur radius in this filter chain, in device pixels.
     pub fn max_blur_radius(&self) -> f32 {
-        max_blur_radius(&self.filters)
+        crate::max_blur_radius(&self.filters)
     }
 }
 
@@ -2656,13 +2671,24 @@ pub struct GroupBoundary {
 impl GroupBoundary {
     /// Largest gaussian blur radius in this filter chain, in device pixels.
     pub fn max_blur_radius(&self) -> f32 {
-        max_blur_radius(&self.filters)
+        crate::max_blur_radius(&self.filters)
     }
 
-    /// How far the group's filters spread what it draws, in device pixels:
-    /// its isolated target covers this much more on every side.
-    pub fn filter_extent(&self) -> f32 {
-        GAUSSIAN_EXTENT_PER_RADIUS * self.max_blur_radius()
+    /// Whether the group has filters to run.
+    pub fn is_filtered(&self) -> bool {
+        !self.filters.is_empty()
+    }
+
+    /// How far the group's filters spread what it draws, on each side, in
+    /// device pixels: its isolated target covers this much more.
+    pub fn filter_outsets(&self) -> Edges<f32> {
+        crate::filter_outsets(&self.filters)
+    }
+
+    /// The passes the group's filters run on its target before it is
+    /// composited.
+    pub fn filter_plan(&self) -> crate::FilterPlan {
+        crate::FilterPlan::new(&self.filters)
     }
 
     /// Whether the group has to be rendered on its own and composited: it
@@ -2671,7 +2697,7 @@ impl GroupBoundary {
     pub fn isolates(&self) -> bool {
         self.opacity < 1.0
             || self.blend_mode != BlendMode::Normal
-            || self.max_blur_radius() > 0.0
+            || self.is_filtered()
             || self.masked
             || self.mask_mode.is_some()
     }
@@ -2729,22 +2755,6 @@ pub enum BlendMode {
     Color,
     /// The group's luminosity with the hue and saturation beneath.
     Luminosity,
-}
-
-/// How far a gaussian blur spreads, per unit of its radius: the standard
-/// deviation is half the radius, and the kernel is cut off at three of them,
-/// but the spread is kept at three radii, as the renderers' blur passes
-/// dilate their bounds.
-pub const GAUSSIAN_EXTENT_PER_RADIUS: f32 = 3.0;
-
-/// Returns the largest blur radius in a scene-space filter chain.
-///
-/// This match is deliberately exhaustive so adding a filter requires one shared scheduling
-/// decision instead of three backend-specific implementations that can drift.
-fn max_blur_radius(filters: &[ScaledFilter]) -> f32 {
-    filters.iter().fold(0.0, |radius, filter| match filter {
-        ScaledFilter::Blur(filter_radius) => radius.max(filter_radius.0),
-    })
 }
 
 impl From<GroupBoundary> for Primitive {

@@ -168,6 +168,20 @@ mod source {
         Luminance = 2,
     }
 
+    /// What a group filter pass does to the group's picture.
+    #[repr(u32)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Wgsl)]
+    pub enum GroupFilter {
+        /// Copies it.
+        None = 0,
+        /// Applies a colour matrix to it.
+        ColorMatrix = 1,
+        /// Composites it over the backdrop texture, moved.
+        Merge = 2,
+        /// Runs a shader program that reads it.
+        Program = 3,
+    }
+
     #[repr(u32)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Wgsl)]
     pub enum BlurCompositeClip {

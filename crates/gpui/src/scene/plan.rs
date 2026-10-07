@@ -1,5 +1,5 @@
 use super::{AtlasTextureId, BatchIterator, BlendMode, GroupBoundary, Scene};
-use crate::{Bounds, ScaledPixels};
+use crate::{Bounds, ScaledPixels, point};
 use smallvec::SmallVec;
 use std::ops::Range;
 
@@ -34,6 +34,10 @@ pub struct ScenePlanRequirements {
     pub surface_count: usize,
     pub backdrop_filter_count: usize,
     pub isolated_group_count: usize,
+    /// Passes of isolated groups' filters that blur, each up to three draws.
+    pub group_blur_count: usize,
+    /// Other passes of isolated groups' filters, each one draw.
+    pub group_filter_pass_count: usize,
     /// Chunks drawn, not counting those inside them, whose own requirements
     /// are added to these.
     pub chunk_count: usize,
@@ -118,9 +122,18 @@ impl ScenePlan {
                         let start = &scene.group_boundaries[group.boundary_index];
                         let matched = matched_starts[group.boundary_index];
                         let region = group.region.map(|region| {
-                            region
-                                .dilate(ScaledPixels(start.filter_extent()))
-                                .intersect(&start.content_mask.bounds)
+                            let outsets = start.filter_outsets();
+                            Bounds::from_corners(
+                                point(
+                                    region.origin.x - ScaledPixels(outsets.left),
+                                    region.origin.y - ScaledPixels(outsets.top),
+                                ),
+                                point(
+                                    region.right() + ScaledPixels(outsets.right),
+                                    region.bottom() + ScaledPixels(outsets.bottom),
+                                ),
+                            )
+                            .intersect(&start.content_mask.bounds)
                         });
                         let target = match region {
                             Some(region) if matched && start.masked => {
@@ -162,6 +175,16 @@ impl ScenePlan {
                         let drawn = match target {
                             GroupTarget::Isolated { region } => {
                                 requirements.isolated_group_count += 1;
+                                if start.is_filtered() {
+                                    for pass in start.filter_plan().passes {
+                                        match pass {
+                                            crate::FilterPass::Blur { .. } => {
+                                                requirements.group_blur_count += 1
+                                            }
+                                            _ => requirements.group_filter_pass_count += 1,
+                                        }
+                                    }
+                                }
                                 requirements.uses_offscreen_target |=
                                     start.blend_mode != BlendMode::Normal;
                                 Some(region)
@@ -263,7 +286,7 @@ fn foldable_batches(
     commands: &[RenderCommand],
 ) -> Option<SmallVec<[PrimitiveBatch; 4]>> {
     if start.blend_mode != BlendMode::Normal
-        || start.max_blur_radius() > 0.0
+        || start.is_filtered()
         || start.masked
         || start.mask_mode.is_some()
     {

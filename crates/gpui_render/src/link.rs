@@ -74,20 +74,34 @@ impl Linkable {
 /// The WGSL of `linkable` with `programs` linked in. Programs run unchanged
 /// wherever a paint names their id; any other program id draws its paint's
 /// fallback colour.
+///
+/// Programs that fill paints run through `program_color`, in every module
+/// that reads the paint table; those that read a filter's input fill
+/// nothing, and are left out of it. Every program can filter a group, and
+/// runs through `program_filter_color`, in the module that runs group
+/// filters, where `program_input` reads the group's picture. Elsewhere,
+/// `program_input` reads nothing.
 pub fn link_source<'a>(
     linkable: &Linkable,
     programs: impl IntoIterator<Item = &'a Program>,
 ) -> String {
     let programs: Vec<&Program> = programs.into_iter().collect();
+    let fills = linkable.wgsl.contains("program_color(");
+    let filters = linkable.wgsl.contains("program_filter_color(");
+    let linked: Vec<&Program> = programs
+        .iter()
+        .copied()
+        .filter(|program| filters || (fills && !program.reads_input()))
+        .collect();
     let prelude = prelude_source();
     let mut source = String::with_capacity(
         linkable.wgsl.len()
             + prelude.len()
-            + programs
+            + linked
                 .iter()
-                .map(|program| program.source().len() + 128)
+                .map(|program| program.source().len() + 256)
                 .sum::<usize>()
-            + 1024,
+            + 2048,
     );
     // Programs may take derivatives, as UI shaders do, inside the per-pixel
     // control flow that clips and picks paints.
@@ -111,28 +125,65 @@ fn paint_param(index: u32) -> vec4<f32> {
 "
         }
     });
-    source.push_str(
+    source.push_str(if linkable.wgsl.contains("fn group_filter_input(") {
         "
+fn program_input(fragment: Fragment, offset: vec2<f32>) -> vec4<f32> {
+    return group_filter_input(fragment.position + offset);
+}
+"
+    } else {
+        "
+fn program_input(fragment: Fragment, offset: vec2<f32>) -> vec4<f32> {
+    return vec4<f32>(0.0);
+}
+"
+    });
+    if fills {
+        source.push_str(
+            "
 fn program_color(id: u32, uv: vec2<f32>, position: vec2<f32>, size: vec2<f32>, origin: vec2<f32>, scale: f32, stroke: vec2<f32>, base: u32, fallback: vec4<f32>) -> vec4<f32> {
     let fragment = Fragment(uv, position, size, origin, scale, stroke);
     switch id {
 ",
-    );
-    for program in &programs {
-        source.push_str(&format!(
-            "        case {}u: {{ return Color_unpremultiply({}(fragment, base)); }}\n",
-            program.id(),
-            program.entry_point(),
-        ));
-    }
-    source.push_str(
-        "        default: { return fallback; }
+        );
+        for program in linked.iter().filter(|program| !program.reads_input()) {
+            source.push_str(&format!(
+                "        case {}u: {{ return Color_unpremultiply({}(fragment, base)); }}\n",
+                program.id(),
+                program.entry_point(),
+            ));
+        }
+        source.push_str(
+            "        default: { return fallback; }
     }
 }
-
 ",
-    );
-    for program in &programs {
+        );
+    }
+    if filters {
+        source.push_str(
+            "
+fn program_filter_color(id: u32, uv: vec2<f32>, position: vec2<f32>, size: vec2<f32>, origin: vec2<f32>, scale: f32, stroke: vec2<f32>, base: u32, fallback: vec4<f32>) -> vec4<f32> {
+    let fragment = Fragment(uv, position, size, origin, scale, stroke);
+    switch id {
+",
+        );
+        for program in &linked {
+            source.push_str(&format!(
+                "        case {}u: {{ return {}(fragment, base); }}\n",
+                program.id(),
+                program.entry_point(),
+            ));
+        }
+        source.push_str(
+            "        default: { return vec4<f32>(fallback.xyz * fallback.w, fallback.w); }
+    }
+}
+",
+        );
+    }
+    source.push('\n');
+    for program in &linked {
         source.push_str(program.source());
         source.push('\n');
     }
@@ -269,13 +320,23 @@ mod tests {
                 "smoothed_shadows",
                 "path_rasterization",
                 "meshes",
-                "monochrome_sprites"
+                "monochrome_sprites",
+                "group_filter"
             ]
         );
         for shader in linkable() {
             let wgsl = shader.linkable_wgsl.unwrap();
             assert!(!wgsl.contains("fn program_color("), "{}", shader.label);
-            assert!(wgsl.contains("program_color("), "{}", shader.label);
+            assert!(
+                !wgsl.contains("fn program_filter_color("),
+                "{}",
+                shader.label
+            );
+            assert!(
+                wgsl.contains("program_color(") || wgsl.contains("program_filter_color("),
+                "{}",
+                shader.label
+            );
         }
     }
 
@@ -316,6 +377,57 @@ mod tests {
                     shader.label
                 );
             }
+        }
+    }
+
+    /// A program reading a filter's input links into the group-filter
+    /// shader, where `program_input` reads the group's picture, on Metal and
+    /// Direct3D; the shaders that fill paints leave it out.
+    #[test]
+    fn filter_programs_link_only_where_groups_are_filtered() {
+        let sharpen = shader::paint(|px| {
+            let around = px.input_at(shader::vec2(1.0, 0.0)).rgba()
+                + px.input_at(shader::vec2(-1.0, 0.0)).rgba();
+            Paint::premultiplied(px.input().rgba() * 3.0 - around)
+        })
+        .compile()
+        .unwrap()
+        .program;
+        assert!(sharpen.reads_input());
+        let grain = grain().compile().unwrap().program;
+        assert!(!grain.reads_input());
+        let programs = [sharpen.clone(), grain.clone()];
+        for shader in linkable() {
+            let source = linked_wgsl(shader, &programs).unwrap();
+            let filters = shader.label == "group_filter";
+            assert_eq!(
+                source.contains(sharpen.entry_point()),
+                filters,
+                "{}",
+                shader.label
+            );
+            assert!(source.contains(grain.entry_point()), "{}", shader.label);
+            assert_eq!(
+                source.contains("group_filter_input(fragment.position + offset)"),
+                filters,
+                "{}",
+                shader.label
+            );
+            let msl = link_msl(shader, &programs).unwrap();
+            let hlsl = link_hlsl(shader, &programs).unwrap();
+            if filters {
+                assert!(msl.contains(sharpen.entry_point()));
+                assert!(hlsl.contains(sharpen.entry_point()));
+            }
+        }
+        // The wgpu module runs both, in both dialects.
+        for dialect in [Dialect::Modern, Dialect::Downlevel] {
+            let (source, _, _) = link(&Linkable::base(dialect), &programs).unwrap();
+            assert!(source.contains(&format!(
+                "case {}u: {{ return {}(",
+                sharpen.id(),
+                sharpen.entry_point()
+            )));
         }
     }
 

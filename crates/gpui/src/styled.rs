@@ -86,8 +86,32 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Casts a shadow of this element's own content and children beneath them, like CSS
+    /// `filter: drop-shadow(<offset_x> <offset_y> <blur_radius> <color>)`: unlike a box
+    /// shadow, it follows the shape of what is drawn, text, paths and transparent photos
+    /// included. The blur radius is CSS's, twice the Gaussian's standard deviation.
+    ///
+    /// *Appends* to the element's filter chain; see [`Styled::filter`].
+    fn drop_shadow(
+        mut self,
+        offset_x: impl Into<Pixels>,
+        offset_y: impl Into<Pixels>,
+        blur_radius: impl Into<Pixels>,
+        color: impl palette::IntoColor<crate::Hsla>,
+    ) -> Self {
+        self.style()
+            .filter
+            .get_or_insert_with(Vec::new)
+            .push(Filter::drop_shadow(offset_x, offset_y, blur_radius, color));
+        self
+    }
+
     /// Set (replacing any existing) the full list of filters applied to this element's own
-    /// content, like CSS `filter`. To add a single filter to the chain instead, use the
+    /// content, like CSS `filter`, applied in order:
+    ///
+    /// ```ignore
+    /// div().filter(Filter::blur(px(4.)).then(Filter::saturate(1.2)))
+    /// ``` To add a single filter to the chain instead, use the
     /// convenience setters such as [`Styled::blur`].
     fn filter(mut self, filters: impl Into<Vec<Filter>>) -> Self {
         self.style().filter = Some(filters.into());
